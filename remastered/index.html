@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Frontier — Remastered Preview (Blinn + Basic Shadows, WebGPU)</title>
+<style>
+  :root {
+    --bg: #0b0e13;
+    --panel: rgba(18, 22, 30, 0.88);
+    --panel-border: rgba(255,255,255,0.09);
+    --text: #e8ecf1;
+    --muted: #9aa4b2;
+    --accent: #6ea8fe;
+    --accent-2: #7ee0a3;
+    --danger: #ff7b7b;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  #app { position: fixed; inset: 0; }
+  canvas#view {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas#view.dragging { cursor: grabbing; }
+
+  .hud {
+    position: absolute;
+    pointer-events: none;
+    z-index: 5;
+  }
+  .hud .card { pointer-events: auto; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+
+  #title {
+    top: 14px; left: 14px;
+    padding: 12px 14px;
+    max-width: 360px;
+  }
+  #title h1 {
+    margin: 0 0 4px 0;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+    font-weight: 700;
+  }
+  #title h1 .tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #0b0e13;
+    background: var(--accent-2);
+    border-radius: 999px;
+    padding: 2px 8px;
+    margin-left: 8px;
+    vertical-align: 2px;
+  }
+  #title p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  #title p b { color: var(--text); font-weight: 600; }
+
+  #stats {
+    top: 14px; right: 14px;
+    padding: 10px 12px;
+    min-width: 190px;
+    font-variant-numeric: tabular-nums;
+  }
+  #stats .row {
+    display: flex; justify-content: space-between; gap: 12px;
+    font-size: 12px; line-height: 1.7;
+  }
+  #stats .k { color: var(--muted); }
+  #stats .v { font-weight: 700; }
+  #stats .fps-big { font-size: 22px; font-weight: 800; line-height: 1.1; }
+  #stats .fps-sub { font-size: 11px; color: var(--muted); }
+
+  #panel {
+    right: 14px; bottom: 14px;
+    width: 300px;
+    max-height: calc(100vh - 150px);
+    overflow: auto;
+    padding: 12px 14px;
+  }
+  #panel h2 {
+    margin: 0 0 8px 0;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  #panel h3 {
+    margin: 14px 0 6px 0;
+    font-size: 12px;
+    color: var(--text);
+  }
+  .ctl { margin: 8px 0; }
+  .ctl label {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 12px; color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .ctl label output { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ctl input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .ctl input[type="color"] {
+    width: 100%; height: 30px; border: 1px solid var(--panel-border);
+    border-radius: 8px; background: transparent; padding: 0; cursor: pointer;
+  }
+  .ctl select {
+    width: 100%; padding: 6px 8px; border-radius: 8px;
+    background: #0f1319; color: var(--text); border: 1px solid var(--panel-border);
+  }
+  .check {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; margin: 8px 0; cursor: pointer; user-select: none;
+  }
+  .check input { accent-color: var(--accent); width: 16px; height: 16px; }
+  .btnrow { display: flex; gap: 8px; margin-top: 10px; }
+  button {
+    flex: 1;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--panel-border);
+    background: #1a212c;
+    color: var(--text);
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button:hover { background: #232c3a; }
+  button.primary { background: var(--accent); border-color: transparent; color: #08111f; }
+  button.primary:hover { filter: brightness(1.08); }
+  .hint {
+    font-size: 11px; color: var(--muted); line-height: 1.5;
+    margin-top: 10px;
+  }
+  .hint kbd {
+    background: #1a212c; border: 1px solid var(--panel-border);
+    border-bottom-width: 2px; border-radius: 6px;
+    padding: 1px 6px; font-size: 11px; font-family: inherit;
+  }
+
+  #help {
+    left: 14px; bottom: 14px;
+    padding: 10px 12px;
+    font-size: 12px; color: var(--muted); line-height: 1.6;
+    max-width: 320px;
+  }
+  #help b { color: var(--text); }
+
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(5,7,10,0.72);
+    z-index: 20;
+    padding: 20px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .box {
+    max-width: 560px; width: 100%;
+    padding: 22px;
+  }
+  #overlay h2 { margin: 0 0 8px 0; font-size: 18px; }
+  #overlay p { margin: 8px 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+  #overlay code {
+    background: #0f1319; border: 1px solid var(--panel-border);
+    border-radius: 6px; padding: 1px 6px; font-size: 12px; color: var(--text);
+  }
+  #overlay .err {
+    border: 1px solid rgba(255,123,123,0.35);
+    background: rgba(255,123,123,0.08);
+    border-radius: 10px; padding: 10px 12px;
+    font-size: 12px; color: #ffb3b3; white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  @media (max-width: 860px) {
+    #title { max-width: calc(100vw - 28px); }
+    #stats { top: auto; bottom: 14px; left: 14px; right: auto; min-width: 160px; }
+    #panel { width: calc(100vw - 28px); max-height: 46vh; }
+    #help { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="view"></canvas>
+
+  <div class="hud" id="title">
+    <div class="card" style="padding:12px 14px;">
+      <h1>Frontier — Remastered Preview <span class="tag">WebGPU</span></h1>
+      <p>
+        <b>Simple Blinn lighting + basic shadows.</b>
+        No ReSTIR, no PBR, no GI, no SDF, no BVH — by design.
+        One shadow-map pass + one main pass per frame. Geometry is baked once at startup.
+      </p>
+    </div>
+  </div>
+
+  <div class="hud" id="stats">
+    <div class="card" style="padding:10px 12px;">
+      <div class="row"><span class="fps-big" id="fps">—</span><span class="fps-sub">FPS<br/><span id="ms">— ms</span></span></div>
+      <div class="row"><span class="k">Triangles</span><span class="v" id="tris">—</span></div>
+      <div class="row"><span class="k">Vertices</span><span class="v" id="verts">—</span></div>
+      <div class="row"><span class="k">Draw calls</span><span class="v" id="draws">—</span></div>
+      <div class="row"><span class="k">Shadow map</span><span class="v" id="shadowInfo">—</span></div>
+    </div>
+  </div>
+
+  <div class="hud" id="panel">
+    <div class="card" style="padding:12px 14px;">
+      <h2>Controls</h2>
+
+      <h3>Light</h3>
+      <div class="ctl">
+        <label>Azimuth <output id="o-az">45°</output></label>
+        <input id="in-az" type="range" min="-180" max="180" step="1" value="45" />
+      </div>
+      <div class="ctl">
+        <label>Elevation <output id="o-el">50°</output></label>
+        <input id="in-el" type="range" min="5" max="85" step="1" value="50" />
+      </div>
+      <div class="ctl">
+        <label>Light color</label>
+        <input id="in-color" type="color" value="#ffffff" />
+      </div>
+      <div class="ctl">
+        <label>Intensity <output id="o-int">1.00</output></label>
+        <input id="in-int" type="range" min="0" max="2" step="0.01" value="1" />
+      </div>
+      <div class="ctl">
+        <label>Ambient <output id="o-amb">0.25</output></label>
+        <input id="in-amb" type="range" min="0" max="1" step="0.01" value="0.25" />
+      </div>
+      <div class="ctl">
+        <label>Shininess (Blinn) <output id="o-shin">32</output></label>
+        <input id="in-shin" type="range" min="1" max="128" step="1" value="32" />
+      </div>
+
+      <h3>Shadows (basic)</h3>
+      <label class="check"><input id="in-shadow" type="checkbox" checked /> Enable shadow map</label>
+      <div class="ctl">
+        <label>Shadow map size</label>
+        <select id="in-shadowsize">
+          <option value="512">512</option>
+          <option value="1024" selected>1024</option>
+          <option value="2048">2048</option>
+        </select>
+      </div>
+      <div class="ctl">
+        <label>Shadow strength <output id="o-sstr">0.85</output></label>
+        <input id="in-sstr" type="range" min="0" max="1" step="0.01" value="0.85" />
+      </div>
+
+      <h3>Camera</h3>
+      <label class="check"><input id="in-rotate" type="checkbox" checked /> Auto-rotate</label>
+      <div class="ctl">
+        <label>Rotate speed <output id="o-rspeed">0.30</output></label>
+        <input id="in-rspeed" type="range" min="0" max="2" step="0.01" value="0.3" />
+      </div>
+
+      <div class="btnrow">
+        <button id="btn-reset" class="primary">Reset camera</button>
+        <button id="btn-pause">Pause</button>
+      </div>
+
+      <div class="hint">
+        Drag to orbit · wheel to zoom · <kbd>R</kbd> reset · <kbd>Space</kbd> pause · <kbd>S</kbd> shadows.
+        <br/>This page does <b>no</b> per-frame readbacks and <b>no</b> CPU geometry work in the render loop.
+      </div>
+    </div>
+  </div>
+
+  <div class="hud" id="help">
+    <div class="card" style="padding:10px 12px;">
+      <b>Why this is fast:</b> static buffers, 2 passes max, tiny uniform updates,
+      no <code>mapAsync</code> / readbacks in the hot loop, DPR capped at 2.
+      If you still see low FPS, look at device selection, resolution, or shadow size first — not the lighting formula.
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="card box">
+      <h2 id="ov-title">Initializing WebGPU…</h2>
+      <p id="ov-body">Creating adapter, device, pipelines, and uploading static geometry. This takes a moment on first load.</p>
+      <div id="ov-err" class="err" style="display:none;"></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+"use strict";
+
+/* ============================================================
+   Frontier — Remastered Preview
+   - Single-file HTML, painting in WebGPU
+   - Blinn-Phong (diffuse + Blinn specular) + ambient
+   - One directional shadow map (basic, single sample + bias)
+   - NO ReSTIR / PBR / GI / SDF / BVH
+   - Performance: bake geometry once, 1-2 passes/frame,
+     no readbacks, no per-frame CPU geometry, DPR capped.
+   ============================================================ */
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("view");
+const overlay = $("overlay");
+const ovTitle = $("ov-title");
+const ovBody = $("ov-body");
+const ovErr = $("ov-err");
+
+function showError(title, body, errText) {
+  ovTitle.textContent = title;
+  ovBody.textContent = body;
+  if (errText) {
+    ovErr.style.display = "block";
+    ovErr.textContent = errText;
+  }
+  overlay.classList.remove("hidden");
+}
+function hideOverlay() { overlay.classList.add("hidden"); }
+
+/* ---------------- tiny mat4 helpers (column-major) ---------------- */
+function mat4Identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function mat4Multiply(a, b) {
+  // result = a * b  (b applied first), column-major
+  const out = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k*4 + r] * b[c*4 + k];
+      out[c*4 + r] = s;
+    }
+  }
+  return out;
+}
+function mat4Perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f;
+  m[10] = far / (near - far); m[11] = -1;
+  m[14] = (near * far) / (near - far);
+  return m;
+}
+function mat4Ortho(l, r, b, t, n, f) {
+  const m = new Float32Array(16);
+  m[0] = 2 / (r - l); m[5] = 2 / (t - b); m[10] = 1 / (n - f);
+  m[12] = (l + r) / (l - r); m[13] = (t + b) / (b - t); m[14] = n / (n - f);
+  m[15] = 1;
+  return m;
+}
+function mat4LookAt(eye, center, up) {
+  const zx = eye[0]-center[0], zy = eye[1]-center[1], zz = eye[2]-center[2];
+  let zl = Math.hypot(zx, zy, zz) || 1;
+  const z = [zx/zl, zy/zl, zz/zl];
+  let xx = up[1]*z[2] - up[2]*z[1], xy = up[2]*z[0] - up[0]*z[2], xz = up[0]*z[1] - up[1]*z[0];
+  let xl = Math.hypot(xx, xy, xz);
+  if (xl < 1e-6) { xx = 1; xy = 0; xz = 0; xl = 1; }
+  const x = [xx/xl, xy/xl, xz/xl];
+  const y = [z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]];
+  const m = new Float32Array(16);
+  m[0]=x[0]; m[1]=y[0]; m[2]=z[0]; m[3]=0;
+  m[4]=x[1]; m[5]=y[1]; m[6]=z[1]; m[7]=0;
+  m[8]=x[2]; m[9]=y[2]; m[10]=z[2]; m[11]=0;
+  m[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]);
+  m[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]);
+  m[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]);
+  m[15]=1;
+  return m;
+}
+function mat4Translate(x, y, z) {
+  const m = mat4Identity(); m[12]=x; m[13]=y; m[14]=z; return m;
+}
+function mat4Scale(s) {
+  const m = mat4Identity(); m[0]=s; m[5]=s; m[10]=s; return m;
+}
+function mat4RotateY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  const m = mat4Identity();
+  m[0]=c; m[2]=-s; m[8]=s; m[10]=c;
+  return m;
+}
+function mat4RotateX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  const m = mat4Identity();
+  m[5]=c; m[6]=s; m[9]=-s; m[10]=c;
+  return m;
+}
+function transformPoint(m, p) {
+  const x=p[0], y=p[1], z=p[2];
+  return [
+    m[0]*x + m[4]*y + m[8]*z + m[12],
+    m[1]*x + m[5]*y + m[9]*z + m[13],
+    m[2]*x + m[6]*y + m[10]*z + m[14],
+  ];
+}
+function transformNormal(m, n) {
+  // valid for rotation + uniform scale (our case)
+  const x=n[0], y=n[1], z=n[2];
+  let nx = m[0]*x + m[4]*y + m[8]*z;
+  let ny = m[1]*x + m[5]*y + m[9]*z;
+  let nz = m[2]*x + m[6]*y + m[10]*z;
+  const l = Math.hypot(nx, ny, nz) || 1;
+  return [nx/l, ny/l, nz/l];
+}
+
+/* ---------------- geometry (baked once) ---------------- */
+// Interleaved: position(3) normal(3) color(3) per vertex, non-indexed.
+function buildScene() {
+  const verts = [];
+  function pushTri(a, b, c, n, col) {
+    for (const p of [a, b, c]) {
+      verts.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2]);
+    }
+  }
+  function addCube(size, pos, rotY, col) {
+    const h = size / 2;
+    const faces = [
+      { n: [ 1,0,0], quad: [[ h,-h, h],[ h,-h,-h],[ h, h,-h],[ h, h, h]] },
+      { n: [-1,0,0], quad: [[-h,-h,-h],[-h,-h, h],[-h, h, h],[-h, h,-h]] },
+      { n: [0, 1,0], quad: [[-h, h, h],[-h, h,-h],[ h, h,-h],[ h, h, h]] },
+      { n: [0,-1,0], quad: [[-h,-h,-h],[-h,-h, h],[ h,-h, h],[ h,-h,-h]] },
+      { n: [0,0, 1], quad: [[-h,-h, h],[ h,-h, h],[ h, h, h],[-h, h, h]] },
+      { n: [0,0,-1], quad: [[ h,-h,-h],[-h,-h,-h],[-h, h,-h],[ h, h,-h]] },
+    ];
+    const m = mat4Multiply(mat4Translate(pos[0], pos[1], pos[2]), mat4RotateY(rotY));
+    for (const f of faces) {
+      const q = f.quad.map(p => transformPoint(m, p));
+      const n = transformNormal(m, f.n);
+      pushTri(q[0], q[1], q[2], n, col);
+      pushTri(q[0], q[2], q[3], n, col);
+    }
+  }
+  function addSphere(radius, pos, col, latSeg = 24, lonSeg = 16) {
+    const m = mat4Translate(pos[0], pos[1], pos[2]);
+    for (let i = 0; i < latSeg; i++) {
+      const v0 = i / latSeg, v1 = (i+1) / latSeg;
+      const phi0 = v0 * Math.PI, phi1 = v1 * Math.PI;
+      for (let j = 0; j < lonSeg; j++) {
+        const u0 = j / lonSeg, u1 = (j+1) / lonSeg;
+        const th0 = u0 * Math.PI * 2, th1 = u1 * Math.PI * 2;
+        function sp(phi, th) {
+          const x = radius * Math.sin(phi) * Math.cos(th);
+          const y = radius * Math.cos(phi);
+          const z = radius * Math.sin(phi) * Math.sin(th);
+          const p = transformPoint(m, [x, y, z]);
+          const n = transformNormal(m, [x/radius, y/radius, z/radius]);
+          return { p, n };
+        }
+        const a = sp(phi0, th0), b = sp(phi0, th1), c = sp(phi1, th1), d = sp(phi1, th0);
+        // two tris, per-vertex normals (smooth)
+        for (const [p1, p2, p3] of [[a,b,c],[a,c,d]]) {
+          verts.push(
+            p1.p[0],p1.p[1],p1.p[2], p1.n[0],p1.n[1],p1.n[2], col[0],col[1],col[2],
+            p2.p[0],p2.p[1],p2.p[2], p2.n[0],p2.n[1],p2.n[2], col[0],col[1],col[2],
+            p3.p[0],p3.p[1],p3.p[2], p3.n[0],p3.n[1],p3.n[2], col[0],col[1],col[2],
+          );
+        }
+      }
+    }
+  }
+  function addCylinder(radius, height, pos, col, seg = 24) {
+    const m = mat4Translate(pos[0], pos[1], pos[2]);
+    const hh = height / 2;
+    // side
+    for (let j = 0; j < seg; j++) {
+      const t0 = (j / seg) * Math.PI * 2, t1 = ((j+1) / seg) * Math.PI * 2;
+      const c0 = Math.cos(t0), s0 = Math.sin(t0), c1 = Math.cos(t1), s1 = Math.sin(t1);
+      const b0 = transformPoint(m, [radius*c0, -hh, radius*s0]);
+      const b1 = transformPoint(m, [radius*c1, -hh, radius*s1]);
+      const t0p = transformPoint(m, [radius*c0, hh, radius*s0]);
+      const t1p = transformPoint(m, [radius*c1, hh, radius*s1]);
+      const n0 = transformNormal(m, [c0, 0, s0]);
+      const n1 = transformNormal(m, [c1, 0, s1]);
+      // tri b0,b1,t1
+      verts.push(b0[0],b0[1],b0[2], n0[0],n0[1],n0[2], col[0],col[1],col[2]);
+      verts.push(b1[0],b1[1],b1[2], n1[0],n1[1],n1[2], col[0],col[1],col[2]);
+      verts.push(t1p[0],t1p[1],t1p[2], n1[0],n1[1],n1[2], col[0],col[1],col[2]);
+      // tri b0,t1,t0
+      verts.push(b0[0],b0[1],b0[2], n0[0],n0[1],n0[2], col[0],col[1],col[2]);
+      verts.push(t1p[0],t1p[1],t1p[2], n1[0],n1[1],n1[2], col[0],col[1],col[2]);
+      verts.push(t0p[0],t0p[1],t0p[2], n0[0],n0[1],n0[2], col[0],col[1],col[2]);
+      // caps (fan)
+      const topC = transformPoint(m, [0, hh, 0]);
+      const botC = transformPoint(m, [0, -hh, 0]);
+      const nTop = transformNormal(m, [0,1,0]);
+      const nBot = transformNormal(m, [0,-1,0]);
+      verts.push(topC[0],topC[1],topC[2], nTop[0],nTop[1],nTop[2], col[0],col[1],col[2]);
+      verts.push(t0p[0],t0p[1],t0p[2], nTop[0],nTop[1],nTop[2], col[0],col[1],col[2]);
+      verts.push(t1p[0],t1p[1],t1p[2], nTop[0],nTop[1],nTop[2], col[0],col[1],col[2]);
+      verts.push(botC[0],botC[1],botC[2], nBot[0],nBot[1],nBot[2], col[0],col[1],col[2]);
+      verts.push(b1[0],b1[1],b1[2], nBot[0],nBot[1],nBot[2], col[0],col[1],col[2]);
+      verts.push(b0[0],b0[1],b0[2], nBot[0],nBot[1],nBot[2], col[0],col[1],col[2]);
+    }
+  }
+  function addGround(size, col) {
+    const h = size / 2;
+    const n = [0, 1, 0];
+    pushTri([-h,0,-h],[h,0,-h],[h,0,h], n, col);
+    pushTri([-h,0,-h],[h,0,h],[-h,0,h], n, col);
+  }
+
+  // Ground
+  addGround(24, [0.32, 0.34, 0.38]);
+
+  // Center cube
+  addCube(1.4, [0, 0.7, 0], 0.4, [0.95, 0.45, 0.35]);
+  // Spheres (cardinal)
+  addSphere(0.7, [ 3.2, 0.7, 0], [0.35, 0.65, 0.95]);
+  addSphere(0.7, [-3.2, 0.7, 0], [0.45, 0.85, 0.45]);
+  addSphere(0.7, [0, 0.7,  3.2], [0.95, 0.80, 0.35]);
+  addSphere(0.7, [0, 0.7, -3.2], [0.75, 0.55, 0.95]);
+  // Small cubes (diagonals)
+  addCube(0.8, [ 2.4, 0.4,  2.4], 0.2, [0.95, 0.65, 0.30]);
+  addCube(0.8, [-2.4, 0.4,  2.4], 0.7, [0.30, 0.80, 0.75]);
+  addCube(0.8, [ 2.4, 0.4, -2.4], 1.1, [0.60, 0.70, 0.95]);
+  addCube(0.8, [-2.4, 0.4, -2.4], 0.5, [0.95, 0.50, 0.60]);
+  // Cylinders
+  addCylinder(0.45, 1.2, [ 4.2, 0.6,  2.0], [0.55, 0.90, 0.55]);
+  addCylinder(0.45, 1.2, [-4.2, 0.6, -2.0], [0.90, 0.60, 0.85]);
+
+  return new Float32Array(verts);
+}
+
+/* ---------------- state ---------------- */
+const state = {
+  yaw: 0.6, pitch: 0.55, dist: 10, target: [0, 1, 0],
+  azDeg: 45, elDeg: 50, lightColor: [1,1,1], intensity: 1.0,
+  ambient: 0.25, shininess: 32,
+  shadows: true, shadowSize: 1024, shadowStrength: 0.85,
+  autoRotate: true, rotateSpeed: 0.3,
+  paused: false,
+  dirty: true,
+};
+const DEFAULT_CAM = { yaw: 0.6, pitch: 0.55, dist: 10, target: [0,1,0] };
+
+/* ---------------- WGSL ---------------- */
+const shaderWGSL = /* wgsl */`
+struct CameraUniforms {
+  viewProj: mat4x4f,
+  cameraPos: vec4f,   // xyz = pos
+  lightDir: vec4f,    // xyz = dir TO light (normalized), w = intensity
+  lightColor: vec4f,  // rgb = color, w = ambient
+  lightViewProj: mat4x4f,
+  params: vec4f,      // x = shininess, y = shadowEnabled, z = shadowStrength
+};
+
+@group(0) @binding(0) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var shadowTex: texture_depth_2d;
+@group(0) @binding(2) var shadowSampler: sampler_comparison;
+
+struct VertexInput {
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) color: vec3f,
+};
+
+struct VertexOutput {
+  @builtin(position) clipPos: vec4f,
+  @location(0) worldPos: vec3f,
+  @location(1) normal: vec3f,
+  @location(2) color: vec3f,
+  @location(3) lightSpacePos: vec4f,
+};
+
+@vertex
+fn vsMain(input: VertexInput) -> VertexOutput {
+  var out: VertexOutput;
+  out.worldPos = input.position;
+  out.normal = normalize(input.normal);
+  out.color = input.color;
+  out.clipPos = camera.viewProj * vec4f(input.position, 1.0);
+  out.lightSpacePos = camera.lightViewProj * vec4f(input.position, 1.0);
+  return out;
+}
+
+@fragment
+fn fsMain(in: VertexOutput) -> @location(0) vec4f {
+  let N = normalize(in.normal);
+  let L = normalize(camera.lightDir.xyz);
+  let V = normalize(camera.cameraPos.xyz - in.worldPos);
+  let H = normalize(L + V);
+
+  let diff = max(dot(N, L), 0.0);
+  let spec = pow(max(dot(N, H), 0.0), camera.params.x);
+
+  var shadow = 1.0;
+  if (camera.params.y > 0.5) {
+    let ndc = in.lightSpacePos.xyz / in.lightSpacePos.w;
+    let uv = ndc.xy * 0.5 + 0.5;
+    if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && ndc.z >= 0.0 && ndc.z <= 1.0) {
+      let depth = clamp(ndc.z - 0.0008, 0.0, 1.0);
+      let s = textureSampleCompare(shadowTex, shadowSampler, uv, depth);
+      shadow = mix(1.0, s, camera.params.z);
+    }
+  }
+
+  let ambient = camera.lightColor.w;
+  let lightCol = camera.lightColor.rgb * camera.lightDir.w;
+  let albedo = in.color;
+
+  // Blinn-Phong: ambient + diffuse + Blinn specular (specular tinted by light color)
+  var col = albedo * ambient + (albedo * diff + spec * vec3f(1.0)) * lightCol * shadow;
+  return vec4f(col, 1.0);
+}
+
+@vertex
+fn vsShadow(input: VertexInput) -> @builtin(position) vec4f {
+  return camera.lightViewProj * vec4f(input.position, 1.0);
+}
+`;
+
+/* ---------------- WebGPU setup ---------------- */
+let device, context, canvasFormat;
+let mainPipeline, shadowPipeline, bindGroupLayout, bindGroup;
+let vertexBuffer, uniformBuffer, shadowTexture, shadowView, depthTexture, depthView;
+let vertexCount = 0, triangleCount = 0;
+let canvasW = 0, canvasH = 0;
+
+async function initGPU() {
+  if (!("gpu" in navigator)) {
+    throw new Error("WebGPU is not available in this browser. Use a recent Chrome/Edge (or Firefox with WebGPU enabled) over HTTPS or localhost.");
+  }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new Error("No WebGPU adapter found. Your GPU/browser may not support WebGPU.");
+  device = await adapter.requestDevice();
+
+  context = canvas.getContext("webgpu");
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format: canvasFormat, alphaMode: "opaque" });
+
+  // Bake geometry once
+  const data = buildScene();
+  vertexCount = data.length / 9;
+  triangleCount = vertexCount / 3;
+
+  vertexBuffer = device.createBuffer({
+    size: data.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Float32Array(vertexBuffer.getMappedRange()).set(data);
+  vertexBuffer.unmap();
+
+  // Uniforms: 192 bytes (48 floats)
+  uniformBuffer = device.createBuffer({
+    size: 192,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Bind group layout
+  bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth", viewDimension: "2d" } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } },
+    ],
+  });
+
+  const shaderModule = device.createShaderModule({ code: shaderWGSL });
+
+  const vertexLayout = {
+    arrayStride: 36,
+    attributes: [
+      { format: "float32x3", offset: 0, shaderLocation: 0 },
+      { format: "float32x3", offset: 12, shaderLocation: 1 },
+      { format: "float32x3", offset: 24, shaderLocation: 2 },
+    ],
+  };
+
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+  mainPipeline = device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module: shaderModule, entryPoint: "vsMain", buffers: [vertexLayout] },
+    fragment: {
+      module: shaderModule, entryPoint: "fsMain",
+      targets: [{ format: canvasFormat }],
+    },
+    primitive: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
+    depthStencil: {
+      format: "depth32float",
+      depthWriteEnabled: true,
+      depthCompare: "less",
+    },
+  });
+
+  shadowPipeline = device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module: shaderModule, entryPoint: "vsShadow", buffers: [vertexLayout] },
+    // depth-only: no fragment, no color targets
+    primitive: { topology: "triangle-list", cullMode: "back", frontFace: "ccw" },
+    depthStencil: {
+      format: "depth32float",
+      depthWriteEnabled: true,
+      depthCompare: "less",
+    },
+  });
+
+  createShadowTexture();
+  createDepthTexture();
+  updateBindGroup();
+  resizeCanvas();
+}
+
+function createShadowTexture() {
+  if (shadowTexture) shadowTexture.destroy();
+  shadowTexture = device.createTexture({
+    size: [state.shadowSize, state.shadowSize, 1],
+    format: "depth32float",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  shadowView = shadowTexture.createView();
+}
+
+function createDepthTexture() {
+  if (depthTexture) depthTexture.destroy();
+  const w = Math.max(1, canvasW), h = Math.max(1, canvasH);
+  depthTexture = device.createTexture({
+    size: [w, h, 1],
+    format: "depth32float",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  depthView = depthTexture.createView();
+}
+
+function updateBindGroup() {
+  const shadowSampler = device.createSampler({
+    compare: "less",
+    magFilter: "linear",
+    minFilter: "linear",
+  });
+  bindGroup = device.createBindGroup({
+    layout: bindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: shadowView },
+      { binding: 2, resource: shadowSampler },
+    ],
+  });
+}
+
+function resizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2); // cap for perf
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (w !== canvasW || h !== canvasH) {
+    canvasW = w; canvasH = h;
+    canvas.width = w; canvas.height = h;
+    createDepthTexture();
+    state.dirty = true;
+  }
+}
+
+/* ---------------- camera / light math ---------------- */
+function cameraPosition() {
+  const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+  const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
+  return [
+    state.target[0] + state.dist * cp * sy,
+    state.target[1] + state.dist * sp,
+    state.target[2] + state.dist * cp * cy,
+  ];
+}
+function lightDirection() {
+  const az = state.azDeg * Math.PI / 180;
+  const el = state.elDeg * Math.PI / 180;
+  return [
+    Math.cos(el) * Math.cos(az),
+    Math.sin(el),
+    Math.cos(el) * Math.sin(az),
+  ];
+}
+function computeUniforms() {
+  const aspect = canvasW / Math.max(1, canvasH);
+  const proj = mat4Perspective(45 * Math.PI / 180, aspect, 0.1, 100);
+  const camPos = cameraPosition();
+  const view = mat4LookAt(camPos, state.target, [0, 1, 0]);
+  const viewProj = mat4Multiply(proj, view);
+
+  const L = lightDirection();
+  const lightPos = [L[0]*15, L[1]*15, L[2]*15];
+  // avoid degenerate up when light is near-vertical
+  const up = Math.abs(L[1]) > 0.95 ? [0, 0, 1] : [0, 1, 0];
+  const lightView = mat4LookAt(lightPos, [0, 0, 0], up);
+  const lightProj = mat4Ortho(-8, 8, -8, 8, 0.5, 30);
+  const lightViewProj = mat4Multiply(lightProj, lightView);
+
+  const u = new Float32Array(48);
+  u.set(viewProj, 0);
+  u.set([camPos[0], camPos[1], camPos[2], 0], 16);
+  u.set([L[0], L[1], L[2], state.intensity], 20);
+  u.set([state.lightColor[0], state.lightColor[1], state.lightColor[2], state.ambient], 24);
+  u.set(lightViewProj, 28);
+  u.set([state.shininess, state.shadows ? 1 : 0, state.shadowStrength, 0], 44);
+  return u;
+}
+
+/* ---------------- render loop ---------------- */
+let rafId = 0, lastTime = 0;
+let frames = 0, fpsTime = 0;
+
+function frame(now) {
+  rafId = requestAnimationFrame(frame);
+  if (state.paused) { lastTime = now; return; }
+  const dt = Math.min(0.1, (now - lastTime) / 1000 || 0.016);
+  lastTime = now;
+
+  if (state.autoRotate) {
+    state.yaw += state.rotateSpeed * dt;
+    state.dirty = true;
+  }
+
+  if (state.dirty) {
+    device.queue.writeBuffer(uniformBuffer, 0, computeUniforms());
+    state.dirty = false;
+  }
+
+  const encoder = device.createCommandEncoder();
+  const drawCalls = state.shadows ? 2 : 1;
+
+  // Shadow pass (depth only)
+  if (state.shadows) {
+    const sp = encoder.beginRenderPass({
+      colorAttachments: [],
+      depthStencilAttachment: {
+        view: shadowView,
+        depthLoadOp: "clear",
+        depthStoreOp: "store",
+        depthClearValue: 1.0,
+      },
+    });
+    sp.setPipeline(shadowPipeline);
+    sp.setBindGroup(0, bindGroup);
+    sp.setVertexBuffer(0, vertexBuffer);
+    sp.draw(vertexCount);
+    sp.end();
+  }
+
+  // Main pass
+  const colorView = context.getCurrentTexture().createView();
+  const mp = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: colorView,
+      loadOp: "clear",
+      storeOp: "store",
+      clearValue: { r: 0.07, g: 0.09, b: 0.12, a: 1.0 },
+    }],
+    depthStencilAttachment: {
+      view: depthView,
+      depthLoadOp: "clear",
+      depthStoreOp: "store",
+      depthClearValue: 1.0,
+    },
+  });
+  mp.setPipeline(mainPipeline);
+  mp.setBindGroup(0, bindGroup);
+  mp.setVertexBuffer(0, vertexBuffer);
+  mp.draw(vertexCount);
+  mp.end();
+
+  device.queue.submit([encoder.finish()]);
+
+  // FPS (DOM update at most ~2x/sec to avoid layout thrash)
+  frames++;
+  if (now - fpsTime >= 500) {
+    const fps = frames * 1000 / Math.max(1, now - fpsTime);
+    const ms = 1000 / Math.max(1, fps);
+    $("fps").textContent = fps.toFixed(0);
+    $("ms").textContent = ms.toFixed(1) + " ms";
+    $("tris").textContent = triangleCount.toLocaleString();
+    $("verts").textContent = vertexCount.toLocaleString();
+    $("draws").textContent = String(drawCalls);
+    $("shadowInfo").textContent = state.shadows ? `${state.shadowSize}²` : "off";
+    frames = 0; fpsTime = now;
+  }
+}
+
+/* ---------------- input ---------------- */
+let dragging = false, lastX = 0, lastY = 0;
+const pointers = new Map();
+
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  dragging = true;
+  lastX = e.clientX; lastY = e.clientY;
+  canvas.classList.add("dragging");
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size === 1) {
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    state.yaw -= dx * 0.005;
+    state.pitch = Math.min(1.45, Math.max(0.05, state.pitch + dy * 0.005));
+    state.dirty = true;
+  } else if (pointers.size === 2) {
+    // pinch zoom
+    const pts = [...pointers.values()];
+    const d = Math.hypot(pts[0][0]-pts[1][0], pts[0][1]-pts[1][1]);
+    if (lastPinch > 0) {
+      state.dist = Math.min(30, Math.max(3, state.dist * (lastPinch / d)));
+      state.dirty = true;
+    }
+    lastPinch = d;
+  }
+});
+let lastPinch = 0;
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size === 0) { dragging = false; lastPinch = 0; canvas.classList.remove("dragging"); }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  state.dist = Math.min(30, Math.max(3, state.dist * (1 + Math.sign(e.deltaY) * 0.1)));
+  state.dirty = true;
+}, { passive: false });
+
+window.addEventListener("resize", resizeCanvas);
+if ("ResizeObserver" in window) new ResizeObserver(resizeCanvas).observe(canvas);
+
+/* ---------------- UI bindings ---------------- */
+function bindRange(id, outId, fmt, apply) {
+  const el = $(id), out = $(outId);
+  const sync = () => { out.textContent = fmt(parseFloat(el.value)); apply(parseFloat(el.value)); state.dirty = true; };
+  el.addEventListener("input", sync);
+  sync();
+}
+bindRange("in-az", "o-az", v => `${v.toFixed(0)}°`, v => state.azDeg = v);
+bindRange("in-el", "o-el", v => `${v.toFixed(0)}°`, v => state.elDeg = v);
+bindRange("in-int", "o-int", v => v.toFixed(2), v => state.intensity = v);
+bindRange("in-amb", "o-amb", v => v.toFixed(2), v => state.ambient = v);
+bindRange("in-shin", "o-shin", v => v.toFixed(0), v => state.shininess = v);
+bindRange("in-sstr", "o-sstr", v => v.toFixed(2), v => state.shadowStrength = v);
+bindRange("in-rspeed", "o-rspeed", v => v.toFixed(2), v => state.rotateSpeed = v);
+
+$("in-color").addEventListener("input", (e) => {
+  const hex = e.target.value;
+  state.lightColor = [
+    parseInt(hex.slice(1,3), 16) / 255,
+    parseInt(hex.slice(3,5), 16) / 255,
+    parseInt(hex.slice(5,7), 16) / 255,
+  ];
+  state.dirty = true;
+});
+$("in-shadow").addEventListener("change", (e) => { state.shadows = e.target.checked; state.dirty = true; });
+$("in-rotate").addEventListener("change", (e) => { state.autoRotate = e.target.checked; });
+$("in-shadowsize").addEventListener("change", (e) => {
+  state.shadowSize = parseInt(e.target.value, 10);
+  createShadowTexture();
+  updateBindGroup();
+  state.dirty = true;
+});
+
+function resetCamera() {
+  state.yaw = DEFAULT_CAM.yaw; state.pitch = DEFAULT_CAM.pitch;
+  state.dist = DEFAULT_CAM.dist; state.target = [...DEFAULT_CAM.target];
+  state.dirty = true;
+}
+$("btn-reset").addEventListener("click", resetCamera);
+$("btn-pause").addEventListener("click", () => {
+  state.paused = !state.paused;
+  $("btn-pause").textContent = state.paused ? "Resume" : "Pause";
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "SELECT")) return;
+  if (e.code === "KeyR") resetCamera();
+  else if (e.code === "Space") { e.preventDefault(); $("btn-pause").click(); }
+  else if (e.code === "KeyS") {
+    const cb = $("in-shadow"); cb.checked = !cb.checked;
+    cb.dispatchEvent(new Event("change"));
+  }
+});
+
+/* ---------------- boot ---------------- */
+(async () => {
+  try {
+    await initGPU();
+    hideOverlay();
+    fpsTime = performance.now();
+    lastTime = performance.now();
+    rafId = requestAnimationFrame(frame);
+  } catch (err) {
+    console.error(err);
+    showError(
+      "WebGPU unavailable",
+      "This preview paints in WebGPU. Please use a recent Chrome/Edge (or Firefox with WebGPU enabled) over HTTPS or localhost. If you are viewing this file directly, serve it with a local server instead of file://.",
+      String(err && err.message ? err.message : err)
+    );
+  }
+})();
+</script>
+</body>
+</html>

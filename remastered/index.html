@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<!--
+====================================================================================================
+  FRONTIER · remastered
+====================================================================================================
+  From scratch, single-file HTML. All painting and rendering happen in WebGPU.
+
+  Deliberately NOT carried over from the old 2d55bd2 tree: no ReSTIR, no reservoirs
+  (ReservoirTemporal / ReservoirSpatial / ReservoirRecords), no SDF spaces, no BVH,
+  no PBR / GI passes. The lighting model here is plain Blinn-Phong with ONE shadow
+  map (directional light, 3x3 PCF) — a simple preview path, nothing more.
+
+  What it does:
+    · procedurally generated UV sphere (no external assets) + ground plane
+    · strokes are deposited into a 1024x1024 rgba16float UV atlas by a WebGPU
+      compute pass (soft round dab, src-over blend, erase mode)
+    · sphere is shaded by sampling that atlas: Blinn-Phong + basic shadow map
+    · unpainted texels show a checker so "empty" is distinguishable from black
+    · orbit / pan / zoom camera, undo stack (texture snapshots), clear
+    · FPS + adapter readout so the simple path's speed can actually be measured
+
+  Open this file directly (file://) or over any static server. No build step.
+====================================================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frontier — remastered · WebGPU paint</title>
+<style>
+  :root {
+    --panel: rgba(16, 18, 24, 0.82);
+    --edge: rgba(255, 255, 255, 0.09);
+    --text: #d7dbe4;
+    --dim: #8b91a1;
+    --accent: #e63946;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12;
+               color: var(--text); font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  #Stage { position: fixed; inset: 0; }
+  #Paint, #Cursor { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #Cursor { pointer-events: none; }
+  #Paint { touch-action: none; cursor: crosshair; }
+
+  .Panel { position: absolute; background: var(--panel); border: 1px solid var(--edge);
+           border-radius: 10px; backdrop-filter: blur(8px); padding: 10px 12px; }
+
+  #Toolbar { top: 12px; left: 12px; display: flex; flex-wrap: wrap; gap: 10px 14px;
+             align-items: center; max-width: min(860px, calc(100vw - 24px)); }
+  #Toolbar .Title { font-weight: 700; letter-spacing: 0.12em; font-size: 12px; }
+  #Toolbar .Title em { color: var(--accent); font-style: normal; }
+  #Toolbar label { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  #Toolbar input[type="range"] { width: 90px; accent-color: var(--accent); }
+  #Toolbar input[type="color"] { width: 30px; height: 24px; padding: 0; border: 1px solid var(--edge);
+                                  border-radius: 6px; background: none; cursor: pointer; }
+  #Toolbar .Val { color: var(--text); min-width: 3ch; display: inline-block; }
+  #Toolbar button { background: rgba(255,255,255,0.07); color: var(--text); border: 1px solid var(--edge);
+                    border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  #Toolbar button:hover { background: rgba(255,255,255,0.14); }
+  #Toolbar button.On { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  #Readout { top: 12px; right: 12px; min-width: 210px; font-size: 12px; }
+  .Row { display: flex; justify-content: space-between; gap: 14px; padding: 1px 0; }
+  .Row .K { color: var(--dim); }
+  .Row .V { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  #Hint { bottom: 12px; left: 50%; transform: translateX(-50%); color: var(--dim);
+          font-size: 12px; white-space: nowrap; }
+  #Hint b { color: var(--text); } #Hint kbd { background: rgba(255,255,255,0.08); border-radius: 4px;
+          padding: 0 5px; font-family: inherit; }
+
+  #Fault { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+           max-width: 520px; padding: 18px 22px; background: #3a1418; border: 1px solid #e63946;
+           border-radius: 10px; color: #ffd7da; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="Stage">
+  <canvas id="Paint"></canvas>
+  <canvas id="Cursor"></canvas>
+
+  <div id="Toolbar" class="Panel">
+    <span class="Title">FRONTIER <em>remastered</em></span>
+    <label>Ink <input type="color" id="Color" value="#e63946"></label>
+    <label>Size <input type="range" id="Size" min="6" max="160" value="42"><span class="Val" id="SizeVal">42</span></label>
+    <label>Flow <input type="range" id="Flow" min="1" max="100" value="85"><span class="Val" id="FlowVal">85</span></label>
+    <label>Edge <input type="range" id="Hard" min="0" max="100" value="55"><span class="Val" id="HardVal">55</span></label>
+    <button id="Erase" title="E">Erase</button>
+    <button id="Undo" title="Ctrl+Z">Undo</button>
+    <button id="Clear" title="C">Clear</button>
+  </div>
+
+  <div id="Readout" class="Panel">
+    <div class="Row"><span class="K">Adapter</span><span class="V" id="RAdapter">—</span></div>
+    <div class="Row"><span class="K">FPS</span><span class="V" id="RFps">—</span></div>
+    <div class="Row"><span class="K">Strokes</span><span class="V" id="RStrokes">0</span></div>
+    <div class="Row"><span class="K">Dabs</span><span class="V" id="RDabs">0</span></div>
+    <div class="Row"><span class="K">Atlas</span><span class="V" id="RAtlas">—</span></div>
+    <div class="Row"><span class="K">Mode</span><span class="V" id="RMode">paint</span></div>
+  </div>
+
+  <div id="Hint" class="Panel">
+    <b>left-drag</b> paint · <b>right-drag</b> orbit · <b>middle-drag</b> pan · <b>wheel</b> zoom ·
+    <kbd>E</kbd> erase · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · <kbd>C</kbd> clear
+  </div>
+
+  <div id="Fault" hidden></div>
+</div>
+
+<script type="module">
+//--------------------------------------------------------------------------------------------------
+//  tiny vec/mat helpers (column-major mat4, WebGPU clip z in [0,1])
+//--------------------------------------------------------------------------------------------------
+const V3 = {
+  sub:   (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
+  add:   (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
+  scale: (a, s) => [a[0]*s, a[1]*s, a[2]*s],
+  dot:   (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2],
+  cross: (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]],
+  norm:  (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; },
+};
+const lerp3 = (a, b, t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+
+function mat4Perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f;
+  m[10] = far / (near - far); m[11] = -1;
+  m[14] = far * near / (near - far);
+  return m;
+}
+function mat4LookAt(eye, target, up) {
+  const z = V3.norm(V3.sub(eye, target));
+  const x = V3.norm(V3.cross(up, z));
+  const y = V3.cross(z, x);
+  const m = new Float32Array(16);
+  m[0]=x[0]; m[1]=y[0]; m[2]=z[0];
+  m[4]=x[1]; m[5]=y[1]; m[6]=z[1];
+  m[8]=x[2]; m[9]=y[2]; m[10]=z[2];
+  m[12]=-V3.dot(x,eye); m[13]=-V3.dot(y,eye); m[14]=-V3.dot(z,eye); m[15]=1;
+  return m;
+}
+function mat4Ortho(l, r, b, t, n, f) {
+  const m = new Float32Array(16);
+  m[0]=2/(r-l); m[5]=2/(t-b); m[10]=1/(n-f);
+  m[12]=-(r+l)/(r-l); m[13]=-(t+b)/(t-b); m[14]=-n/(n-f); m[15]=1;
+  return m;
+}
+function mat4Mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+r] * b[c*4+k];
+    o[c*4+r] = s;
+  }
+  return o;
+}
+const mat4Identity = () => { const m = new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; };
+
+//--------------------------------------------------------------------------------------------------
+//  WGSL — one lit pipeline (Blinn-Phong + one shadow map), one dab-deposit compute pass.
+//  No reservoir / ReSTIR / SDF / BVH code anywhere: this file is the from-scratch renderer.
+//--------------------------------------------------------------------------------------------------
+const MainWGSL = /* wgsl */`
+struct Frame {
+  viewProj     : mat4x4f,
+  lightViewProj: mat4x4f,
+  cameraPos    : vec4f,
+  lightDir     : vec4f,   // direction TOWARD the light
+  lightColor   : vec4f,
+  ambient      : vec4f,
+  shadowParams : vec4f,   // x = shadow map extent, y = bias, z = unused, w = enabled
+};
+struct Object {
+  model  : mat4x4f,
+  params : vec4f,         // x = sample paint atlas, y = spec strength, z = shininess, w = receive shadow
+};
+
+@group(0) @binding(0) var<uniform> F : Frame;
+@group(1) @binding(0) var<uniform> O : Object;
+@group(1) @binding(1) var ShadowCmp : sampler_comparison;
+@group(1) @binding(2) var ShadowMap : texture_depth_2d;
+@group(1) @binding(3) var AtlasSamp : sampler;
+@group(1) @binding(4) var Atlas     : texture_2d<f32>;
+
+struct VOut {
+  @builtin(position) pos : vec4f,
+  @location(0) world : vec3f,
+  @location(1) normal : vec3f,
+  @location(2) uv : vec2f,
+};
+
+@vertex
+fn vs(@location(0) position : vec3f, @location(1) normal : vec3f, @location(2) uv : vec2f) -> VOut {
+  var o : VOut;
+  let wp = O.model * vec4f(position, 1.0);
+  o.pos    = F.viewProj * wp;
+  o.world  = wp.xyz;
+  o.normal = normalize((O.model * vec4f(normal, 0.0)).xyz);   // models are rigid/uniform-scale
+  o.uv     = uv;
+  return o;
+}
+
+@fragment
+fn fs(v : VOut) -> @location(0) vec4f {
+  // ---- albedo: paint atlas (checker where unpainted) or solid ground ----------------------
+  var albedo : vec3f;
+  if (O.params.x > 0.5) {
+    let p    = textureSample(Atlas, AtlasSamp, v.uv);
+    let cov  = clamp(p.a, 0.0, 1.0);
+    let cc   = floor(v.uv * vec2f(28.0, 28.0));
+    let parity = fract((cc.x + cc.y) * 0.5);
+    let checker = mix(vec3f(0.13, 0.14, 0.17), vec3f(0.22, 0.23, 0.26), parity);
+    albedo = mix(checker, p.rgb, cov);
+  } else {
+    let gc = floor(v.world.xz);
+    let gp = fract((gc.x + gc.y) * 0.5);
+    albedo = mix(vec3f(0.22, 0.225, 0.245), vec3f(0.295, 0.30, 0.315), gp);
+  }
+
+  let N = normalize(v.normal);
+  let L = normalize(F.lightDir.xyz);
+  let V = normalize(F.cameraPos.xyz - v.world);
+  let diff = max(dot(N, L), 0.0);
+
+  // ---- basic shadow: one directional shadow map, 3x3 PCF --------------------------------
+  var shadow = 1.0;
+  if (F.shadowParams.w > 0.5 && O.params.w > 0.5) {
+    let ls = F.lightViewProj * vec4f(v.world, 1.0);
+    let suv = ls.xy / ls.w * 0.5 + vec2f(0.5, 0.5);
+    let depth = ls.z / ls.w;
+    if (suv.x > 0.0 && suv.x < 1.0 && suv.y > 0.0 && suv.y < 1.0 && depth > 0.0 && depth < 1.0) {
+      let bias = F.shadowParams.y + 0.006 * (1.0 - diff);
+      let texel = 1.0 / F.shadowParams.x;
+      let base = clamp(suv, vec2f(0.002, 0.002), vec2f(0.998, 0.998));
+      var sum = 0.0;
+      for (var i = -1; i <= 1; i = i + 1) {
+        for (var j = -1; j <= 1; j = j + 1) {
+          sum = sum + textureSampleCompare(ShadowMap, ShadowCmp,
+                  base + vec2f(f32(i), f32(j)) * texel, depth - bias);
+        }
+      }
+      shadow = sum / 9.0;
+    }
+  }
+
+  // ---- Blinn-Phong --------------------------------------------------------------------------
+  let H = normalize(L + V);
+  let spec = pow(max(dot(N, H), 0.0), O.params.z) * O.params.y;
+  let hemi = mix(vec3f(0.10, 0.10, 0.12), vec3f(0.32, 0.35, 0.42), N.y * 0.5 + 0.5);
+  var color = albedo * hemi * F.ambient.rgb
+            + albedo * F.lightColor.rgb * diff * shadow
+            + F.lightColor.rgb * spec * shadow;
+
+  // ---- distance fog + gamma (preview grade, not a PBR pipeline) ----------------------------
+  let dist = length(F.cameraPos.xyz - v.world);
+  let fog = clamp((dist - 5.0) / 12.0, 0.0, 1.0) * 0.55;
+  color = mix(color, vec3f(0.045, 0.05, 0.065), fog);
+  color = pow(max(color, vec3f(0.0)), vec3f(1.0 / 2.2));
+  return vec4f(color, 1.0);
+}
+`;
+
+const ShadowWGSL = /* wgsl */`
+struct Light { viewProj : mat4x4f };
+struct Object { model : mat4x4f };
+@group(0) @binding(0) var<uniform> L : Light;
+@group(1) @binding(0) var<uniform> O : Object;
+
+@vertex
+fn vs(@location(0) position : vec3f) -> @builtin(position) vec4f {
+  return L.viewProj * O.model * vec4f(position, 1.0);
+}
+`;
+
+// One dab = one dispatch over the dab's bounding box in atlas texels. Ping-pong: reads the
+// previous atlas as a sampled texture, writes the next atlas as a storage texture.
+const DabWGSL = /* wgsl */`
+struct Dab {
+  center    : vec2f,   // uv
+  origin    : vec2f,   // dispatch origin in texels (may be negative on u seam)
+  color     : vec4f,   // rgb, a = strength (flow)
+  radiusU   : f32,     // dab radius in u
+  radiusV   : f32,     // dab radius in v (2x because v spans half the arc of u)
+  mode      : f32,     // 0 = paint, 1 = erase
+  hardness  : f32,
+  atlasSize : f32,
+};
+@group(0) @binding(0) var<uniform> D : Dab;
+@group(0) @binding(1) var AtlasIn  : texture_2d<f32>;
+@group(0) @binding(2) var AtlasOut : texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn splat(@builtin(global_invocation_id) gid : vec3u) {
+  let W = i32(D.atlasSize);
+  let x = i32(D.origin.x) + i32(gid.x);
+  let y = i32(D.origin.y) + i32(gid.y);
+  if (y < 0 || y >= W) { return; }
+  let xt = ((x % W) + W) % W;              // u wraps around the seam; box width < W so no double-hit
+  let u = (f32(xt) + 0.5) / D.atlasSize;
+  let v = (f32(y) + 0.5) / D.atlasSize;
+
+  var du = abs(u - D.center.x);
+  du = min(du, 1.0 - du);
+  let dv = abs(v - D.center.y);
+  let d = length(vec2f(du / max(D.radiusU, 1e-5), dv / max(D.radiusV, 1e-5)));
+  if (d > 1.0) { return; }
+
+  let edge = clamp((1.0 - d) / max(1.0 - D.hardness, 0.001), 0.0, 1.0);
+  let a = edge * D.color.a;
+  if (a <= 0.0) { return; }
+
+  let prev = textureLoad(AtlasIn, vec2i(xt, y));
+  var outv : vec4f;
+  if (D.mode > 0.5) {
+    outv = vec4f(prev.rgb, max(prev.a - a, 0.0));
+  } else {
+    let na = min(prev.a + a, 1.0);
+    let t  = a / max(na, 1e-4);
+    outv = vec4f(mix(prev.rgb, D.color.rgb, t), na);
+  }
+  textureStore(AtlasOut, vec2i(xt, y), outv);
+}
+`;
+
+//--------------------------------------------------------------------------------------------------
+//  constants / state
+//--------------------------------------------------------------------------------------------------
+const ATLAS = 1024;                 // paint atlas extent [px]
+const SHADOW_EXTENT = 2048;
+const SPHERE_R = 1.0;
+const FOV = 40 * Math.PI / 180;
+const MAX_DABS_PER_SUBMIT = 1024;   // compute dispatches per command buffer
+const MAX_UNDO = 8;
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("Paint");
+const cursorCanvas = $("Cursor");
+
+const Probe = { Stage: "start" };
+window.ProbeReport = Probe;
+
+function fault(msg) { const f = $("Fault"); f.hidden = false; f.textContent = msg; Probe.Fault = String(msg); }
+
+const Brush = {
+  px: 42,               // brush radius in atlas px (authored quantity)
+  flow: 0.85,
+  hardness: 0.55,
+  color: [0.90, 0.22, 0.27],
+  erase: false,
+};
+const Cam = { yaw: 0.65, pitch: 0.32, dist: 3.6, target: [0, -0.15, 0] };
+
+const S = {
+  device: null, ctx: null, format: null,
+  atlasA: null, atlasB: null, empty: null, parity: 0,       // parity 0 => A is the readable atlas
+  shadowTex: null, shadowView: null, depthTex: null, depthView: null,
+  mainPipeline: null, shadowPipeline: null, dabPipeline: null,
+  frameUBO: null, lightUBO: null, objSphere: null, objGround: null, dabUBO: null,
+  frameBG: null, lightBG: null, shadowObjBG: null, mainBG: null, dabBG: [null, null],
+  sphereVB: null, sphereIB: null, sphereIdx: 0,
+  groundVB: null, groundIB: null,
+  pending: [], strokes: 0, dabs: 0, undoStack: [],
+  painting: false, orbiting: 0, lastPointer: null, strokeLast: null,
+  camEye: [0, 0, 0], basis: null, viewProj: null,
+  fps: 0, fpsFrames: 0, fpsTime: 0,
+};
+
+//--------------------------------------------------------------------------------------------------
+//  procedural geometry — no external assets
+//--------------------------------------------------------------------------------------------------
+function buildSphere(seg, rings) {
+  const verts = [], idx = [];
+  for (let j = 0; j <= rings; j++) {
+    const v = j / rings, phi = v * Math.PI;
+    const y = Math.cos(phi), r = Math.sin(phi);
+    for (let i = 0; i <= seg; i++) {
+      const u = i / seg, theta = u * 2 * Math.PI;
+      const x = r * Math.cos(theta), z = r * Math.sin(theta);
+      verts.push(x, y, z,  x, y, z,  u, 1 - v);   // v=1 at top pole, matching the picker
+    }
+  }
+  for (let j = 0; j < rings; j++) for (let i = 0; i < seg; i++) {
+    const a = j * (seg + 1) + i, b = a + 1, c = a + seg + 1, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  return { verts: new Float32Array(verts), idx: new Uint32Array(idx) };
+}
+function buildGround(half, y) {
+  const verts = new Float32Array([
+    -half, y, -half,  0, 1, 0,  0, 0,
+     half, y, -half,  0, 1, 0,  1, 0,
+     half, y,  half,  0, 1, 0,  1, 1,
+    -half, y,  half,  0, 1, 0,  0, 1,
+  ]);
+  return { verts, idx: new Uint32Array([0, 1, 2, 0, 2, 3]) };
+}
+
+//--------------------------------------------------------------------------------------------------
+//  camera
+//--------------------------------------------------------------------------------------------------
+function updateCamera(aspect) {
+  const cp = Math.cos(Cam.pitch), sp = Math.sin(Cam.pitch);
+  const eye = [
+    Cam.target[0] + Cam.dist * cp * Math.sin(Cam.yaw),
+    Cam.target[1] + Cam.dist * sp,
+    Cam.target[2] + Cam.dist * cp * Math.cos(Cam.yaw),
+  ];
+  const fwd = V3.norm(V3.sub(Cam.target, eye));
+  const right = V3.norm(V3.cross(fwd, [0, 1, 0]));
+  const up = V3.cross(right, fwd);
+  S.camEye = eye;
+  S.basis = { fwd, right, up };
+  const view = mat4LookAt(eye, Cam.target, [0, 1, 0]);
+  S.viewProj = mat4Mul(mat4Perspective(FOV, aspect, 0.05, 60), view);
+  return eye;
+}
+
+//--------------------------------------------------------------------------------------------------
+//  picking — analytic ray/sphere on the CPU; the deposit itself is a GPU compute pass
+//--------------------------------------------------------------------------------------------------
+function pointerRay(e) {
+  const rect = canvas.getBoundingClientRect();
+  const nx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  const ny = 1 - ((e.clientY - rect.top) / rect.height) * 2;
+  const tanH = Math.tan(FOV / 2), aspect = rect.width / rect.height;
+  const b = S.basis;
+  const d = V3.norm(V3.add(b.fwd, V3.add(V3.scale(b.right, nx * tanH * aspect), V3.scale(b.up, ny * tanH))));
+  return { o: S.camEye, d };
+}
+function raySphereHit(o, d) {
+  const b = V3.dot(o, d), c = V3.dot(o, o) - SPHERE_R * SPHERE_R;
+  const disc = b * b - c;
+  if (disc < 0) return null;
+  const s = Math.sqrt(disc);
+  let t = -b - s; if (t < 0) t = -b + s;
+  if (t < 0) return null;
+  return V3.add(o, V3.scale(d, t));
+}
+// Must match buildSphere's parameterization: mesh angle theta = u * 2*pi, so
+// atan2(z, x) / (2*pi) (wrapped into [0,1)) IS the stored uv.x — no extra offset.
+const sphereUV = (p) => [
+  ((Math.atan2(p[2], p[0]) / (2 * Math.PI)) % 1 + 1) % 1,
+  Math.asin(Math.max(-1, Math.min(1, p[1] / SPHERE_R))) / Math.PI + 0.5,
+];
+
+//--------------------------------------------------------------------------------------------------
+//  dab deposit (WebGPU compute)
+//--------------------------------------------------------------------------------------------------
+const dabData = new Float32Array(16);
+function enqueueDab(p) {
+  const uv = sphereUV(p);
+  const ru = Brush.px / ATLAS;
+  const rv = ru * 2;                                  // v spans half the arc of u on a sphere
+  const ox = Math.floor((uv[0] - ru) * ATLAS);
+  const oy = Math.max(0, Math.floor((uv[1] - rv) * ATLAS));
+  const w = Math.min(ATLAS, Math.ceil((uv[0] + ru) * ATLAS)) - ox;   // w < ATLAS by brush cap
+  const h = Math.min(ATLAS, Math.ceil((uv[1] + rv) * ATLAS)) - oy;
+  if (w <= 0 || h <= 0) return;
+  dabData.set([uv[0], uv[1], ox, oy, Brush.color[0], Brush.color[1], Brush.color[2],
+               Brush.erase ? 1.0 : Brush.flow, ru, rv, Brush.erase ? 1 : 0, Brush.hardness, ATLAS, 0, 0, 0]);
+  // copy — dabData is reused per dab
+  S.pending.push({
+    data: new Float32Array(dabData), ox, oy, w, h,
+  });
+  S.dabs++;
+}
+
+function flushDabs() {
+  if (!S.pending.length) return;
+  const dabs = S.pending; S.pending = [];
+  let i = 0;
+  while (i < dabs.length) {
+    const chunk = dabs.slice(i, i + MAX_DABS_PER_SUBMIT);
+    i += MAX_DABS_PER_SUBMIT;
+    const enc = S.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(S.dabPipeline);
+    for (let k = 0; k < chunk.length; k++) {
+      const d = chunk[k];
+      S.device.queue.writeBuffer(S.dabUBO, k * 256, d.data);
+      pass.setBindGroup(0, S.dabBG[S.parity], [k * 256]);
+      pass.dispatchWorkgroups(Math.ceil(d.w / 8), Math.ceil(d.h / 8), 1);
+    }
+    pass.end();
+    S.device.queue.submit([enc.finish()]);
+    S.parity ^= 1;                                    // the written atlas becomes the readable one
+    S.dabBG[S.parity] = makeDabBG();
+  }
+  $("RDabs").textContent = S.dabs.toLocaleString();
+}
+
+function makeDabBG() {
+  const readTex = S.parity === 0 ? S.atlasA : S.atlasB;
+  const writeTex = S.parity === 0 ? S.atlasB : S.atlasA;
+  return S.device.createBindGroup({
+    layout: S.dabPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: S.dabUBO, offset: 0, size: 64 } },
+      { binding: 1, resource: readTex.createView() },
+      { binding: 2, resource: writeTex.createView() },
+    ],
+  });
+}
+
+//--------------------------------------------------------------------------------------------------
+//  undo — snapshot the readable atlas before each stroke; restore copies it into both ping-pong
+//--------------------------------------------------------------------------------------------------
+function snapshot() {
+  const src = S.parity === 0 ? S.atlasA : S.atlasB;
+  const backup = S.device.createTexture({
+    size: [ATLAS, ATLAS], format: "rgba16float",
+    usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+  });
+  const enc = S.device.createCommandEncoder();
+  enc.copyTextureToTexture({ texture: src }, { texture: backup }, [ATLAS, ATLAS]);
+  S.device.queue.submit([enc.finish()]);
+  S.undoStack.push(backup);
+  if (S.undoStack.length > MAX_UNDO) S.undoStack.shift().destroy();
+}
+function undo() {
+  const backup = S.undoStack.pop();
+  if (!backup) return;
+  const enc = S.device.createCommandEncoder();
+  enc.copyTextureToTexture({ texture: backup }, { texture: S.atlasA }, [ATLAS, ATLAS]);
+  enc.copyTextureToTexture({ texture: backup }, { texture: S.atlasB }, [ATLAS, ATLAS]);
+  S.device.queue.submit([enc.finish()]);
+  backup.destroy();
+}
+function clearAtlas() {
+  snapshot();
+  const enc = S.device.createCommandEncoder();
+  enc.copyTextureToTexture({ texture: S.empty }, { texture: S.atlasA }, [ATLAS, ATLAS]);
+  enc.copyTextureToTexture({ texture: S.empty }, { texture: S.atlasB }, [ATLAS, ATLAS]);
+  S.device.queue.submit([enc.finish()]);
+}
+
+//--------------------------------------------------------------------------------------------------
+//  init
+//--------------------------------------------------------------------------------------------------
+async function init() {
+  Probe.Stage = "navigator-gpu";
+  if (!navigator.gpu) { fault("WebGPU is not available in this browser (navigator.gpu missing)."); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { fault("No WebGPU adapter found."); return; }
+  const info = adapter.info ?? {};
+  Probe.AdapterVendor = info.vendor ?? "?"; Probe.AdapterArchitecture = info.architecture ?? "?";
+  $("RAdapter").textContent = `${Probe.AdapterVendor} / ${Probe.AdapterArchitecture}`;
+
+  Probe.Stage = "device";
+  const device = await adapter.requestDevice();
+  S.device = device;
+  device.addEventListener("uncapturederror", (e) => fault("GPU error: " + (e.error?.message ?? e.error)));
+  device.lost.then((l) => { if (l.reason !== "destroyed") fault("GPU device lost: " + l.message); });
+
+  const ctx = canvas.getContext("webgpu");
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: "opaque" });
+  S.ctx = ctx; S.format = format; Probe.SurfaceFormat = format;
+
+  // ---- paint atlas: ping-pong rgba16float + pristine empty copy ------------------------------
+  const atlasUsage = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING |
+                     GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+  S.atlasA = device.createTexture({ size: [ATLAS, ATLAS], format: "rgba16float", usage: atlasUsage });
+  S.atlasB = device.createTexture({ size: [ATLAS, ATLAS], format: "rgba16float", usage: atlasUsage });
+  S.empty  = device.createTexture({ size: [ATLAS, ATLAS], format: "rgba16float", usage: atlasUsage });
+  {
+    const zeros = new Uint8Array(ATLAS * ATLAS * 8);
+    device.queue.writeTexture({ texture: S.empty }, zeros, { bytesPerRow: ATLAS * 8 }, [ATLAS, ATLAS]);
+    device.queue.writeTexture({ texture: S.atlasA }, zeros, { bytesPerRow: ATLAS * 8 }, [ATLAS, ATLAS]);
+    device.queue.writeTexture({ texture: S.atlasB }, zeros, { bytesPerRow: ATLAS * 8 }, [ATLAS, ATLAS]);
+  }
+  $("RAtlas").textContent = `${ATLAS}² rgba16float`;
+
+  // ---- geometry -------------------------------------------------------------------------------
+  const sphere = buildSphere(128, 64);
+  const ground = buildGround(6, -1.4);
+  const mkBuf = (data, usage) => { const b = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
+    new Uint8Array(b.getMappedRange()).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)); b.unmap(); return b; };
+  S.sphereVB = mkBuf(sphere.verts, GPUBufferUsage.VERTEX);
+  S.sphereIB = mkBuf(sphere.idx, GPUBufferUsage.INDEX);
+  S.sphereIdx = sphere.idx.length;
+  S.groundVB = mkBuf(ground.verts, GPUBufferUsage.VERTEX);
+  S.groundIB = mkBuf(ground.idx, GPUBufferUsage.INDEX);
+
+  const vertexLayout = [{
+    arrayStride: 32,
+    attributes: [
+      { shaderLocation: 0, offset: 0,  format: "float32x3" },   // position
+      { shaderLocation: 1, offset: 12, format: "float32x3" },   // normal
+      { shaderLocation: 2, offset: 24, format: "float32x2" },   // uv
+    ],
+  }];
+
+  // ---- uniforms --------------------------------------------------------------------------------
+  S.frameUBO = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  S.lightUBO = device.createBuffer({ size: 64,  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  S.objSphere = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  S.objGround = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  S.dabUBO = device.createBuffer({ size: MAX_DABS_PER_SUBMIT * 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(S.objSphere, 0, mat4Identity());
+  device.queue.writeBuffer(S.objSphere, 64, new Float32Array([1, 0.35, 48, 1]));   // atlas, spec, shininess, recvShadow
+  device.queue.writeBuffer(S.objGround, 0, mat4Identity());
+  device.queue.writeBuffer(S.objGround, 64, new Float32Array([0, 0.06, 10, 1]));
+
+  // light: one directional light, ortho shadow frustum
+  const lightDir = V3.norm([0.55, 0.85, 0.45]);
+  const lightEye = V3.scale(lightDir, -6);
+  const lightVP = mat4Mul(mat4Ortho(-2.8, 2.8, -2.8, 2.8, 0.5, 12), mat4LookAt(lightEye, [0, -0.4, 0], [0, 1, 0]));
+  device.queue.writeBuffer(S.lightUBO, 0, lightVP);
+  S.lightDir = lightDir;
+  S.lightVP = lightVP;
+
+  // ---- shadow targets --------------------------------------------------------------------------
+  S.shadowTex = device.createTexture({ size: [SHADOW_EXTENT, SHADOW_EXTENT], format: "depth24plus",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+  S.shadowView = S.shadowTex.createView();
+
+  // ---- bind group layouts ----------------------------------------------------------------------
+  const bglFrame = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+  ]});
+  const bglObject = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+    { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+  ]});
+  const bglLight = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+  ]});
+  const bglShadowObj = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+  ]});
+  const bglDab = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 64 } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float" } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "rgba16float" } },
+  ]});
+
+  // ---- pipelines -------------------------------------------------------------------------------
+  const mainModule = device.createShaderModule({ code: MainWGSL });
+  const shadowModule = device.createShaderModule({ code: ShadowWGSL });
+  const dabModule = device.createShaderModule({ code: DabWGSL });
+
+  S.mainPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bglFrame, bglObject] }),
+    vertex: { module: mainModule, entryPoint: "vs", buffers: vertexLayout },
+    fragment: { module: mainModule, entryPoint: "fs", targets: [{ format }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+  });
+  S.shadowPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bglLight, bglShadowObj] }),
+    vertex: { module: shadowModule, entryPoint: "vs", buffers: vertexLayout },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+  });
+  S.dabPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bglDab] }),
+    compute: { module: dabModule, entryPoint: "splat" },
+  });
+
+  // ---- bind groups -----------------------------------------------------------------------------
+  const shadowSampler = device.createSampler({ compare: "less", magFilter: "linear", minFilter: "linear" });
+  const atlasSampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+  S.frameBG = device.createBindGroup({ layout: bglFrame, entries: [
+    { binding: 0, resource: { buffer: S.frameUBO } } ] });
+  S.lightBG = device.createBindGroup({ layout: bglLight, entries: [
+    { binding: 0, resource: { buffer: S.lightUBO } } ] });
+  S.shadowObjBG = {
+    sphere: device.createBindGroup({ layout: bglShadowObj, entries: [{ binding: 0, resource: { buffer: S.objSphere } }] }),
+  };
+  const mkMainBG = (objUBO, atlasView) => device.createBindGroup({ layout: bglObject, entries: [
+    { binding: 0, resource: { buffer: objUBO } },
+    { binding: 1, resource: shadowSampler },
+    { binding: 2, resource: S.shadowView },
+    { binding: 3, resource: atlasSampler },
+    { binding: 4, resource: atlasView },
+  ]});
+  S.mainBG = {
+    sphere: [mkMainBG(S.objSphere, S.atlasA.createView()), mkMainBG(S.objSphere, S.atlasB.createView())],
+    ground: [mkMainBG(S.objGround, S.atlasA.createView()), mkMainBG(S.objGround, S.atlasB.createView())],
+  };
+  S.dabBG[0] = makeDabBG();   // parity 0: read A, write B
+  // parity 1 group is created lazily after the first swap (makeDabBG reads S.parity)
+
+  Probe.Stage = "ready";
+  wireUI();
+  requestAnimationFrame(frame);
+}
+
+//--------------------------------------------------------------------------------------------------
+//  UI
+//--------------------------------------------------------------------------------------------------
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+function wireUI() {
+  $("Color").addEventListener("input", (e) => { Brush.color = hexToRgb(e.target.value); });
+  $("Size").addEventListener("input", (e) => { Brush.px = +e.target.value; $("SizeVal").textContent = e.target.value; });
+  $("Flow").addEventListener("input", (e) => { Brush.flow = +e.target.value / 100; $("FlowVal").textContent = e.target.value; });
+  $("Hard").addEventListener("input", (e) => { Brush.hardness = +e.target.value / 100; $("HardVal").textContent = e.target.value; });
+  const setErase = (on) => { Brush.erase = on; $("Erase").classList.toggle("On", on);
+                             $("RMode").textContent = on ? "erase" : "paint"; };
+  $("Erase").addEventListener("click", () => setErase(!Brush.erase));
+  $("Undo").addEventListener("click", undo);
+  $("Clear").addEventListener("click", clearAtlas);
+  window.addEventListener("keydown", (e) => {
+    if (e.target && e.target.tagName === "INPUT") return;
+    if (e.key === "e" || e.key === "E") setErase(!Brush.erase);
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); }
+    else if (e.key === "c" || e.key === "C") clearAtlas();
+  });
+
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    if (e.button === 0) {
+      const hit = raySphereHit(...(() => { const r = pointerRay(e); return [r.o, r.d]; })());
+      if (hit) {
+        S.painting = true; S.strokeLast = hit;
+        snapshot(); S.strokes++;
+        $("RStrokes").textContent = S.strokes.toLocaleString();
+        enqueueDab(hit); flushDabs();
+      }
+    } else {
+      S.orbiting = e.button;   // 2 = right (orbit), 1 = middle (pan)
+    }
+    S.lastPointer = [e.clientX, e.clientY];
+    drawCursor(e);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (S.painting) {
+      const r = pointerRay(e);
+      const hit = raySphereHit(r.o, r.d);
+      if (hit) {
+        const last = S.strokeLast;
+        const d3 = Math.hypot(hit[0]-last[0], hit[1]-last[1], hit[2]-last[2]);
+        const worldR = (Brush.px / ATLAS) * 2 * Math.PI * SPHERE_R;
+        const step = Math.max(worldR * 0.35, 1e-4);
+        const n = Math.max(1, Math.ceil(d3 / step));
+        for (let k = 1; k <= n; k++) enqueueDab(lerp3(last, hit, k / n));
+        S.strokeLast = hit;
+        flushDabs();
+      } else {
+        S.strokeLast = null;   // left the sphere: break the stroke continuity
+      }
+    } else if (S.orbiting) {
+      const dx = e.clientX - S.lastPointer[0], dy = e.clientY - S.lastPointer[1];
+      if (S.orbiting === 2) {
+        Cam.yaw += dx * 0.005;
+        Cam.pitch = Math.max(-1.45, Math.min(1.45, Cam.pitch + dy * 0.005));
+      } else {
+        const b = S.basis, s = Cam.dist * 0.0016;
+        Cam.target = V3.add(Cam.target, V3.add(V3.scale(b.right, -dx * s), V3.scale(b.up, dy * s)));
+      }
+    }
+    S.lastPointer = [e.clientX, e.clientY];
+    drawCursor(e);
+  });
+  const stop = (e) => { S.painting = false; S.orbiting = 0; };
+  canvas.addEventListener("pointerup", stop);
+  canvas.addEventListener("pointercancel", stop);
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    Cam.dist = Math.max(1.8, Math.min(9.0, Cam.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+  }, { passive: false });
+}
+
+function drawCursor(e) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  if (cursorCanvas.width !== Math.floor(rect.width * dpr)) {
+    cursorCanvas.width = Math.floor(rect.width * dpr);
+    cursorCanvas.height = Math.floor(rect.height * dpr);
+  }
+  const c2 = cursorCanvas.getContext("2d");
+  c2.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c2.clearRect(0, 0, rect.width, rect.height);
+  const r = pointerRay(e);
+  const hit = raySphereHit(r.o, r.d);
+  if (!hit) return;
+  const dist = Math.hypot(hit[0]-r.o[0], hit[1]-r.o[1], hit[2]-r.o[2]);
+  const worldR = (Brush.px / ATLAS) * 2 * Math.PI * SPHERE_R;
+  const screenR = worldR / (dist * Math.tan(FOV / 2)) * (rect.height / 2);
+  c2.beginPath();
+  c2.arc(e.clientX - rect.left, e.clientY - rect.top, Math.max(3, screenR), 0, Math.PI * 2);
+  c2.strokeStyle = Brush.erase ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.65)";
+  c2.lineWidth = 1.5;
+  c2.stroke();
+}
+
+//--------------------------------------------------------------------------------------------------
+//  frame loop
+//--------------------------------------------------------------------------------------------------
+function resizeIfNeeded() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    S.depthTex?.destroy();
+    S.depthTex = S.device.createTexture({ size: [w, h], format: "depth24plus",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    S.depthView = S.depthTex.createView();
+  }
+}
+
+const frameData = new Float32Array(52);
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (!S.device) return;
+  resizeIfNeeded();
+  const aspect = canvas.width / canvas.height;
+  const eye = updateCamera(aspect);
+
+  // frame uniforms
+  frameData.set(S.viewProj, 0);
+  frameData.set(S.lightVP, 16);
+  frameData.set([eye[0], eye[1], eye[2], 1], 32);
+  frameData.set([S.lightDir[0], S.lightDir[1], S.lightDir[2], 0], 36);
+  frameData.set([1.25, 1.15, 1.0, 1], 40);            // light color
+  frameData.set([1.0, 1.0, 1.0, 1], 44);             // ambient scale
+  frameData.set([SHADOW_EXTENT, 0.0018, 0, 1], 48); // shadow extent, bias, -, enabled
+  S.device.queue.writeBuffer(S.frameUBO, 0, frameData);
+
+  const enc = S.device.createCommandEncoder();
+
+  // shadow pass (sphere only — the caster)
+  const sp = enc.beginRenderPass({
+    colorAttachments: [],
+    depthStencilAttachment: { view: S.shadowView, depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
+  });
+  sp.setPipeline(S.shadowPipeline);
+  sp.setBindGroup(0, S.lightBG);
+  sp.setBindGroup(1, S.shadowObjBG.sphere);
+  sp.setVertexBuffer(0, S.sphereVB);
+  sp.setIndexBuffer(S.sphereIB, "uint32");
+  sp.drawIndexed(S.sphereIdx);
+  sp.end();
+
+  // main pass
+  const mp = enc.beginRenderPass({
+    colorAttachments: [{ view: S.ctx.getCurrentTexture().createView(),
+      clearValue: { r: 0.045, g: 0.05, b: 0.065, a: 1 }, loadOp: "clear", storeOp: "store" }],
+    depthStencilAttachment: { view: S.depthView, depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
+  });
+  mp.setPipeline(S.mainPipeline);
+  mp.setBindGroup(0, S.frameBG);
+  mp.setBindGroup(1, S.mainBG.sphere[S.parity]);
+  mp.setVertexBuffer(0, S.sphereVB);
+  mp.setIndexBuffer(S.sphereIB, "uint32");
+  mp.drawIndexed(S.sphereIdx);
+  mp.setBindGroup(1, S.mainBG.ground[S.parity]);
+  mp.setVertexBuffer(0, S.groundVB);
+  mp.setIndexBuffer(S.groundIB, "uint32");
+  mp.drawIndexed(6);
+  mp.end();
+
+  S.device.queue.submit([enc.finish()]);
+
+  // fps
+  S.fpsFrames++;
+  if (t - S.fpsTime >= 500) {
+    S.fps = Math.round(S.fpsFrames * 1000 / Math.max(1, t - S.fpsTime));
+    S.fpsFrames = 0; S.fpsTime = t;
+    $("RFps").textContent = S.fps;
+    Probe.Fps = S.fps;
+  }
+}
+
+init().catch((e) => { console.error(e); fault("Init failed: " + (e?.message ?? e)) });
+</script>
+</body>
+</html>

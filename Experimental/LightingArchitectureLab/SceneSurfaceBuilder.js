@@ -231,13 +231,15 @@ export function buildVehicleGeometry() {
   b.addLoftedSectionBelt(
     [
       makeProfile(-2.18, 0.84, 0.24, 0.92, 0.72, 0.72, 0.78),
-      makeProfile(-1.65, 0.90, 0.19, 0.97, 0.77, 0.72, 0.92),
+      makeProfile(-1.90, 0.88, 0.21, 0.95, 0.75, 0.73, 0.85),
+      makeProfile(-1.55, 0.91, 0.19, 0.97, 0.77, 0.71, 0.95),
       makeProfile(-1.05, 0.92, 0.17, 0.95, 0.76, 0.65, 1.12),
       makeProfile(-0.35, 0.91, 0.17, 0.94, 0.75, 0.64, 1.19),
       makeProfile(0.25, 0.91, 0.17, 0.95, 0.75, 0.66, 1.14),
       makeProfile(0.78, 0.90, 0.17, 0.97, 0.72, 0.74, 0.82),
-      makeProfile(1.45, 0.88, 0.18, 0.95, 0.67, 0.72, 0.71),
-      makeProfile(2.02, 0.80, 0.18, 0.84, 0.50, 0.66, 0.56),
+      makeProfile(1.18, 0.89, 0.18, 0.96, 0.70, 0.73, 0.75),
+      makeProfile(1.62, 0.86, 0.18, 0.92, 0.63, 0.70, 0.66),
+      makeProfile(1.98, 0.81, 0.18, 0.85, 0.51, 0.66, 0.56),
       makeProfile(2.15, 0.68, 0.19, 0.72, 0.36, 0.56, 0.42),
     ],
     10.0 // Sapphire clearcoat metallic car paint
@@ -316,8 +318,8 @@ export function buildStaticEnvironmentGeometry(envPreset) {
   b.addSphere(-2.55, 0.46, 1.0, 0.46, 22, 32, 4.0);  // Clearcoat Signal Orange
   b.addSphere(-2.55, 0.46, -0.4, 0.46, 22, 32, 5.0); // Matte Clay Diffuse
 
-  // Overhead Softbox diffuser panel
-  b.addBox(0.2, 3.88, 0.2, 1.85, 0.04, 0.85, 6.0);
+  // Overhead Softbox diffuser panel (elevated to frame hero 3/4 view cleanly)
+  b.addBox(0.2, 4.46, 0.2, 1.85, 0.04, 0.85, 6.0);
 
   return b.finalize();
 }

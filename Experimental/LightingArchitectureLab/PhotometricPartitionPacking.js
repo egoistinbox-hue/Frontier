@@ -70,7 +70,7 @@ export function kelvinToLinearRgb(kelvin) {
 
 export function createLuminaireBounds(lum) {
   const cat = lum.category;
-  let minB, maxB, axis, cosSpread, cosCutoff, cutoffAngle, power;
+  let minB, maxB, axis, cosSpread, cosCutoff, cutoffAngle, power, rgbPower;
   const color = lum.rgbIntensity;
   const luma = Math.max(0.01, 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]);
 
@@ -82,7 +82,10 @@ export function createLuminaireBounds(lum) {
     cosSpread = -1.0;
     cosCutoff = -1.0;
     cutoffAngle = Math.PI;
-    power = luma * 4.0 * Math.PI;
+    // Direct irradiance scale at 1m is rgbIntensity / d^2 -> exact cd-equivalent power = luma
+    power = luma;
+    const tailScale = 4.0 * Math.PI;
+    rgbPower = [color[0] * tailScale, color[1] * tailScale, color[2] * tailScale];
   } else if (cat === LUMINAIRE_CATEGORY.PHOTOMETRIC_IES) {
     const r = lum.radiusMeters + 0.18;
     minB = [lum.pos[0] - r, lum.pos[1] - r, lum.pos[2] - r];
@@ -90,9 +93,11 @@ export function createLuminaireBounds(lum) {
     axis = norm3(lum.beamAxis);
     const halfSpread = (lum.spreadDeg || 48) * (Math.PI / 180.0);
     cosSpread = Math.cos(halfSpread * 0.5);
-    cutoffAngle = Math.min(Math.PI, halfSpread * 1.15);
+    cutoffAngle = Math.min(Math.PI, Math.max(halfSpread * 1.45, 1.05));
     cosCutoff = Math.cos(cutoffAngle);
-    power = luma * 2.4;
+    power = luma * 1.15;
+    const tailScale = 4.0 * Math.PI * 0.35;
+    rgbPower = [color[0] * tailScale, color[1] * tailScale, color[2] * tailScale];
   } else if (cat === LUMINAIRE_CATEGORY.AREA_QUAD_LTC || cat === LUMINAIRE_CATEGORY.SELF_LIT_CLUSTER) {
     const extX = Math.abs(lum.rightAxis[0]) * lum.halfW + Math.abs(lum.upAxis[0]) * lum.halfH + 0.15;
     const extY = Math.abs(lum.rightAxis[1]) * lum.halfW + Math.abs(lum.upAxis[1]) * lum.halfH + 0.15;
@@ -105,7 +110,11 @@ export function createLuminaireBounds(lum) {
     cutoffAngle = twoSided ? Math.PI : Math.PI * 0.52;
     cosCutoff = Math.cos(cutoffAngle);
     const area = Math.max(0.05, 4.0 * lum.halfW * lum.halfH);
-    power = luma * area * 1.65;
+    // Irradiance scale at 1m is color * area / PI
+    const effScale = area / Math.PI;
+    power = luma * effScale;
+    const tailScale = 4.0 * area;
+    rgbPower = [color[0] * tailScale, color[1] * tailScale, color[2] * tailScale];
   } else {
     // TUBE_CAPSULE
     const r = lum.radiusMeters + 0.12;
@@ -124,7 +133,10 @@ export function createLuminaireBounds(lum) {
     cosCutoff = -1.0;
     cutoffAngle = Math.PI;
     const segLen = Math.max(0.12, len3(sub3(lum.segB, lum.segA)));
-    power = luma * segLen * 2.2;
+    const capNorm = Math.min(1.8, 0.45 + segLen * 0.55);
+    power = luma * capNorm;
+    const tailScale = 4.0 * Math.PI * capNorm;
+    rgbPower = [color[0] * tailScale, color[1] * tailScale, color[2] * tailScale];
   }
 
   return {
@@ -141,6 +153,7 @@ export function createLuminaireBounds(lum) {
     cosCutoff,
     cutoffAngle,
     power,
+    rgbPower,
   };
 }
 
@@ -200,6 +213,11 @@ function mergeBounds(a, b) {
     cosCutoff: Math.cos(Math.min(Math.PI, thetaE)),
     cutoffAngle: Math.min(Math.PI, thetaE),
     power: totalPower,
+    rgbPower: [
+      a.rgbPower[0] + b.rgbPower[0],
+      a.rgbPower[1] + b.rgbPower[1],
+      a.rgbPower[2] + b.rgbPower[2],
+    ],
   };
 }
 
@@ -302,6 +320,7 @@ export function buildUnifiedPartitionAndPack(luminaires) {
         minB: [0, 0, 0],
         maxB: [0, 0, 0],
         power: 0,
+        rgbPower: [0, 0, 0],
         firstNestedOrLeaf: -1,
         axis: [0, -1, 0],
         cosSpread: -1,
@@ -309,7 +328,7 @@ export function buildUnifiedPartitionAndPack(luminaires) {
         cosCutoff: -1,
         cutoffAngle: Math.PI,
       };
-      return cells[slot].bounds;
+      return cells[slot];
     }
     if (items.length === 1) {
       const b = items[0].bounds;
@@ -376,11 +395,11 @@ export function buildUnifiedPartitionAndPack(luminaires) {
     texData[base + 9] = cell.axis[1];
     texData[base + 10] = cell.axis[2];
     texData[base + 11] = cell.cosSpread;
-    // N3: sinSpread, cosCutoff, cutoffAngle, 0
-    texData[base + 12] = cell.sinSpread;
-    texData[base + 13] = cell.cosCutoff;
-    texData[base + 14] = cell.cutoffAngle;
-    texData[base + 15] = 0.0;
+    // N3: rgbPower.rgb, cosCutoff
+    texData[base + 12] = cell.rgbPower[0];
+    texData[base + 13] = cell.rgbPower[1];
+    texData[base + 14] = cell.rgbPower[2];
+    texData[base + 15] = cell.cosCutoff;
   }
 
   return {

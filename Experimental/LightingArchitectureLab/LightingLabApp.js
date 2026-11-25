@@ -101,10 +101,10 @@ function buildActiveLuminaires(labConfiguration) {
 
   // 1. Studio Overhead LTC Quad Softbox
   if (softboxEnabled) {
-    const softInt = envPreset === 0 ? 5.6 : 2.8;
+    const softInt = envPreset === 0 ? 6.2 : 3.0;
     list.push({
       category: LUMINAIRE_CATEGORY.AREA_QUAD_LTC,
-      pos: [0.2, 3.82, 0.2],
+      pos: [0.2, 4.40, 0.2],
       rightAxis: [1.0, 0.0, 0.0],
       upAxis: [0.0, 0.0, -1.0],
       halfW: 1.85,
@@ -134,11 +134,11 @@ function buildActiveLuminaires(labConfiguration) {
   if (rimTubeEnabled) {
     list.push({
       category: LUMINAIRE_CATEGORY.TUBE_CAPSULE,
-      segA: [2.4, 2.25, -2.5],
-      segB: [2.4, 2.25, 2.4],
-      radiusMeters: 0.055,
+      segA: [2.4, 2.55, -2.5],
+      segB: [2.4, 2.55, 2.4],
+      radiusMeters: 0.085,
       rangeMeters: 9.0,
-      rgbIntensity: scaleColor(6400, 5.4),
+      rgbIntensity: scaleColor(6400, 3.2),
     });
   }
 

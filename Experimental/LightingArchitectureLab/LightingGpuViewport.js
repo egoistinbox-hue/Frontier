@@ -265,13 +265,15 @@ vec2 rotXZ(vec2 p, float yaw) {
   return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
 }
 
-// Fast 7-primitive analytical scene SDF used strictly for soft SDF cone shadows, AO & PT bounce!
-float mapShadowSdf(vec3 p) {
-  float d = p.y;
+// Fast analytical scene SDF used strictly for soft SDF cone shadows, AO & PT bounce!
+// IMPORTANT: mapCasterSdf intentionally excludes the floor plane (p.y) so grazing shadow rays never self-band!
+float mapCasterSdf(vec3 p) {
+  float d = 1e6;
   vec3 cp = p - uCarPos;
   cp.xz = rotXZ(cp.xz, -uCarYaw);
-  d = min(d, sdBox(cp - vec3(0.0, 0.48, 0.0), vec3(0.94, 0.30, 2.12)));
-  d = min(d, sdBox(cp - vec3(0.0, 0.92, -0.25), vec3(0.68, 0.24, 0.96)));
+  // Inset slightly longitudinally so front headlamps (z=2.16) & rear tail bar (z=-2.18) never self-occlude on floor!
+  d = min(d, sdBox(cp - vec3(0.0, 0.50, -0.02), vec3(0.90, 0.28, 1.98)));
+  d = min(d, sdBox(cp - vec3(0.0, 0.94, -0.25), vec3(0.66, 0.22, 0.92)));
   d = min(d, length(p - vec3(-2.55, 0.46, 2.4)) - 0.46);
   d = min(d, length(p - vec3(-2.55, 0.46, 1.0)) - 0.46);
   d = min(d, length(p - vec3(-2.55, 0.46, -0.4)) - 0.46);
@@ -290,41 +292,51 @@ float mapShadowSdf(vec3 p) {
 }
 
 float traceExactShadow(vec3 ro, vec3 rd, float maxT) {
-  float t = 0.05;
-  float minRes = 1.0;
-  for (int i = 0; i < 16; ++i) {
-    float h = mapShadowSdf(ro + rd * t);
-    if (h < 0.004) return 0.0;
-    minRes = min(minRes, 18.0 * h / t);
-    t += clamp(h, 0.06, 0.85);
+  float t = 0.06;
+  float res = 1.0;
+  float ph = 1e20;
+  for (int i = 0; i < 24; ++i) {
+    float h = mapCasterSdf(ro + rd * t);
+    if (h < 0.002) return 0.0;
+    float y = (h * h) / (2.0 * ph);
+    float d = sqrt(max(0.0, h * h - y * y));
+    res = min(res, 14.0 * d / max(0.001, t - y));
+    ph = h;
+    t += clamp(h, 0.04, 1.25);
     if (t >= maxT) break;
   }
-  return clamp(minRes, 0.0, 1.0);
+  return clamp(res, 0.0, 1.0);
 }
 
 float traceGdfConeShadow(vec3 ro, vec3 rd, float maxT, float coneSoftness) {
   float t = 0.06;
   float res = 1.0;
-  for (int i = 0; i < 10; ++i) {
-    float h = mapShadowSdf(ro + rd * t);
-    if (h < 0.003) return 0.0;
-    res = min(res, coneSoftness * h / t);
-    t += clamp(h * 1.2, 0.10, 0.95);
+  float ph = 1e20;
+  for (int i = 0; i < 18; ++i) {
+    float h = mapCasterSdf(ro + rd * t);
+    if (h < 0.002) return 0.0;
+    float y = (h * h) / (2.0 * ph);
+    float d = sqrt(max(0.0, h * h - y * y));
+    res = min(res, coneSoftness * d / max(0.001, t - y));
+    ph = h;
+    t += clamp(h * 1.15, 0.06, 1.25);
     if (t >= maxT) break;
   }
-  return clamp(res * res * (3.0 - 2.0 * res), 0.0, 1.0);
+  res = clamp(res, 0.0, 1.0);
+  return res * res * (3.0 - 2.0 * res);
 }
 
 float calcSdfAmbientOcclusion(vec3 pos, vec3 nor) {
   float occ = 0.0;
   float sca = 1.0;
-  for (int i = 0; i < 3; ++i) {
-    float h = 0.06 + 0.22 * float(i);
-    float d = mapShadowSdf(pos + h * nor);
-    occ += (h - d) * sca;
-    sca *= 0.65;
+  for (int i = 0; i < 4; ++i) {
+    float h = 0.05 + 0.18 * float(i);
+    vec3 sp = pos + h * nor;
+    float d = min(sp.y, mapCasterSdf(sp));
+    occ += max(0.0, h - d) * sca;
+    sca *= 0.62;
   }
-  return clamp(1.0 - 1.45 * occ, 0.22, 1.0);
+  return clamp(1.0 - 1.35 * occ, 0.25, 1.0);
 }
 
 void fetchLuminaire(int idx, out vec4 t0, out vec4 t1, out vec4 t2, out vec4 t3) {
@@ -508,6 +520,7 @@ vec3 evalUnifiedLuminaireNoShadow(
   vec3 L_eval = vec3(0.0);
   vec3 L_spec = vec3(0.0);
   float effRough = rough;
+  float specScale = 1.0;
   float totalScale = 0.0;
 
   if (cat == 3) {
@@ -532,6 +545,8 @@ vec3 evalUnifiedLuminaireNoShadow(
     float atten = smoothRangeWindow(dist, rangeM) / max(dist * dist + radius * radius, 0.04);
     float capsuleNorm = min(1.8, 0.45 + sqrt(abLen2) * 0.55);
     totalScale = atten * capsuleNorm;
+    effRough = clamp(rough + clamp(radius / max(dist * 0.45, 0.12), 0.04, 0.24), 0.06, 1.0);
+    specScale = clamp(radius / max(dist * 0.16 + radius, 0.05), 0.14, 0.65);
     outShadowDir = L_eval;
     outShadowDist = dist;
   } else {
@@ -555,7 +570,7 @@ vec3 evalUnifiedLuminaireNoShadow(
 
   vec3 col = t3.rgb;
   outLuxNoVis = max(dot(N, L_eval), 0.0) * totalScale * max(col.r, max(col.g, col.b));
-  vec3 brdf = evalOpenPbrBrdf(N, V, L_eval, albedo, metallic, effRough, clearcoat, 0.045, 1.0, L_spec);
+  vec3 brdf = evalOpenPbrBrdf(N, V, L_eval, albedo, metallic, effRough, clearcoat, 0.045, specScale, L_spec);
   if (uDebugLens == 5) {
     vec3 pureDiff = albedo * (1.0 - metallic) / PI * max(dot(N, L_eval), 0.0);
     return max(brdf - pureDiff, vec3(0.0)) * col * totalScale;
@@ -569,16 +584,17 @@ float partitionCellImportance(vec3 P, vec3 N, vec4 n0, vec4 n1, vec4 n2, vec4 n3
   vec3 center = 0.5 * (n0.xyz + n1.xyz);
   float radius = length(0.5 * (n1.xyz - n0.xyz));
   vec3 delta = P - center;
-  float dist2 = max(dot(delta, delta), max(radius * radius * 0.25, 0.08));
+  float dist2 = max(dot(delta, delta), max(radius * radius * 0.25, 0.12));
   float dist = sqrt(dist2);
   vec3 dirFromCluster = delta / dist;
 
   float thetaU = asin(clamp(radius / max(dist, radius + 1e-4), 0.0, 0.99999));
   float thetaO = acos(clamp(n2.w, -0.99999, 0.99999));
+  float cutoffAngle = acos(clamp(n3.w, -0.99999, 0.99999));
   float theta = acos(clamp(dot(n2.xyz, dirFromCluster), -0.99999, 0.99999));
   float effTheta = max(0.0, theta - thetaO - thetaU);
-  float coneWeight = (effTheta >= n3.z) ? 0.03 : max(0.08, cos(effTheta));
-  float cosNormal = clamp(dot(N, -dirFromCluster) + thetaU, 0.05, 1.0);
+  float coneWeight = (effTheta >= cutoffAngle) ? 0.02 : max(0.08, cos(effTheta));
+  float cosNormal = clamp(dot(N, -dirFromCluster) + thetaU, 0.08, 1.0);
   return (power * coneWeight * cosNormal) / dist2;
 }
 
@@ -628,13 +644,13 @@ void evalMaterial(
     float speckle = hash12(floor(worldP.xz * 22.0)) * 0.035;
     if (uEnvPreset == 1) {
       albedo = mix(vec3(0.11, 0.13, 0.10), vec3(0.16, 0.17, 0.14), seam) + speckle;
-      rough = mix(0.42, 0.28, seam);
+      rough = mix(0.46, 0.34, seam);
     } else if (uEnvPreset == 2) {
       albedo = mix(vec3(0.12, 0.125, 0.135), vec3(0.18, 0.185, 0.19), seam) + speckle;
-      rough = mix(0.28, 0.16, seam);
+      rough = mix(0.38, 0.26, seam);
     } else {
       albedo = mix(vec3(0.09, 0.095, 0.105), vec3(0.14, 0.145, 0.155), seam) + speckle;
-      rough = mix(0.24, 0.15, seam);
+      rough = mix(0.36, 0.25, seam);
     }
   } else if (matId < 2.5) {
     albedo = vec3(0.56, 0.57, 0.59);
@@ -690,6 +706,18 @@ vec3 infernoPalette(float t) {
 const REALTIME_FRAGMENT_SRC =
   SURFACE_GLSL_COMMON +
   `
+vec3 evalClusterTailApprox(
+  vec3 center, vec3 rgbPow, vec3 P, vec3 N, vec3 albedo, float metallic
+) {
+  if (uDebugLens == 5) return vec3(0.0);
+  vec3 toC = center - P;
+  float d2 = max(dot(toC, toC), 0.75);
+  float dist = sqrt(d2);
+  vec3 cDir = toC / dist;
+  float nDotC = clamp(dot(N, cDir), 0.0, 1.0);
+  return (albedo * (1.0 - metallic) / PI) * (rgbPow / (4.0 * PI * d2)) * nDotC * 0.78;
+}
+
 vec3 shadePointRealTime(
   vec3 P, vec3 N, vec3 V,
   vec3 albedo, float metallic, float rough, float clearcoat,
@@ -713,43 +741,56 @@ vec3 shadePointRealTime(
 
   if (uLuminaireCount <= 0) return total;
 
-  const int MAX_CAND = 12;
-  int candIds[12] = int[12](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  const int MAX_CAND = 14;
+  int candIds[14] = int[14](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  int candCells[14] = int[14](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  float candScores[14] = float[14](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  float candWeights[14] = float[14](1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
   int candCount = 0;
+  int evalCount = 0;
   float candMult = 1.0;
   vec3 tailApprox = vec3(0.0);
 
   if (uSchedulerMode == 2) {
-    // Direct Brute-Force evaluates 0..min(uLuminaireCount, 32)
+    // Direct Brute-Force evaluates all luminaires up to 64
+    evalCount = min(uLuminaireCount, 64);
   } else if (uRenderEngine == 0) {
     int cap = min(uLuminaireCount, 4);
     for (int i = 0; i < 4; ++i) {
       if (i >= cap) break;
       candIds[i] = i;
+      candWeights[i] = 1.0;
       candCount++;
     }
+    evalCount = candCount;
   } else if (uSchedulerMode == 3) {
-    for (int i = 0; i < 32; ++i) {
+    for (int i = 0; i < 48; ++i) {
       if (i >= uLuminaireCount || candCount >= 8) break;
       vec4 t0, t1, t2, t3;
       fetchLuminaire(i, t0, t1, t2, t3);
       float lViewZ = dot(t0.xyz - uCamPos, uCamForward);
       vec3 toL = normalize(t0.xyz - uCamPos);
       if (lViewZ <= 0.2 || abs(dot(toL, uCamRight)) >= 0.78) continue;
-      candIds[candCount++] = i;
+      candIds[candCount] = i;
+      candWeights[candCount] = 1.0;
+      candCount++;
     }
+    evalCount = candCount;
   } else if (uSchedulerMode == 4) {
     float r = hash12(fragCoord + vec2(uTimeSec * 60.0, 17.3));
     candIds[0] = clamp(int(floor(r * float(uLuminaireCount))), 0, uLuminaireCount - 1);
+    candWeights[0] = 1.0;
     candCount = 1;
+    evalCount = 1;
     candMult = float(uLuminaireCount) * 0.52;
     vec3 ghostDelta = P - uPrevCarPos;
     total += vec3(1.6, 0.14, 0.08) * exp(-dot(ghostDelta, ghostDelta) * 0.55) * length(uCarPos - uPrevCarPos) * 14.0;
   } else {
     int targetBudget = (uSchedulerMode == 1 || uRenderEngine == 1) ? 6 : 10;
-    const int QMAX = 10;
-    int qCells[10] = int[10](0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-    float qScores[10] = float[10](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    int collectGoal = min(targetBudget + 2, MAX_CAND);
+    const int QMAX = 24;
+    int qCells[24] = int[24](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    float qScores[24] = float[24](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     int qSize = 0;
 
     if (uPartitionCellCount > 0) {
@@ -760,8 +801,8 @@ vec3 shadePointRealTime(
       qSize = 1;
     }
 
-    for (int iter = 0; iter < 18; ++iter) {
-      if (qSize <= 0 || candCount >= targetBudget) break;
+    for (int iter = 0; iter < 40; ++iter) {
+      if (qSize <= 0 || candCount >= collectGoal) break;
       int bestSlot = 0;
       float bestScore = qScores[0];
       for (int k = 1; k < QMAX; ++k) {
@@ -778,7 +819,12 @@ vec3 shadePointRealTime(
       int link = int(floor(n1.w + 0.5));
       if (link < 0) {
         int lumIdx = -link - 1;
-        if (lumIdx >= 0 && lumIdx < uLuminaireCount) candIds[candCount++] = lumIdx;
+        if (lumIdx >= 0 && lumIdx < uLuminaireCount) {
+          candIds[candCount] = lumIdx;
+          candCells[candCount] = cellIdx;
+          candScores[candCount] = bestScore;
+          candCount++;
+        }
       } else if (link >= 0 && link + 1 < uPartitionCellCount && qSize + 2 <= QMAX) {
         vec4 ln0, ln1, ln2, ln3, rn0, rn1, rn2, rn3;
         fetchPartitionCell(link, ln0, ln1, ln2, ln3);
@@ -789,64 +835,114 @@ vec3 shadePointRealTime(
         qCells[qSize] = link + 1;
         qScores[qSize] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
         qSize++;
+      } else {
+        tailApprox += evalClusterTailApprox(0.5 * (n0.xyz + n1.xyz), n3.rgb, evalP, N, albedo, metallic);
       }
     }
 
+    // Sort collected candidates descending so rank cutoff is exact
+    for (int i = 0; i < MAX_CAND - 1; ++i) {
+      if (i >= candCount - 1) break;
+      for (int j = i + 1; j < MAX_CAND; ++j) {
+        if (j >= candCount) break;
+        if (candScores[j] > candScores[i]) {
+          int tmpId = candIds[i]; candIds[i] = candIds[j]; candIds[j] = tmpId;
+          int tmpCell = candCells[i]; candCells[i] = candCells[j]; candCells[j] = tmpCell;
+          float tmpSc = candScores[i]; candScores[i] = candScores[j]; candScores[j] = tmpSc;
+        }
+      }
+    }
+
+    float maxQScore = 0.0;
     for (int r = 0; r < QMAX; ++r) {
       if (r >= qSize) break;
+      maxQScore = max(maxQScore, qScores[r]);
       vec4 n0, n1, n2, n3;
       fetchPartitionCell(qCells[r], n0, n1, n2, n3);
-      vec3 toC = 0.5 * (n0.xyz + n1.xyz) - evalP;
-      float d2 = max(dot(toC, toC), 1.5);
-      float diffFactor = max(dot(N, normalize(toC)), 0.0) * n0.w / (4.0 * PI * d2);
-      tailApprox += (albedo * (1.0 - metallic)) * diffFactor * 0.22;
+      tailApprox += evalClusterTailApprox(0.5 * (n0.xyz + n1.xyz), n3.rgb, evalP, N, albedo, metallic);
+    }
+
+    evalCount = min(candCount, targetBudget);
+    float cutFloor = (candCount > targetBudget) ? max(candScores[targetBudget], maxQScore) : maxQScore;
+
+    // Extra candidates beyond targetBudget fold smoothly into tailApprox
+    for (int extra = 0; extra < MAX_CAND; ++extra) {
+      if (extra < evalCount || extra >= candCount) continue;
+      vec4 cn0, cn1, cn2, cn3;
+      fetchPartitionCell(candCells[extra], cn0, cn1, cn2, cn3);
+      tailApprox += evalClusterTailApprox(0.5 * (cn0.xyz + cn1.xyz), cn3.rgb, evalP, N, albedo, metallic);
+    }
+
+    // Smooth C0/C1 rank weight across cutoff threshold so ZERO Voronoi seams can occur!
+    for (int i = 0; i < MAX_CAND; ++i) {
+      if (i >= evalCount) break;
+      float w = (cutFloor > 1e-6)
+        ? smoothstep(cutFloor, cutFloor * 1.65, candScores[i])
+        : 1.0;
+      candWeights[i] = w;
+      if (w < 0.999) {
+        vec4 cn0, cn1, cn2, cn3;
+        fetchPartitionCell(candCells[i], cn0, cn1, cn2, cn3);
+        tailApprox += (1.0 - w) * evalClusterTailApprox(0.5 * (cn0.xyz + cn1.xyz), cn3.rgb, evalP, N, albedo, metallic);
+      }
     }
   }
 
   vec3 shDir0 = vec3(0.0, 1.0, 0.0); float shDist0 = 0.0; vec3 shRad0 = vec3(0.0);
   vec3 shDir1 = vec3(0.0, 1.0, 0.0); float shDist1 = 0.0; vec3 shRad1 = vec3(0.0);
   vec3 shDir2 = vec3(0.0, 1.0, 0.0); float shDist2 = 0.0; vec3 shRad2 = vec3(0.0);
+  vec3 shDir3 = vec3(0.0, 1.0, 0.0); float shDist3 = 0.0; vec3 shRad3 = vec3(0.0);
   int shCaptured = 0;
 
-  int loopCount = (uSchedulerMode == 2) ? min(uLuminaireCount, 32) : candCount;
-  for (int e = 0; e < 32; ++e) {
-    if (e >= loopCount) break;
+  for (int e = 0; e < 64; ++e) {
+    if (e >= evalCount) break;
     int lumIdx = (uSchedulerMode == 2) ? e : candIds[e < MAX_CAND ? e : 0];
+    float lumWeight = (uSchedulerMode == 2) ? 1.0 : candWeights[e < MAX_CAND ? e : 0];
+    if (lumWeight <= 1e-4) continue;
+
     vec3 shDir;
     float shDist, luxVal;
-    vec3 rad = evalUnifiedLuminaireNoShadow(lumIdx, evalP, N, V, albedo, metallic, rough, clearcoat, shDir, shDist, luxVal);
-    outLuxTotal += luxVal * candMult;
+    vec3 rad = evalUnifiedLuminaireNoShadow(lumIdx, evalP, N, V, albedo, metallic, rough, clearcoat, shDir, shDist, luxVal) * (candMult * lumWeight);
+    outLuxTotal += luxVal * candMult * lumWeight;
 
-    if (doShadows && shCaptured < 3 && shDist > 0.12 && max(rad.r, max(rad.g, rad.b)) > 0.008) {
-      if (shCaptured == 0) { shDir0 = shDir; shDist0 = shDist; shRad0 = rad * candMult; }
-      else if (shCaptured == 1) { shDir1 = shDir; shDist1 = shDist; shRad1 = rad * candMult; }
-      else { shDir2 = shDir; shDist2 = shDist; shRad2 = rad * candMult; }
+    // Cast shadows deterministically on key studio/automotive rig lights (lumIdx < 8) that are >0.35m away
+    if (doShadows && lumIdx < 8 && shCaptured < 4 && shDist > 0.35 && max(rad.r, max(rad.g, rad.b)) > 0.012) {
+      if (shCaptured == 0) { shDir0 = shDir; shDist0 = shDist; shRad0 = rad; }
+      else if (shCaptured == 1) { shDir1 = shDir; shDist1 = shDist; shRad1 = rad; }
+      else if (shCaptured == 2) { shDir2 = shDir; shDist2 = shDist; shRad2 = rad; }
+      else { shDir3 = shDir; shDist3 = shDist; shRad3 = rad; }
       shCaptured++;
     } else {
-      total += rad * candMult;
+      total += rad;
     }
   }
 
   if (shCaptured > 0) {
     float v0 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.025, shDir0, min(shDist0 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.025, shDir0, min(shDist0 - 0.14, 15.0));
+      ? traceGdfConeShadow(P + N * 0.025, shDir0, min(shDist0 - 0.32, 14.0), 10.0)
+      : traceExactShadow(P + N * 0.025, shDir0, min(shDist0 - 0.32, 15.0));
     total += shRad0 * v0;
   }
   if (shCaptured > 1) {
     float v1 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.025, shDir1, min(shDist1 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.025, shDir1, min(shDist1 - 0.14, 15.0));
+      ? traceGdfConeShadow(P + N * 0.025, shDir1, min(shDist1 - 0.32, 14.0), 10.0)
+      : traceExactShadow(P + N * 0.025, shDir1, min(shDist1 - 0.32, 15.0));
     total += shRad1 * v1;
   }
   if (shCaptured > 2) {
     float v2 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.025, shDir2, min(shDist2 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.025, shDir2, min(shDist2 - 0.14, 15.0));
+      ? traceGdfConeShadow(P + N * 0.025, shDir2, min(shDist2 - 0.32, 14.0), 10.0)
+      : traceExactShadow(P + N * 0.025, shDir2, min(shDist2 - 0.32, 15.0));
     total += shRad2 * v2;
   }
+  if (shCaptured > 3) {
+    float v3 = fastSdfShadow
+      ? traceGdfConeShadow(P + N * 0.025, shDir3, min(shDist3 - 0.32, 14.0), 10.0)
+      : traceExactShadow(P + N * 0.025, shDir3, min(shDist3 - 0.32, 15.0));
+    total += shRad3 * v3;
+  }
 
-  outCutEvals = loopCount;
+  outCutEvals = evalCount;
   return total + tailApprox;
 }
 
@@ -1013,7 +1109,8 @@ void main() {
   bool hit2 = false;
   vec3 ro2 = P + N * 0.025;
   for (int s = 0; s < 20; ++s) {
-    float d2 = mapShadowSdf(ro2 + bounceDir * t2);
+    vec3 bp = ro2 + bounceDir * t2;
+    float d2 = min(max(bp.y, 0.0), mapCasterSdf(bp));
     if (d2 < 0.01) { hit2 = true; break; }
     t2 += clamp(d2, 0.05, 1.2);
     if (t2 > 18.0) break;

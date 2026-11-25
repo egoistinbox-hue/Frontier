@@ -31,6 +31,7 @@ function BuildGlslBoxesBlock() {
 
 const FRAG_SRC = `
 precision highp float;
+const int MAX_LIGHTS = ${MAX_LIGHTS};
 varying vec2 vUv;
 
 uniform vec2  uResolution;

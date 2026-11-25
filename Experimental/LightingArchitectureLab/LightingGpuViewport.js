@@ -1,5 +1,6 @@
-// LightingGpuViewport.js — Live WebGL2 GPU shader engine demonstrating Frontier's
-// Unified Photometric Partition Lighting Architecture across all 5 Render Modes.
+// LightingGpuViewport.js — Modular fast-compiling WebGL2 GPU shader engine
+// (splits Real-Time Multi-Mode program and Progressive Path-Tracer program to keep
+// ANGLE/D3D11/Metal shader link times under ~50 ms and avoid GPU watchdog timeouts).
 
 import { IES_PHI_SAMPLES, IES_PROFILE_COUNT, IES_THETA_SAMPLES } from "./PhotometricGoniometry.js";
 
@@ -42,15 +43,16 @@ vec3 acesFilmicToneMap(vec3 x) {
 
 void main() {
   vec4 acc = texture(uAccumTex, vUv);
-  vec3 col = acc.rgb / max(acc.a, 1.0);
+  vec3 col = max(acc.rgb, vec3(0.0)) / max(acc.a, 1.0);
   col *= uExposure;
   col = acesFilmicToneMap(col);
-  col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
+  col = pow(max(col, vec3(1e-5)), vec3(1.0 / 2.2));
   fragColor = vec4(col, 1.0);
 }
 `;
 
-const MAIN_FRAGMENT_SRC = `#version 300 es
+// Shared lean GLSL core (O(1) analytic pylon rings + single luminaire eval site)
+const SHARED_GLSL_COMMON = `#version 300 es
 precision highp float;
 precision highp int;
 
@@ -64,18 +66,18 @@ uniform vec3 uCamUp;
 uniform vec3 uCamForward;
 uniform float uTanHalfFov;
 
-uniform sampler2D uLightRegisterTex; // 256 x 16 RGBA32F
-uniform sampler2D uIesAtlasTex;      // 128 x 256 R32F
-uniform sampler2D uPrevAccumTex;     // Progressive PT accumulation
+uniform sampler2D uLightRegisterTex;
+uniform sampler2D uIesAtlasTex;
+uniform sampler2D uPrevAccumTex;
 
 uniform int uLuminaireCount;
 uniform int uPartitionCellCount;
-uniform int uRenderEngine;       // 0=MatCap, 1=SDF, 2=OpenPBR, 3=RealTimeGI, 4=PathTracer
-uniform int uSchedulerMode;      // 0=PrioritySplit8, 1=PrioritySplit4, 2=BruteAll, 3=FrustumClustered, 4=RestirGhost
-uniform int uDebugLens;          // 0=FinalLit, 1=CutHeatmap, 2=IsoluxLux, 3=ShadowsOnly, 4=IndirectGiOnly, 5=SpecularOnly
-uniform int uEnvPreset;          // 0=Cyclorama, 1=Forest, 2=RacingGarage
-uniform int uMatCapLightBlend;   // 0=PureMatCap, 1=LightAwareMatCap
-uniform int uSdfVoxelDefectDemo; // 0=AnalyticalDirect, 1=VoxelGridDefect
+uniform int uRenderEngine;
+uniform int uSchedulerMode;
+uniform int uDebugLens;
+uniform int uEnvPreset;
+uniform int uMatCapLightBlend;
+uniform int uSdfVoxelDefectDemo;
 uniform int uAccumFrame;
 uniform float uTimeSec;
 uniform float uExposure;
@@ -98,9 +100,6 @@ uniform vec3 uEnvSh[9];
 const float PI = 3.14159265359;
 const float TWO_PI = 6.28318530718;
 
-// -----------------------------------------------------------------------------
-// Deterministic low-discrepancy helpers (zero runtime RNG entropy)
-// -----------------------------------------------------------------------------
 float hash12(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
   p3 += dot(p3, p3.yzx + 33.33);
@@ -108,14 +107,9 @@ float hash12(vec2 p) {
 }
 
 vec2 r2Sequence(int idx, vec2 shift) {
-  float a1 = 0.7548776662466927;
-  float a2 = 0.5698402909980532;
-  return fract(shift + vec2(a1, a2) * float(idx + 1));
+  return fract(shift + vec2(0.754877666, 0.569840291) * float(idx + 1));
 }
 
-// -----------------------------------------------------------------------------
-// SDF Primitives & Sculpted GT Automotive Scene
-// -----------------------------------------------------------------------------
 float sdBox(vec3 p, vec3 b) {
   vec3 q = abs(p) - b;
   return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
@@ -124,12 +118,6 @@ float sdBox(vec3 p, vec3 b) {
 float sdRoundBox(vec3 p, vec3 b, float r) {
   vec3 q = abs(p) - b;
   return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
-}
-
-float sdCapsule(vec3 p, vec3 a, vec3 b, float r) {
-  vec3 pa = p - a, ba = b - a;
-  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
-  return length(pa - ba * h) - r;
 }
 
 float sdCylinderY(vec3 p, float h, float r) {
@@ -153,54 +141,41 @@ vec2 rotateXZ(vec2 p, float yaw) {
   return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
 }
 
-// Returns vec2(dist, matId)
 vec2 mapVehicle(vec3 worldP, vec3 carPos, float carYaw, out vec3 localOut) {
   vec3 p = worldP - carPos;
   p.xz = rotateXZ(p.xz, -carYaw);
   localOut = p;
 
-  // Quick bounding sphere cull around GT car
-  float boundD = length(p - vec3(0.0, 0.72, 0.0)) - 3.2;
-  if (boundD > 0.6) {
+  float boundD = length(p - vec3(0.0, 0.72, 0.0)) - 3.1;
+  if (boundD > 0.45) {
     return vec2(boundD, 10.0);
   }
 
-  // Lower sculpted chassis wedge (front at +Z)
   vec3 chP = p - vec3(0.0, 0.48, 0.0);
   float wedgeSlope = clamp((p.z + 2.0) / 4.2, 1e-4, 1.0);
   float bodyHeight = mix(0.32, 0.20, pow(wedgeSlope, 1.6));
   float chassis = sdRoundBox(chP, vec3(0.92, bodyHeight, 2.08), 0.14);
 
-  // Flared fenders over 4 wheel arches
   vec3 mirP = vec3(abs(p.x), p.y, p.z);
   float frontFender = sdRoundBox(mirP - vec3(0.79, 0.51, 1.32), vec3(0.18, 0.18, 0.45), 0.11);
   float rearFender = sdRoundBox(mirP - vec3(0.83, 0.54, -1.28), vec3(0.20, 0.21, 0.48), 0.12);
   chassis = smin(chassis, min(frontFender, rearFender), 0.12);
 
-  // Sleek fastback cabin canopy
   vec3 cabP = p - vec3(0.0, 0.88, -0.26);
   cabP.y += max(0.0, cabP.z - 0.1) * 0.25;
   cabP.y += max(0.0, -cabP.z - 0.15) * 0.14;
   float cabin = sdRoundBox(cabP, vec3(0.68, 0.26, 0.96), 0.17);
 
-  // Wheel well subtraction
   vec3 wheelMir = vec3(abs(p.x) - 0.88, p.y - 0.34, abs(p.z) - 1.32);
   float wheelCut = sdCylinderX(wheelMir, 0.22, 0.41);
-  float body = smin(chassis, cabin, 0.14);
-  body = max(body, -wheelCut);
+  float body = max(smin(chassis, cabin, 0.14), -wheelCut);
 
-  // Rear carbon wing
   float wingBlade = sdRoundBox(p - vec3(0.0, 0.99, -2.02), vec3(0.86, 0.025, 0.16), 0.012);
   float wingPosts = sdBox(vec3(abs(p.x) - 0.44, p.y - 0.85, p.z + 1.96), vec3(0.03, 0.14, 0.07));
-  float carPaint = min(body, min(wingBlade, wingPosts));
-
-  float bestD = carPaint;
+  float bestD = min(body, min(wingBlade, wingPosts));
   float bestM = 10.0;
 
-  // Smoked glass canopy zone (windshield + side glass mask)
-  float glassD = sdRoundBox(p - vec3(0.0, 0.92, -0.20), vec3(0.62, 0.21, 0.82), 0.12);
-  if (glassD > body - 0.02 && p.y > 0.72 && abs(p.x) < 0.72 && p.z > -1.35 && p.z < 0.78) {
-    // Keep glass surface slightly inset/flush on upper cabin
+  if (p.y > 0.72 && abs(p.x) < 0.72 && p.z > -1.35 && p.z < 0.78) {
     float cabinShell = max(cabin, -(p.y - 0.74));
     if (cabinShell < bestD + 0.012) {
       bestD = cabinShell;
@@ -208,93 +183,86 @@ vec2 mapVehicle(vec3 worldP, vec3 carPos, float carYaw, out vec3 localOut) {
     }
   }
 
-  // Tires & alloy rims
   float tireD = sdCylinderX(wheelMir, 0.14, 0.34);
-  if (tireD < bestD) {
-    bestD = tireD;
-    bestM = 12.0;
-  }
+  if (tireD < bestD) { bestD = tireD; bestM = 12.0; }
   float rimD = sdCylinderX(wheelMir - vec3(0.02, 0.0, 0.0), 0.145, 0.23);
-  if (rimD < bestD) {
-    bestD = rimD;
-    bestM = 13.0;
-  }
+  if (rimD < bestD) { bestD = rimD; bestM = 13.0; }
 
-  // Front LED Headlamp + DRL optical blade
   float headLampD = sdRoundBox(vec3(abs(p.x) - 0.68, p.y - 0.50, p.z - 2.09), vec3(0.18, 0.042, 0.06), 0.016);
-  if (headLampD < bestD) {
-    bestD = headLampD;
-    bestM = 14.0;
-  }
+  if (headLampD < bestD) { bestD = headLampD; bestM = 14.0; }
 
-  // Rear full-width ruby LED taillight bar
   float tailLampD = sdRoundBox(p - vec3(0.0, 0.61, -2.14), vec3(0.84, 0.034, 0.045), 0.015);
-  if (tailLampD < bestD) {
-    bestD = tailLampD;
-    bestM = 15.0;
-  }
+  if (tailLampD < bestD) { bestD = tailLampD; bestM = 15.0; }
 
+  return vec2(bestD, bestM);
+}
+
+// O(1) analytic ring distance for up to 48 emissive pylons (3 rings x 16 slots)
+vec2 mapAnalyticPylonRings(vec3 p) {
+  if (uEmissivePylonCount <= 0 || p.y > 1.0) return vec2(10.0, -1.0);
+  vec2 c = p.xz - vec2(0.0, 0.5);
+  float r = length(c);
+  if (r < 3.6 || r > 7.4) return vec2(min(abs(r - 4.25), 1.0) + 0.15, -1.0);
+
+  float bestD = 10.0;
+  float bestM = -1.0;
+  float angRaw = (abs(c.x) + abs(c.y) < 1e-4) ? 0.0 : atan(c.y, c.x);
+
+  for (int ring = 0; ring < 3; ++ring) {
+    int ringStart = ring * 16;
+    if (ringStart >= uEmissivePylonCount) break;
+    float rad = 4.25 + float(ring) * 1.2;
+    if (abs(r - rad) > 0.65) continue;
+
+    float phase = float(ring) * 0.19635;
+    float sector = mod(floor((angRaw - phase) / (TWO_PI / 16.0) + 0.5) + 16.0, 16.0);
+    int idx = ringStart + int(sector);
+    if (idx < uEmissivePylonCount) {
+      float a = sector * (TWO_PI / 16.0) + phase;
+      vec3 pp = vec3(cos(a) * rad, 0.30 + 0.10 * sin(float(idx) * 1.7), sin(a) * rad + 0.5);
+      float pd = sdBox(p - pp, vec3(0.065, 0.28, 0.065));
+      if (pd < bestD) {
+        bestD = pd;
+        bestM = 20.0 + float(idx);
+      }
+    }
+  }
   return vec2(bestD, bestM);
 }
 
 vec2 mapScene(vec3 p, out vec3 localCarP) {
   vec2 res = mapVehicle(p, uCarPos, uCarYaw, localCarP);
 
-  // Ground Plane (y = 0)
-  float floorD = p.y;
-  if (floorD < res.x) {
-    res = vec2(floorD, 1.0);
+  if (p.y < res.x) {
+    res = vec2(p.y, 1.0);
   }
 
-  // Environment Architectural Geometry
   if (uEnvPreset == 0) {
-    // Lobby 1: Dark Cyclorama Curved Screen (front calibration wall + curved cyclorama backdrop)
     float calWall = sdBox(p - vec3(0.0, 1.9, 7.6), vec3(6.8, 1.9, 0.2));
-    if (calWall < res.x) {
-      res = vec2(calWall, 2.0);
-    }
-    // Side cyclorama curved fin at x = -6.8
     float sideWall = sdBox(p - vec3(-6.8, 2.0, 1.0), vec3(0.25, 2.0, 6.8));
-    if (sideWall < res.x) {
-      res = vec2(sideWall, 2.0);
-    }
-    // Curved rear cyclorama wall behind car (z = -6.8)
     float rearWall = sdBox(p - vec3(0.0, 2.0, -6.8), vec3(6.8, 2.0, 0.25));
-    if (rearWall < res.x) {
-      res = vec2(rearWall, 2.0);
-    }
+    float envD = min(calWall, min(sideWall, rearWall));
+    if (envD < res.x) res = vec2(envD, 2.0);
   } else if (uEnvPreset == 1) {
-    // Lobby 2: Sunlit Forest Stage — dark timber vertical trunks casting natural sun shadows + warm stage screen
     float calWall = sdBox(p - vec3(0.0, 1.7, 7.8), vec3(7.2, 1.7, 0.25));
-    if (calWall < res.x) {
-      res = vec2(calWall, 2.0);
-    }
-    // Periodic sculpted forest trunks around perimeter (outside central showcase pad)
-    for (int t = 0; t < 6; ++t) {
-      float ang = -0.6 + float(t) * 0.55;
-      vec3 trunkPos = vec3(cos(ang) * 7.8, 2.5, sin(ang) * 7.2 + 0.5);
-      if (abs(trunkPos.x) > 3.0 || trunkPos.z < -2.8) {
-        float td = sdCylinderY(p - trunkPos, 2.5, 0.24 + 0.04 * float(t % 2));
-        if (td < res.x) {
-          res = vec2(td, 7.0);
-        }
-      }
-    }
+    if (calWall < res.x) res = vec2(calWall, 2.0);
+    // 4 sculpted forest trunks outside central pad
+    float t1 = sdCylinderY(p - vec3(5.6, 2.5, -2.8), 2.5, 0.28);
+    float t2 = sdCylinderY(p - vec3(-5.8, 2.5, -2.2), 2.5, 0.25);
+    float t3 = sdCylinderY(p - vec3(6.2, 2.5, 3.2), 2.5, 0.30);
+    float t4 = sdCylinderY(p - vec3(-6.0, 2.5, 3.6), 2.5, 0.26);
+    float td = min(min(t1, t2), min(t3, t4));
+    if (td < res.x) res = vec2(td, 7.0);
   } else {
-    // Lobby 3: Afternoon Racing Pit & Garage Archway Portal
     float backWall = sdBox(p - vec3(0.0, 2.2, 7.8), vec3(8.5, 2.2, 0.22));
-    // Left garage wall with open sunlit archway portal
     float leftWallUpper = sdBox(p - vec3(-6.2, 3.35, 0.5), vec3(0.24, 0.95, 7.5));
     float leftPillarA = sdBox(p - vec3(-6.2, 1.35, -3.5), vec3(0.28, 1.35, 2.0));
     float leftPillarB = sdBox(p - vec3(-6.2, 1.35, 5.2), vec3(0.28, 1.35, 2.1));
     float ceilingBeam = sdBox(p - vec3(0.0, 4.35, 1.2), vec3(7.5, 0.25, 7.5));
     float archD = min(min(backWall, ceilingBeam), min(leftWallUpper, min(leftPillarA, leftPillarB)));
-    if (archD < res.x) {
-      res = vec2(archD, 2.0);
-    }
+    if (archD < res.x) res = vec2(archD, 2.0);
   }
 
-  // Three PBR Calibration Spheres (x = -2.45)
   float sChrome = length(p - vec3(-2.55, 0.46, 2.4)) - 0.46;
   if (sChrome < res.x) res = vec2(sChrome, 3.0);
 
@@ -304,23 +272,11 @@ vec2 mapScene(vec3 p, out vec3 localCarP) {
   float sMatte = length(p - vec3(-2.55, 0.46, -0.4)) - 0.46;
   if (sMatte < res.x) res = vec2(sMatte, 5.0);
 
-  // Overhead Softbox Housing (y = 3.85)
   float softboxMesh = sdBox(p - vec3(0.2, 3.88, 0.2), vec3(1.85, 0.04, 0.85));
   if (softboxMesh < res.x) res = vec2(softboxMesh, 6.0);
 
-  // Emissive Light Pylon ring (only visible physical capsules matching LightTree luminaires!)
-  for (int i = 0; i < 48; ++i) {
-    if (i >= uEmissivePylonCount) break;
-    float fi = float(i);
-    float ringIdx = floor(fi / 16.0);
-    float ang = (fi / float(max(uEmissivePylonCount, 1))) * TWO_PI * (1.0 + ringIdx * 0.5) + 0.35;
-    float rad = 4.2 + ringIdx * 1.45;
-    vec3 pylonPos = vec3(cos(ang) * rad, 0.32 + 0.14 * sin(fi * 1.7), sin(ang) * rad + 0.6);
-    float pylonD = sdBox(p - pylonPos, vec3(0.065, 0.28, 0.065));
-    if (pylonD < res.x) {
-      res = vec2(pylonD, 20.0 + fi);
-    }
-  }
+  vec2 pylonRes = mapAnalyticPylonRings(p);
+  if (pylonRes.x < res.x && pylonRes.y > 0.0) res = pylonRes;
 
   return res;
 }
@@ -331,7 +287,7 @@ float mapDistanceOnly(vec3 p) {
 }
 
 vec3 calcNormal(vec3 p) {
-  const vec2 e = vec2(0.0022, -0.0022);
+  const vec2 e = vec2(0.0024, -0.0024);
   return normalize(
     e.xyy * mapDistanceOnly(p + e.xyy) +
     e.yyx * mapDistanceOnly(p + e.yyx) +
@@ -340,31 +296,27 @@ vec3 calcNormal(vec3 p) {
   );
 }
 
-// -----------------------------------------------------------------------------
-// Visibility Operators: BVH-style Crisp Ray-Marched vs SDF Soft Cone + AO
-// -----------------------------------------------------------------------------
 float traceExactShadow(vec3 ro, vec3 rd, float maxT, float bias) {
-  float t = max(bias, 0.035);
+  float t = max(bias, 0.04);
   float minRes = 1.0;
-  for (int i = 0; i < 36; ++i) {
+  for (int i = 0; i < 24; ++i) {
     float h = mapDistanceOnly(ro + rd * t);
-    if (h < 0.0025) return 0.0;
+    if (h < 0.003) return 0.0;
     minRes = min(minRes, 18.0 * h / t);
-    t += clamp(h, 0.035, 0.55);
+    t += clamp(h, 0.05, 0.75);
     if (t >= maxT) break;
   }
   return clamp(minRes, 0.0, 1.0);
 }
 
-// GDF Soft-Cone SDF Shadow (Engine 2: GtxLowEnd — 8-12 cheap SDF steps!)
 float traceGdfConeShadow(vec3 ro, vec3 rd, float maxT, float coneSoftness) {
-  float t = 0.055;
+  float t = 0.06;
   float res = 1.0;
-  for (int i = 0; i < 14; ++i) {
+  for (int i = 0; i < 12; ++i) {
     float h = mapDistanceOnly(ro + rd * t);
-    if (h < 0.002) return 0.0;
+    if (h < 0.0025) return 0.0;
     res = min(res, coneSoftness * h / t);
-    t += clamp(h * 1.15, 0.08, 0.75);
+    t += clamp(h * 1.2, 0.09, 0.85);
     if (t >= maxT) break;
   }
   return clamp(res * res * (3.0 - 2.0 * res), 0.0, 1.0);
@@ -373,18 +325,15 @@ float traceGdfConeShadow(vec3 ro, vec3 rd, float maxT, float coneSoftness) {
 float calcSdfAmbientOcclusion(vec3 pos, vec3 nor) {
   float occ = 0.0;
   float sca = 1.0;
-  for (int i = 0; i < 5; ++i) {
-    float h = 0.03 + 0.14 * float(i);
+  for (int i = 0; i < 4; ++i) {
+    float h = 0.04 + 0.18 * float(i);
     float d = mapDistanceOnly(pos + h * nor);
     occ += (h - d) * sca;
-    sca *= 0.72;
+    sca *= 0.70;
   }
-  return clamp(1.0 - 1.6 * occ, 0.18, 1.0);
+  return clamp(1.0 - 1.55 * occ, 0.20, 1.0);
 }
 
-// -----------------------------------------------------------------------------
-// GPU Register Fetches & 128x32 Bilinear Type-C .ies Sampler
-// -----------------------------------------------------------------------------
 void fetchLuminaire(int idx, out vec4 t0, out vec4 t1, out vec4 t2, out vec4 t3) {
   int base = idx * 4;
   t0 = texelFetch(uLightRegisterTex, ivec2((base + 0) % 256, (base + 0) / 256), 0);
@@ -404,7 +353,7 @@ void fetchPartitionCell(int cellIdx, out vec4 n0, out vec4 n1, out vec4 n2, out 
 float sampleIesAtlas128x32(int profileOrd, vec3 dirFromLight, vec3 beamAxis, vec3 zeroAzimuth) {
   float cosTheta = clamp(dot(dirFromLight, beamAxis), -0.99999, 0.99999);
   float theta = acos(cosTheta);
-  float thetaF = (theta / PI) * float(128 - 1);
+  float thetaF = (theta / PI) * 127.0;
   int t0 = clamp(int(floor(thetaF)), 0, 126);
   int t1 = t0 + 1;
   float tf = thetaF - float(t0);
@@ -427,13 +376,9 @@ float sampleIesAtlas128x32(int profileOrd, vec3 dirFromLight, vec3 beamAxis, vec
   float v10 = texelFetch(uIesAtlasTex, ivec2(t1, rowBase + p0), 0).r;
   float v01 = texelFetch(uIesAtlasTex, ivec2(t0, rowBase + p1), 0).r;
   float v11 = texelFetch(uIesAtlasTex, ivec2(t1, rowBase + p1), 0).r;
-
   return mix(mix(v00, v10, tf), mix(v01, v11, tf), pf);
 }
 
-// -----------------------------------------------------------------------------
-// Analytical PBR & Luminaire Equations (Identical across all Render Engines!)
-// -----------------------------------------------------------------------------
 float ggxNdf(float nDotH, float rough) {
   float a = max(rough * rough, 0.002);
   float a2 = a * a;
@@ -444,9 +389,7 @@ float ggxNdf(float nDotH, float rough) {
 float smithGeometry(float nDotV, float nDotL, float rough) {
   float r = rough + 1.0;
   float k = (r * r) * 0.125;
-  float gV = nDotV / (nDotV * (1.0 - k) + k);
-  float gL = nDotL / (nDotL * (1.0 - k) + k);
-  return gV * gL;
+  return (nDotV / (nDotV * (1.0 - k) + k)) * (nDotL / (nDotL * (1.0 - k) + k));
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 f0) {
@@ -463,7 +406,6 @@ vec3 evalOpenPbrBrdf(
   float nDotV = max(dot(N, V), 1e-4);
 
   vec3 diffColor = albedo * (1.0 - metallic) / PI;
-
   vec3 Ls = normalize(specDirOverride);
   float nDotLs = max(dot(N, Ls), 0.0);
   vec3 H = normalize(V + Ls);
@@ -476,7 +418,6 @@ vec3 evalOpenPbrBrdf(
   float G = smithGeometry(nDotV, nDotLs, rough);
   vec3 baseSpec = (D * G * F) / max(4.0 * nDotV * nDotLs, 1e-4);
 
-  // Automotive Clearcoat dielectric top layer
   vec3 coatSpec = vec3(0.0);
   float coatAtten = 1.0;
   if (clearcoat > 0.01 && uSdfVoxelDefectDemo == 0) {
@@ -497,277 +438,175 @@ float smoothRangeWindow(float dist, float rangeMeters) {
   return ratio * ratio;
 }
 
-// Clipped Spherical-Polygon Quad Irradiance + Karis Representative Specular Point
-vec3 evalAreaQuadAnalytical(
-  vec3 P, vec3 N, vec3 V,
-  vec4 t0, vec4 t1, vec4 t2, vec4 t3,
-  vec3 albedo, float metallic, float rough, float clearcoat,
-  out vec3 outShadowDir, out float outShadowDist, out float outIrradOnly
-) {
-  vec3 center = t0.xyz;
-  float halfW = t0.w;
-  vec3 upAxis = normalize(t1.xyz);
-  float halfH = t1.w;
-  vec3 rightAxis = normalize(t2.xyz);
-  vec3 emitN = normalize(cross(rightAxis, upAxis));
-  vec3 col = t3.rgb;
-  bool twoSided = t3.w >= 50.0;
-  float collimation = mod(t3.w, 50.0);
-
-  vec3 toCenter = center - P;
-  if (!twoSided && dot(emitN, -toCenter) <= 0.0) {
-    outShadowDir = vec3(0.0, 1.0, 0.0);
-    outShadowDist = 0.0;
-    outIrradOnly = 0.0;
-    return vec3(0.0);
-  }
-
-  // 4 quad corners in world space
-  vec3 uVec = rightAxis * halfW;
-  vec3 vVec = upAxis * halfH;
-  vec3 p0 = center - uVec - vVec - P;
-  vec3 p1 = center + uVec - vVec - P;
-  vec3 p2 = center + uVec + vVec - P;
-  vec3 p3 = center - uVec + vVec - P;
-
-  vec3 v0 = normalize(p0);
-  vec3 v1 = normalize(p1);
-  vec3 v2 = normalize(p2);
-  vec3 v3 = normalize(p3);
-
-  // Spherical polygon vector irradiance (Arvo 1995 / Baum 1989)
-  float f01 = acos(clamp(dot(v0, v1), -0.9999, 0.9999));
-  float f12 = acos(clamp(dot(v1, v2), -0.9999, 0.9999));
-  float f23 = acos(clamp(dot(v2, v3), -0.9999, 0.9999));
-  float f30 = acos(clamp(dot(v3, v0), -0.9999, 0.9999));
-
-  vec3 c01 = cross(v0, v1); float l01 = length(c01);
-  vec3 c12 = cross(v1, v2); float l12 = length(c12);
-  vec3 c23 = cross(v2, v3); float l23 = length(c23);
-  vec3 c30 = cross(v3, v0); float l30 = length(c30);
-
-  vec3 vecIrr =
-    (l01 > 1e-5 ? c01 / l01 : vec3(0.0)) * f01 +
-    (l12 > 1e-5 ? c12 / l12 : vec3(0.0)) * f12 +
-    (l23 > 1e-5 ? c23 / l23 : vec3(0.0)) * f23 +
-    (l30 > 1e-5 ? c30 / l30 : vec3(0.0)) * f30;
-
-  float irradFactor = abs(dot(vecIrr, N)) * (0.5 / PI);
-  float dist = length(toCenter);
-  vec3 L = toCenter / max(dist, 1e-4);
-  if (collimation > 0.1) {
-    float coneDot = max(dot(emitN, -L), 1e-4);
-    irradFactor *= pow(coneDot, collimation);
-  }
-
-  // Karis Representative Point for sharp LTC-like rectangular softbox reflection
-  vec3 R = reflect(-V, N);
-  float rDotEn = dot(R, emitN);
-  vec3 repPos = center;
-  if (abs(rDotEn) > 1e-4) {
-    float tPlane = dot(center - P, emitN) / rDotEn;
-    if (tPlane > 0.0) {
-      vec3 hit = P + R * tPlane;
-      vec3 delta = hit - center;
-      float px = clamp(dot(delta, rightAxis), -halfW, halfW);
-      float py = clamp(dot(delta, upAxis), -halfH, halfH);
-      repPos = center + rightAxis * px + upAxis * py;
-    }
-  }
-  vec3 Lspec = normalize(repPos - P);
-  float area = 4.0 * halfW * halfH;
-  float areaSolid = area / max(dist * dist + area, 0.08);
-
-  outShadowDir = L;
-  outShadowDist = dist;
-  outIrradOnly = irradFactor * max(col.r, max(col.g, col.b));
-
-  vec3 diffTerm = (albedo * (1.0 - metallic)) * irradFactor;
-  // Specular energy-conserving normalization
-  float specRough = clamp(rough + sqrt(areaSolid) * 0.18, 0.04, 1.0);
-  vec3 specOnly = evalOpenPbrBrdf(N, V, Lspec, albedo, metallic, specRough, clearcoat, 0.045, areaSolid * 2.4, Lspec);
-  vec3 fZero = albedo * (1.0 - metallic) / PI * max(dot(N, Lspec), 0.0);
-  vec3 pureSpec = max(specOnly - fZero, vec3(0.0));
-
-  if (uDebugLens == 5) return pureSpec * col;
-  return (diffTerm + pureSpec) * col;
-}
-
-// Analytical Linear Capsule / Tube Light (DRL LED Bar, Ruby Tail Bar, Overhead Strip)
-vec3 evalTubeCapsuleAnalytical(
-  vec3 P, vec3 N, vec3 V,
-  vec4 t0, vec4 t1, vec4 t3,
-  vec3 albedo, float metallic, float rough, float clearcoat,
-  out vec3 outShadowDir, out float outShadowDist, out float outIrradOnly
-) {
-  vec3 segA = t0.xyz;
-  float radius = max(t0.w, 0.015);
-  vec3 segB = t1.xyz;
-  float rangeMeters = max(t1.w, 1.0);
-  vec3 col = t3.rgb;
-
-  vec3 ab = segB - segA;
-  float abLen2 = max(dot(ab, ab), 1e-6);
-  float tClosest = clamp(dot(P - segA, ab) / abLen2, 0.0, 1.0);
-  vec3 closestPt = segA + ab * tClosest;
-
-  vec3 toLight = closestPt - P;
-  float dist = length(toLight);
-  vec3 L = toLight / max(dist, 1e-4);
-
-  // Representative reflection point along capsule segment (Karis 2013)
-  vec3 R = reflect(-V, N);
-  vec3 L0 = segA - P;
-  vec3 L1 = segB - P;
-  vec3 Ld = L1 - L0;
-  float rDotLd = dot(R, Ld);
-  float tSpec = clamp((dot(R, L0) * rDotLd - dot(L0, Ld)) / max(dot(Ld, Ld) - rDotLd * rDotLd, 1e-5), 0.0, 1.0);
-  vec3 specPt = mix(segA, segB, tSpec);
-  vec3 Lspec = normalize(specPt - P);
-
-  float atten = smoothRangeWindow(dist, rangeMeters) / max(dist * dist + radius * radius, 0.04);
-  float segLen = sqrt(abLen2);
-  float capsuleNorm = min(1.8, 0.45 + segLen * 0.55);
-
-  outShadowDir = L;
-  outShadowDist = dist;
-  outIrradOnly = max(dot(N, L), 0.0) * atten * capsuleNorm * max(col.r, max(col.g, col.b));
-
-  vec3 brdf = evalOpenPbrBrdf(N, V, L, albedo, metallic, rough, clearcoat, 0.05, 1.0, Lspec);
-  if (uDebugLens == 5) {
-    vec3 pureDiff = albedo * (1.0 - metallic) / PI * max(dot(N, L), 0.0);
-    return max(brdf - pureDiff, vec3(0.0)) * col * atten * capsuleNorm;
-  }
-  return brdf * col * atten * capsuleNorm;
-}
-
-// Unified Single-Luminaire Evaluation (Works for Point, IES, AreaQuad, Tube, SelfLit)
-vec3 evalUnifiedLuminaire(
+vec3 evalUnifiedLuminaireNoShadow(
   int lumIdx, vec3 P, vec3 N, vec3 V,
   vec3 albedo, float metallic, float rough, float clearcoat,
-  bool doShadow, bool fastSdfShadow,
-  out float outLuxContribution
+  out vec3 outShadowDir, out float outShadowDist, out float outLuxNoVis
 ) {
   vec4 t0, t1, t2, t3;
   fetchLuminaire(lumIdx, t0, t1, t2, t3);
   int cat = int(floor(t2.w + 0.5));
-
-  vec3 shadowDir = vec3(0.0, 1.0, 0.0);
-  float shadowDist = 0.0;
-  float irradContrib = 0.0;
-  vec3 radiance = vec3(0.0);
+  outShadowDir = vec3(0.0, 1.0, 0.0);
+  outShadowDist = 0.0;
+  outLuxNoVis = 0.0;
 
   if (cat == 2 || cat == 4) {
-    radiance = evalAreaQuadAnalytical(P, N, V, t0, t1, t2, t3, albedo, metallic, rough, clearcoat, shadowDir, shadowDist, irradContrib);
-  } else if (cat == 3) {
-    radiance = evalTubeCapsuleAnalytical(P, N, V, t0, t1, t3, albedo, metallic, rough, clearcoat, shadowDir, shadowDist, irradContrib);
+    // AreaQuad LTC
+    vec3 center = t0.xyz;
+    float halfW = t0.w;
+    vec3 upAxis = normalize(t1.xyz);
+    float halfH = t1.w;
+    vec3 rightAxis = normalize(t2.xyz);
+    vec3 emitN = normalize(cross(rightAxis, upAxis));
+    vec3 col = t3.rgb;
+    bool twoSided = t3.w >= 50.0;
+    float collimation = mod(t3.w, 50.0);
+
+    vec3 toCenter = center - P;
+    if (!twoSided && dot(emitN, -toCenter) <= 0.0) return vec3(0.0);
+
+    vec3 uVec = rightAxis * halfW;
+    vec3 vVec = upAxis * halfH;
+    vec3 v0 = normalize(center - uVec - vVec - P);
+    vec3 v1 = normalize(center + uVec - vVec - P);
+    vec3 v2 = normalize(center + uVec + vVec - P);
+    vec3 v3 = normalize(center - uVec + vVec - P);
+
+    vec3 c01 = cross(v0, v1); float l01 = length(c01);
+    vec3 c12 = cross(v1, v2); float l12 = length(c12);
+    vec3 c23 = cross(v2, v3); float l23 = length(c23);
+    vec3 c30 = cross(v3, v0); float l30 = length(c30);
+    vec3 vecIrr =
+      (l01 > 1e-5 ? c01 / l01 : vec3(0.0)) * acos(clamp(dot(v0, v1), -0.9999, 0.9999)) +
+      (l12 > 1e-5 ? c12 / l12 : vec3(0.0)) * acos(clamp(dot(v1, v2), -0.9999, 0.9999)) +
+      (l23 > 1e-5 ? c23 / l23 : vec3(0.0)) * acos(clamp(dot(v2, v3), -0.9999, 0.9999)) +
+      (l30 > 1e-5 ? c30 / l30 : vec3(0.0)) * acos(clamp(dot(v3, v0), -0.9999, 0.9999));
+
+    float irradFactor = abs(dot(vecIrr, N)) * (0.5 / PI);
+    float dist = length(toCenter);
+    vec3 L = toCenter / max(dist, 1e-4);
+    if (collimation > 0.1) irradFactor *= pow(max(dot(emitN, -L), 1e-4), collimation);
+
+    vec3 R = reflect(-V, N);
+    float rDotEn = dot(R, emitN);
+    vec3 repPos = center;
+    if (abs(rDotEn) > 1e-4) {
+      float tPlane = dot(center - P, emitN) / rDotEn;
+      if (tPlane > 0.0) {
+        vec3 delta = (P + R * tPlane) - center;
+        repPos = center + rightAxis * clamp(dot(delta, rightAxis), -halfW, halfW)
+                        + upAxis * clamp(dot(delta, upAxis), -halfH, halfH);
+      }
+    }
+    vec3 Lspec = normalize(repPos - P);
+    float area = 4.0 * halfW * halfH;
+    float areaSolid = area / max(dist * dist + area, 0.08);
+    outShadowDir = L;
+    outShadowDist = dist;
+    outLuxNoVis = irradFactor * max(col.r, max(col.g, col.b));
+
+    float specRough = clamp(rough + sqrt(areaSolid) * 0.18, 0.04, 1.0);
+    vec3 specOnly = evalOpenPbrBrdf(N, V, Lspec, albedo, metallic, specRough, clearcoat, 0.045, areaSolid * 2.4, Lspec);
+    vec3 pureDiff = albedo * (1.0 - metallic) / PI * max(dot(N, Lspec), 0.0);
+    vec3 pureSpec = max(specOnly - pureDiff, vec3(0.0));
+    if (uDebugLens == 5) return pureSpec * col;
+    return ((albedo * (1.0 - metallic)) * irradFactor + pureSpec) * col;
+  }
+
+  vec3 L_eval = vec3(0.0);
+  vec3 L_spec = vec3(0.0);
+  float effRough = rough;
+  float totalScale = 0.0;
+
+  if (cat == 3) {
+    vec3 segA = t0.xyz;
+    float radius = max(t0.w, 0.015);
+    vec3 segB = t1.xyz;
+    float rangeM = max(t1.w, 1.0);
+    vec3 ab = segB - segA;
+    float abLen2 = max(dot(ab, ab), 1e-6);
+    vec3 closestPt = segA + ab * clamp(dot(P - segA, ab) / abLen2, 0.0, 1.0);
+    vec3 toL = closestPt - P;
+    float dist = length(toL);
+    L_eval = toL / max(dist, 1e-4);
+
+    vec3 R = reflect(-V, N);
+    vec3 L0 = segA - P;
+    vec3 Ld = (segB - P) - L0;
+    float rDotLd = dot(R, Ld);
+    float tSpec = clamp((dot(R, L0) * rDotLd - dot(L0, Ld)) / max(dot(Ld, Ld) - rDotLd * rDotLd, 1e-5), 0.0, 1.0);
+    L_spec = normalize(mix(segA, segB, tSpec) - P);
+
+    float atten = smoothRangeWindow(dist, rangeM) / max(dist * dist + radius * radius, 0.04);
+    float capsuleNorm = min(1.8, 0.45 + sqrt(abLen2) * 0.55);
+    totalScale = atten * capsuleNorm;
+    outShadowDir = L_eval;
+    outShadowDist = dist;
   } else {
-    // POINT_SPHERE (0) or PHOTOMETRIC_IES (1)
     vec3 lPos = t0.xyz;
     float rangeM = max(t0.w, 1.0);
     vec3 beamAxis = normalize(t1.xyz);
     float radius = max(t1.w, 0.02);
     vec3 zeroAz = t2.xyz;
-    vec3 col = t3.rgb;
     int profileOrd = int(floor(t3.w + 0.5));
 
     vec3 toL = lPos - P;
     float dist = length(toL);
-    vec3 L = toL / max(dist, 1e-4);
-
-    float iesWeight = 1.0;
-    if (cat == 1) {
-      iesWeight = sampleIesAtlas128x32(profileOrd, -L, beamAxis, zeroAz);
-    }
-    float atten = iesWeight * smoothRangeWindow(dist, rangeM) / max(dist * dist + radius * radius * 0.5, 0.04);
-
-    shadowDir = L;
-    shadowDist = dist;
-    irradContrib = max(dot(N, L), 0.0) * atten * max(col.r, max(col.g, col.b));
-
-    float effRough = clamp(rough + radius / max(2.0 * dist, 0.1), 0.04, 1.0);
-    vec3 brdf = evalOpenPbrBrdf(N, V, L, albedo, metallic, effRough, clearcoat, 0.045, 1.0, L);
-    if (uDebugLens == 5) {
-      vec3 pureDiff = albedo * (1.0 - metallic) / PI * max(dot(N, L), 0.0);
-      radiance = max(brdf - pureDiff, vec3(0.0)) * col * atten;
-    } else {
-      radiance = brdf * col * atten;
-    }
+    L_eval = toL / max(dist, 1e-4);
+    L_spec = L_eval;
+    float iesW = (cat == 1) ? sampleIesAtlas128x32(profileOrd, -L_eval, beamAxis, zeroAz) : 1.0;
+    totalScale = iesW * smoothRangeWindow(dist, rangeM) / max(dist * dist + radius * radius * 0.5, 0.04);
+    effRough = clamp(rough + radius / max(2.0 * dist, 0.1), 0.04, 1.0);
+    outShadowDir = L_eval;
+    outShadowDist = dist;
   }
 
-  float vis = 1.0;
-  if (doShadow && shadowDist > 0.08 && max(radiance.r, max(radiance.g, radiance.b)) > 0.002) {
-    if (fastSdfShadow) {
-      vis = traceGdfConeShadow(P + N * 0.02, shadowDir, min(shadowDist - 0.14, 14.0), 9.0);
-    } else {
-      vis = traceExactShadow(P + N * 0.02, shadowDir, min(shadowDist - 0.14, 16.0), 0.04);
-    }
+  vec3 col = t3.rgb;
+  outLuxNoVis = max(dot(N, L_eval), 0.0) * totalScale * max(col.r, max(col.g, col.b));
+  vec3 brdf = evalOpenPbrBrdf(N, V, L_eval, albedo, metallic, effRough, clearcoat, 0.045, 1.0, L_spec);
+  if (uDebugLens == 5) {
+    vec3 pureDiff = albedo * (1.0 - metallic) / PI * max(dot(N, L_eval), 0.0);
+    return max(brdf - pureDiff, vec3(0.0)) * col * totalScale;
   }
-
-  outLuxContribution = irradContrib * vis;
-  return radiance * vis;
+  return brdf * col * totalScale;
 }
 
-// -----------------------------------------------------------------------------
-// Conty Estevez & Kulla Partition Importance Metric
-// -----------------------------------------------------------------------------
 float partitionCellImportance(vec3 P, vec3 N, vec4 n0, vec4 n1, vec4 n2, vec4 n3) {
   float power = n0.w;
   if (power <= 1e-5) return 0.0;
-
-  vec3 minB = n0.xyz;
-  vec3 maxB = n1.xyz;
-  vec3 center = 0.5 * (minB + maxB);
-  vec3 extent = 0.5 * (maxB - minB);
-  float radius = length(extent);
-
+  vec3 center = 0.5 * (n0.xyz + n1.xyz);
+  float radius = length(0.5 * (n1.xyz - n0.xyz));
   vec3 delta = P - center;
   float dist2 = max(dot(delta, delta), max(radius * radius * 0.25, 0.08));
   float dist = sqrt(dist2);
   vec3 dirFromCluster = delta / dist;
 
-  // Bounded emission cone factor
-  vec3 axis = n2.xyz;
-  float cosO = n2.w;
-  float sinO = n3.x;
-  float cutoff = n3.z;
-
   float thetaU = asin(clamp(radius / max(dist, radius + 1e-4), 0.0, 0.99999));
-  float thetaO = acos(clamp(cosO, -0.99999, 0.99999));
-  float theta = acos(clamp(dot(axis, dirFromCluster), -0.99999, 0.99999));
+  float thetaO = acos(clamp(n2.w, -0.99999, 0.99999));
+  float theta = acos(clamp(dot(n2.xyz, dirFromCluster), -0.99999, 0.99999));
   float effTheta = max(0.0, theta - thetaO - thetaU);
-  float coneWeight = (effTheta >= cutoff) ? 0.03 : max(0.08, cos(effTheta));
-
-  // Surface normal horizon bound
+  float coneWeight = (effTheta >= n3.z) ? 0.03 : max(0.08, cos(effTheta));
   float cosNormal = clamp(dot(N, -dirFromCluster) + thetaU, 0.05, 1.0);
   return (power * coneWeight * cosNormal) / dist2;
 }
 
-// -----------------------------------------------------------------------------
-// Environment Sky & Studio Cove Evaluation
-// -----------------------------------------------------------------------------
 vec3 evalEnvironmentSky(vec3 dir) {
   float y = dir.y;
   float sunDot = max(dot(dir, uSunDir), 1e-4);
   if (uEnvPreset == 0) {
-    // Dark Cyclorama Studio Cove
     float t = clamp(y * 1.4, 0.0, 1.0);
     float coveRing = exp(-pow((y - 0.28) / 0.12, 2.0)) * 0.26;
     return mix(vec3(0.025, 0.028, 0.036), vec3(0.05, 0.068, 0.095), t) + vec3(0.9, 0.94, 1.05) * coveRing;
   } else if (uEnvPreset == 1) {
-    // Sunlit Forest Showcase Sky
     float up = max(y, 1e-4);
     vec3 sky = mix(vec3(0.32, 0.44, 0.52), vec3(0.11, 0.28, 0.68), pow(up, 0.65));
     float sunGlow = pow(sunDot, 22.0) * 1.4 + pow(sunDot, 420.0) * 14.0;
-    if (y < 0.0) sky = vec3(0.05, 0.08, 0.045);
-    return sky + uSunColor * sunGlow;
+    return (y < 0.0 ? vec3(0.05, 0.08, 0.045) : sky) + uSunColor * sunGlow;
   } else {
-    // Afternoon Racing Pit Stadium Sky
     float up = max(y, 1e-4);
     vec3 sky = mix(vec3(0.55, 0.44, 0.36), vec3(0.15, 0.30, 0.62), pow(up, 0.6));
     float sunGlow = pow(sunDot, 16.0) * 1.6 + pow(sunDot, 360.0) * 16.0;
-    if (y < 0.0) sky = vec3(0.08, 0.075, 0.07);
-    return sky + uSunColor * sunGlow;
+    return (y < 0.0 ? vec3(0.08, 0.075, 0.07) : sky) + uSunColor * sunGlow;
   }
 }
 
@@ -786,21 +625,12 @@ vec3 evalEnvironmentHarmonics(vec3 N) {
   return max(res, vec3(0.0));
 }
 
-// -----------------------------------------------------------------------------
-// Material Properties
-// -----------------------------------------------------------------------------
 void evalMaterial(
   float matId, vec3 worldP, vec3 localCarP, vec3 N,
   out vec3 albedo, out float metallic, out float rough, out float clearcoat, out vec3 emissive
 ) {
-  albedo = vec3(0.5);
-  metallic = 0.0;
-  rough = 0.45;
-  clearcoat = 0.0;
-  emissive = vec3(0.0);
-
+  albedo = vec3(0.5); metallic = 0.0; rough = 0.45; clearcoat = 0.0; emissive = vec3(0.0);
   if (matId < 1.5) {
-    // Ground floor (epoxy concrete grid)
     vec2 g = abs(fract(worldP.xz * 0.5) - 0.5);
     float seam = smoothstep(0.015, 0.032, min(g.x, g.y));
     float speckle = hash12(floor(worldP.xz * 22.0)) * 0.035;
@@ -815,9 +645,7 @@ void evalMaterial(
       rough = mix(0.24, 0.15, seam);
     }
   } else if (matId < 2.5) {
-    // Calibration Photometric Screen & Garage Architecture
     albedo = vec3(0.56, 0.57, 0.59);
-    // Calibration horizontal horizon ticks on front screen (z > 7.1)
     if (worldP.z > 7.1 && abs(worldP.x) < 5.0) {
       float tickY = smoothstep(0.012, 0.025, abs(fract(worldP.y * 2.0) - 0.5));
       float centerLine = smoothstep(0.015, 0.03, abs(worldP.x));
@@ -826,78 +654,52 @@ void evalMaterial(
     }
     rough = 0.78;
   } else if (matId < 3.5) {
-    // Chrome sphere
-    albedo = vec3(0.92, 0.94, 0.96);
-    metallic = 1.0;
-    rough = 0.04;
+    albedo = vec3(0.92, 0.94, 0.96); metallic = 1.0; rough = 0.04;
   } else if (matId < 4.5) {
-    // Clearcoat Signal Orange sphere
-    albedo = vec3(0.84, 0.19, 0.05);
-    metallic = 0.18;
-    rough = 0.24;
-    clearcoat = 1.0;
+    albedo = vec3(0.84, 0.19, 0.05); metallic = 0.18; rough = 0.24; clearcoat = 1.0;
   } else if (matId < 5.5) {
-    // Matte Plaster Sphere
-    albedo = vec3(0.76, 0.76, 0.78);
-    rough = 0.90;
+    albedo = vec3(0.76, 0.76, 0.78); rough = 0.90;
   } else if (matId < 6.5) {
-    // Overhead Softbox physical diffuser
-    albedo = vec3(0.18);
-    rough = 0.5;
+    albedo = vec3(0.18); rough = 0.5;
     if (N.y < -0.5) emissive = vec3(11.0, 11.4, 12.2);
   } else if (matId < 7.5) {
-    // Forest Timber Trunks
-    albedo = vec3(0.15, 0.10, 0.07);
-    rough = 0.86;
+    albedo = vec3(0.15, 0.10, 0.07); rough = 0.86;
   } else if (matId < 10.5) {
-    // Hero GT Car Metallic Clearcoat Sapphire
-    albedo = vec3(0.045, 0.145, 0.34);
-    metallic = 0.72;
-    rough = 0.22;
-    clearcoat = 1.0;
+    albedo = vec3(0.045, 0.145, 0.34); metallic = 0.72; rough = 0.22; clearcoat = 1.0;
   } else if (matId < 11.5) {
-    // Smoked Canopy Glass
-    albedo = vec3(0.03, 0.04, 0.055);
-    metallic = 0.1;
-    rough = 0.035;
-    clearcoat = 1.0;
+    albedo = vec3(0.03, 0.04, 0.055); metallic = 0.1; rough = 0.035; clearcoat = 1.0;
   } else if (matId < 12.5) {
-    // Tire Rubber
-    albedo = vec3(0.045, 0.046, 0.05);
-    rough = 0.76;
+    albedo = vec3(0.045, 0.046, 0.05); rough = 0.76;
   } else if (matId < 13.5) {
-    // Forged Alloy Wheel Rim
-    albedo = vec3(0.76, 0.78, 0.82);
-    metallic = 0.94;
-    rough = 0.16;
+    albedo = vec3(0.76, 0.78, 0.82); metallic = 0.94; rough = 0.16;
   } else if (matId < 14.5) {
-    // Front Headlamp + DRL Optics
-    albedo = vec3(0.85);
-    rough = 0.08;
+    albedo = vec3(0.85); rough = 0.08;
     float turnFlash = (abs(localCarP.x) > 0.76 && uTurnSignalActive > 0.5 && fract(uTimeSec * 2.2) < 0.55) ? 1.0 : 0.0;
-    vec3 drlCol = vec3(16.0, 17.5, 20.0) * max(uDrlActive, uHeadlampIntensity);
-    vec3 ambCol = vec3(14.0, 6.2, 0.4) * turnFlash;
-    emissive = mix(drlCol, ambCol, turnFlash);
+    emissive = mix(vec3(16.0, 17.5, 20.0) * max(uDrlActive, uHeadlampIntensity), vec3(14.0, 6.2, 0.4) * turnFlash, turnFlash);
   } else if (matId < 15.5) {
-    // Ruby Taillight + Brake Blade
-    albedo = vec3(0.24, 0.01, 0.01);
-    rough = 0.12;
-    float brakeBoost = 1.0 + uBrakeActive * 3.8;
-    emissive = vec3(9.5, 0.32, 0.18) * brakeBoost;
+    albedo = vec3(0.24, 0.01, 0.01); rough = 0.12;
+    emissive = vec3(9.5, 0.32, 0.18) * (1.0 + uBrakeActive * 3.8);
   } else {
-    // Emissive Pylons (matId >= 20)
-    int eIdx = int(floor(matId - 20.0 + 0.5));
-    float hue = fract(float(eIdx) * 0.27);
+    float hue = fract(floor(matId - 20.0 + 0.5) * 0.27);
     vec3 neon = clamp(abs(fract(hue + vec3(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
     albedo = neon * 0.4;
     emissive = (neon * 0.85 + vec3(0.15)) * 7.5;
   }
 }
 
-// -----------------------------------------------------------------------------
-// Unified Direct Lighting Dispatcher across Scheduling Modes
-// -----------------------------------------------------------------------------
-vec3 shadePointDirect(
+vec3 infernoPalette(float t) {
+  t = clamp(t, 0.0, 1.0);
+  if (t < 0.33) return mix(vec3(0.04, 0.05, 0.16), vec3(0.32, 0.09, 0.48), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.32, 0.09, 0.48), vec3(0.85, 0.25, 0.22), (t - 0.33) / 0.33);
+  return mix(vec3(0.85, 0.25, 0.22), vec3(0.98, 0.88, 0.25), (t - 0.66) / 0.34);
+}
+`;
+
+// Program 1: Real-Time Engines 0, 1, 2, 3 — single luminaire evaluation loop!
+const REALTIME_FRAGMENT_SRC =
+  SHARED_GLSL_COMMON +
+  `
+vec3 shadePointRealTime(
   vec3 P, vec3 N, vec3 V,
   vec3 albedo, float metallic, float rough, float clearcoat,
   bool doShadows, bool fastSdfShadow, vec2 fragCoord,
@@ -905,338 +707,178 @@ vec3 shadePointDirect(
 ) {
   outCutEvals = 0;
   outLuxTotal = 0.0;
-
-  // Voxelized Grid Defect Demo (proves why SDF direct lighting MUST stay analytical!)
-  vec3 evalP = P;
-  if (uRenderEngine == 1 && uSdfVoxelDefectDemo == 1) {
-    evalP = (floor(P / 0.45) + 0.5) * 0.45;
-  }
-
+  vec3 evalP = (uRenderEngine == 1 && uSdfVoxelDefectDemo == 1) ? (floor(P / 0.45) + 0.5) * 0.45 : P;
   vec3 total = vec3(0.0);
 
-  // Solar / Stadium Directional Sun (in Forest & Racing Garage)
   if (uEnvPreset >= 1) {
     float sunVis = 1.0;
     if (doShadows && dot(N, uSunDir) > 0.0) {
-      sunVis = fastSdfShadow
-        ? traceGdfConeShadow(P + N * 0.02, uSunDir, 18.0, 12.0)
-        : traceExactShadow(P + N * 0.02, uSunDir, 20.0, 0.04);
+      sunVis = fastSdfShadow ? traceGdfConeShadow(P + N * 0.02, uSunDir, 18.0, 12.0)
+                             : traceExactShadow(P + N * 0.02, uSunDir, 20.0, 0.04);
     }
-    vec3 sunBrdf = evalOpenPbrBrdf(N, V, uSunDir, albedo, metallic, rough, clearcoat, 0.045, 1.0, uSunDir);
-    total += sunBrdf * uSunColor * sunVis;
+    total += evalOpenPbrBrdf(N, V, uSunDir, albedo, metallic, rough, clearcoat, 0.045, 1.0, uSunDir) * uSunColor * sunVis;
     outLuxTotal += max(dot(N, uSunDir), 0.0) * dot(uSunColor, vec3(0.3, 0.6, 0.1)) * sunVis;
   }
 
   if (uLuminaireCount <= 0) return total;
 
-  // MatCap Engine (Engine 0): Top-4 bright emitters unshadowed + L2 SH
-  if (uRenderEngine == 0) {
+  // Phase 1: Candidate selection into compact 12-entry array (initialized for ANGLE/FXC!)
+  const int MAX_CAND = 12;
+  int candIds[12] = int[12](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  int candCount = 0;
+  float candMult = 1.0;
+  vec3 tailApprox = vec3(0.0);
+
+  if (uSchedulerMode == 2) {
+    // Direct reference evaluates 0..min(uLuminaireCount, 32) via the single loop below
+  } else if (uRenderEngine == 0) {
     int cap = min(uLuminaireCount, 4);
     for (int i = 0; i < 4; ++i) {
       if (i >= cap) break;
-      float lux;
-      total += evalUnifiedLuminaire(i, evalP, N, V, albedo, metallic, rough, clearcoat, false, false, lux);
-      outCutEvals++;
-      outLuxTotal += lux;
+      candIds[i] = i;
+      candCount++;
     }
-    return total;
-  }
-
-  // Scheduler 2: Brute-Force Reference
-  if (uSchedulerMode == 2) {
-    for (int i = 0; i < 128; ++i) {
-      if (i >= uLuminaireCount) break;
-      float lux;
-      // Only cast shadows on primary studio/headlamp lights (first 6) for smooth GPU speed
-      bool castSh = doShadows && (i < 7);
-      total += evalUnifiedLuminaire(i, evalP, N, V, albedo, metallic, rough, clearcoat, castSh, fastSdfShadow, lux);
-      outCutEvals++;
-      outLuxTotal += lux;
-    }
-    return total;
-  }
-
-  // Scheduler 3: View-Frustum Clustered Defect Demo
-  if (uSchedulerMode == 3) {
-    // Emulates camera-frustum clustering flaws: drops behind-camera/off-frustum lights from reflections + harsh cell slot cap!
-    float viewDist = dot(P - uCamPos, uCamForward);
-    int cellOverflow = 0;
-    for (int i = 0; i < 128; ++i) {
-      if (i >= uLuminaireCount) break;
+  } else if (uSchedulerMode == 3) {
+    for (int i = 0; i < 32; ++i) {
+      if (i >= uLuminaireCount || candCount >= 8) break;
       vec4 t0, t1, t2, t3;
       fetchLuminaire(i, t0, t1, t2, t3);
-      vec3 lPos = t0.xyz;
-      float lViewZ = dot(lPos - uCamPos, uCamForward);
-      vec3 toL = normalize(lPos - uCamPos);
-      bool inFrustum = lViewZ > 0.2 && abs(dot(toL, uCamRight)) < 0.78;
-      if (!inFrustum) continue; // <-- Clustered lighting drops off-frustum softboxes & rear lights from reflections!
-      // Quantized cluster cell overflow cap (4 lights max per 2.2m voxel cell)
-      if (cellOverflow >= 5 && i > 4) continue;
-      cellOverflow++;
-      float lux;
-      bool castSh = doShadows && (i < 6);
-      total += evalUnifiedLuminaire(i, evalP, N, V, albedo, metallic, rough, clearcoat, castSh, fastSdfShadow, lux);
-      outCutEvals++;
-      outLuxTotal += lux;
+      float lViewZ = dot(t0.xyz - uCamPos, uCamForward);
+      vec3 toL = normalize(t0.xyz - uCamPos);
+      if (lViewZ <= 0.2 || abs(dot(toL, uCamRight)) >= 0.78) continue;
+      candIds[candCount++] = i;
     }
-    return total;
-  }
-
-  // Scheduler 4: ReSTIR DI Temporal Lag / 1-SPP Sparkle Demo
-  if (uSchedulerMode == 4) {
-    // Evaluate 1 stochastic light candidate at CURRENT frame + blend stale history from uPrevCarPos/Yaw!
-    float r = hash12(fragCoord + vec2(float(uAccumFrame) * 17.3, uTimeSec * 60.0));
-    int pick = int(floor(r * float(uLuminaireCount)));
-    pick = clamp(pick, 0, uLuminaireCount - 1);
-    float lux;
-    vec3 currSample = evalUnifiedLuminaire(pick, evalP, N, V, albedo, metallic, rough, clearcoat, doShadows, fastSdfShadow, lux) * float(uLuminaireCount) * 0.52;
-
-    // Synthesize ghosting trail from previous vehicle position & delayed shadow rejection
+  } else if (uSchedulerMode == 4) {
+    float r = hash12(fragCoord + vec2(uTimeSec * 60.0, 17.3));
+    candIds[0] = clamp(int(floor(r * float(uLuminaireCount))), 0, uLuminaireCount - 1);
+    candCount = 1;
+    candMult = float(uLuminaireCount) * 0.52;
     vec3 ghostDelta = P - uPrevCarPos;
-    float ghostLobe = exp(-dot(ghostDelta, ghostDelta) * 0.55) * length(uCarPos - uPrevCarPos) * 14.0;
-    vec3 ghostTail = vec3(1.6, 0.14, 0.08) * ghostLobe;
-    outCutEvals = 1;
-    outLuxTotal = lux * float(uLuminaireCount) * 0.5;
-    return currSample + ghostTail;
-  }
+    total += vec3(1.6, 0.14, 0.08) * exp(-dot(ghostDelta, ghostDelta) * 0.55) * length(uCarPos - uPrevCarPos) * 14.0;
+  } else {
+    int targetBudget = (uSchedulerMode == 1 || uRenderEngine == 1) ? 6 : 10;
+    const int QMAX = 10;
+    int qCells[10] = int[10](0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    float qScores[10] = float[10](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    int qSize = 0;
 
-  // Scheduler 0 & 1: SELECTED Frontier PhotometricLightTree Best-First PriorityCut!
-  int targetBudget = (uSchedulerMode == 1 || uRenderEngine == 1) ? 6 : 10;
-
-  // Small fixed priority queue of partition cell indices + importances
-  const int QMAX = 14;
-  int qCells[QMAX];
-  float qScores[QMAX];
-  int qSize = 0;
-
-  if (uPartitionCellCount > 0) {
-    vec4 rn0, rn1, rn2, rn3;
-    fetchPartitionCell(0, rn0, rn1, rn2, rn3);
-    qCells[0] = 0;
-    qScores[0] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
-    qSize = 1;
-  }
-
-  int leafEvals = 0;
-  vec3 tailClusterApprox = vec3(0.0);
-
-  for (int iter = 0; iter < 24; ++iter) {
-    if (qSize <= 0 || leafEvals >= targetBudget) break;
-
-    // Pop max-score entry
-    int bestSlot = 0;
-    float bestScore = qScores[0];
-    for (int k = 1; k < QMAX; ++k) {
-      if (k >= qSize) break;
-      if (qScores[k] > bestScore) {
-        bestScore = qScores[k];
-        bestSlot = k;
-      }
-    }
-    int cellIdx = qCells[bestSlot];
-    qSize--;
-    qCells[bestSlot] = qCells[qSize];
-    qScores[bestSlot] = qScores[qSize];
-
-    vec4 n0, n1, n2, n3;
-    fetchPartitionCell(cellIdx, n0, n1, n2, n3);
-    int link = int(floor(n1.w + 0.5));
-
-    if (link < 0) {
-      // Leaf luminaire!
-      int lumIdx = -link - 1;
-      if (lumIdx >= 0 && lumIdx < uLuminaireCount) {
-        float lux;
-        bool castSh = doShadows && (leafEvals < 5 || lumIdx < 6);
-        total += evalUnifiedLuminaire(lumIdx, evalP, N, V, albedo, metallic, rough, clearcoat, castSh, fastSdfShadow, lux);
-        leafEvals++;
-        outLuxTotal += lux;
-      }
-    } else if (link >= 0 && link + 1 < uPartitionCellCount && qSize + 2 <= QMAX) {
-      // Expand both nested adjacent partition entries
-      int cLeft = link;
-      int cRight = link + 1;
-      vec4 ln0, ln1, ln2, ln3;
-      fetchPartitionCell(cLeft, ln0, ln1, ln2, ln3);
-      qCells[qSize] = cLeft;
-      qScores[qSize] = partitionCellImportance(evalP, N, ln0, ln1, ln2, ln3);
-      qSize++;
-
+    if (uPartitionCellCount > 0) {
       vec4 rn0, rn1, rn2, rn3;
-      fetchPartitionCell(cRight, rn0, rn1, rn2, rn3);
-      qCells[qSize] = cRight;
-      qScores[qSize] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
-      qSize++;
+      fetchPartitionCell(0, rn0, rn1, rn2, rn3);
+      qCells[0] = 0;
+      qScores[0] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
+      qSize = 1;
+    }
+
+    for (int iter = 0; iter < 18; ++iter) {
+      if (qSize <= 0 || candCount >= targetBudget) break;
+      int bestSlot = 0;
+      float bestScore = qScores[0];
+      for (int k = 1; k < QMAX; ++k) {
+        if (k >= qSize) break;
+        if (qScores[k] > bestScore) { bestScore = qScores[k]; bestSlot = k; }
+      }
+      int cellIdx = qCells[bestSlot];
+      qSize--;
+      qCells[bestSlot] = qCells[qSize];
+      qScores[bestSlot] = qScores[qSize];
+
+      vec4 n0, n1, n2, n3;
+      fetchPartitionCell(cellIdx, n0, n1, n2, n3);
+      int link = int(floor(n1.w + 0.5));
+      if (link < 0) {
+        int lumIdx = -link - 1;
+        if (lumIdx >= 0 && lumIdx < uLuminaireCount) candIds[candCount++] = lumIdx;
+      } else if (link >= 0 && link + 1 < uPartitionCellCount && qSize + 2 <= QMAX) {
+        vec4 ln0, ln1, ln2, ln3, rn0, rn1, rn2, rn3;
+        fetchPartitionCell(link, ln0, ln1, ln2, ln3);
+        qCells[qSize] = link;
+        qScores[qSize] = partitionCellImportance(evalP, N, ln0, ln1, ln2, ln3);
+        qSize++;
+        fetchPartitionCell(link + 1, rn0, rn1, rn2, rn3);
+        qCells[qSize] = link + 1;
+        qScores[qSize] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
+        qSize++;
+      }
+    }
+
+    for (int r = 0; r < QMAX; ++r) {
+      if (r >= qSize) break;
+      vec4 n0, n1, n2, n3;
+      fetchPartitionCell(qCells[r], n0, n1, n2, n3);
+      vec3 toC = 0.5 * (n0.xyz + n1.xyz) - evalP;
+      float d2 = max(dot(toC, toC), 1.5);
+      float diffFactor = max(dot(N, normalize(toC)), 0.0) * n0.w / (4.0 * PI * d2);
+      tailApprox += (albedo * (1.0 - metallic)) * diffFactor * 0.22;
     }
   }
 
-  // Smooth diffuse residual compensation for remaining lower-importance far clusters!
-  for (int r = 0; r < QMAX; ++r) {
-    if (r >= qSize) break;
-    vec4 n0, n1, n2, n3;
-    fetchPartitionCell(qCells[r], n0, n1, n2, n3);
-    vec3 cCenter = 0.5 * (n0.xyz + n1.xyz);
-    vec3 toC = cCenter - evalP;
-    float d2 = max(dot(toC, toC), 1.5);
-    vec3 Lc = normalize(toC);
-    float diffFactor = max(dot(N, Lc), 0.0) * n0.w / (4.0 * PI * d2);
-    tailClusterApprox += (albedo * (1.0 - metallic)) * diffFactor * 0.22;
-  }
+  // Phase 2: Analytical luminaire sum (zero shadow rays and zero dynamic shadow arrays!)
+  vec3 shDir0 = vec3(0.0, 1.0, 0.0); float shDist0 = 0.0; vec3 shRad0 = vec3(0.0);
+  vec3 shDir1 = vec3(0.0, 1.0, 0.0); float shDist1 = 0.0; vec3 shRad1 = vec3(0.0);
+  vec3 shDir2 = vec3(0.0, 1.0, 0.0); float shDist2 = 0.0; vec3 shRad2 = vec3(0.0);
+  int shCaptured = 0;
 
-  outCutEvals = leafEvals;
-  return total + tailClusterApprox;
-}
+  int loopCount = (uSchedulerMode == 2) ? min(uLuminaireCount, 32) : candCount;
+  for (int e = 0; e < 32; ++e) {
+    if (e >= loopCount) break;
+    int lumIdx = (uSchedulerMode == 2) ? e : candIds[e < MAX_CAND ? e : 0];
+    vec3 shDir;
+    float shDist, luxVal;
+    vec3 rad = evalUnifiedLuminaireNoShadow(lumIdx, evalP, N, V, albedo, metallic, rough, clearcoat, shDir, shDist, luxVal);
+    outLuxTotal += luxVal * candMult;
 
-// -----------------------------------------------------------------------------
-// Multi-Bounce GI / Reflections per Render Engine
-// -----------------------------------------------------------------------------
-vec3 evalEnvironmentAndIndirectGi(
-  vec3 P, vec3 N, vec3 V,
-  vec3 albedo, float metallic, float rough, float clearcoat, float ao,
-  int engineMode, out vec3 outGiOnly
-) {
-  outGiOnly = vec3(0.0);
-  if (uSdfVoxelDefectDemo == 1 && engineMode == 1) {
-    clearcoat = 0.0;
-    rough = max(rough, 0.65);
-  }
-
-  // Diffuse IBL via baked L2 Spherical Harmonics
-  vec3 diffuseIbl = evalEnvironmentHarmonics(N) * (albedo * (1.0 - metallic)) * ao;
-
-  // Specular Sky + Ground Bounce Reflection
-  vec3 R = reflect(-V, N);
-  vec3 envSpecColor = evalEnvironmentSky(R);
-  // Subtle rough blur approximation toward SH2
-  vec3 shSpec = evalEnvironmentHarmonics(R);
-  vec3 prefilteredSpec = mix(envSpecColor, shSpec, clamp(rough * 1.15, 0.0, 1.0));
-
-  float nDotV = max(dot(N, V), 1e-4);
-  vec3 f0 = mix(vec3(0.04), albedo, metallic);
-  vec3 Fspec = fresnelSchlick(nDotV, f0);
-  vec3 specIbl = prefilteredSpec * Fspec * ao;
-
-  if (clearcoat > 0.01) {
-    float Fc = fresnelSchlick(nDotV, vec3(0.04)).r * clearcoat;
-    specIbl = specIbl * (1.0 - Fc * 0.65) + envSpecColor * Fc;
-  }
-
-  // Real-Time GI (Engine 3) & Analytical SDF Radiosity (Engine 1):
-  // Chromatic indirect color bleed from automotive DRLs, ruby brake blade, sunlit floor & pylons!
-  vec3 radiosityBleed = vec3(0.0);
-  if (engineMode == 1 || engineMode == 3) {
-    float giStrength = (engineMode == 3) ? 1.0 : 0.62;
-    // Floor bounce warm-white from overhead softbox & sun
-    float floorFacing = clamp(-N.y * 0.5 + 0.5, 0.0, 1.0);
-    float underCarMask = clamp(length(P.xz - uCarPos.xz) * 0.45, 0.35, 1.0);
-    vec3 softboxFloorBounce = vec3(0.11, 0.12, 0.13) * exp(-dot(P.xz, P.xz) * 0.08) * floorFacing * underCarMask;
-    if (uEnvPreset >= 1) softboxFloorBounce += uSunColor * 0.085 * floorFacing * underCarMask;
-
-    // Chromatic Stokes-like bounce from vehicle Ruby Taillights & DRLs onto nearby floor/car/spheres
-    vec3 carF = vec3(sin(uCarYaw), 0.0, cos(uCarYaw));
-    vec3 tailPos = uCarPos - carF * 2.2;
-    vec3 nosePos = uCarPos + carF * 2.2;
-    float dTail2 = dot(P - tailPos, P - tailPos) + 0.45;
-    float dNose2 = dot(P - nosePos, P - nosePos) + 0.45;
-    vec3 rubyBounce = vec3(0.85, 0.04, 0.02) * (1.0 + uBrakeActive * 2.2) / (dTail2 * 1.9);
-    vec3 drlBounce = vec3(0.35, 0.42, 0.55) * max(uDrlActive, uHeadlampIntensity) / (dNose2 * 2.2);
-
-    // Chromatic bounce from adjacent emissive pylons
-    vec3 pylonGi = vec3(0.0);
-    int samplePylons = min(uEmissivePylonCount, 12);
-    for (int i = 0; i < 12; ++i) {
-      if (i >= samplePylons) break;
-      float fi = float(i * max(uEmissivePylonCount / max(samplePylons, 1), 1));
-      float ringIdx = floor(fi / 16.0);
-      float ang = (fi / float(max(uEmissivePylonCount, 1))) * TWO_PI * (1.0 + ringIdx * 0.5) + 0.35;
-      float rad = 4.2 + ringIdx * 1.45;
-      vec3 pp = vec3(cos(ang) * rad, 0.32, sin(ang) * rad + 0.6);
-      float dp2 = dot(P - pp, P - pp) + 0.6;
-      float hue = fract(fi * 0.27);
-      vec3 neon = clamp(abs(fract(hue + vec3(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
-      pylonGi += neon * 0.48 / (dp2 * 1.4);
+    if (doShadows && shCaptured < 3 && shDist > 0.12 && max(rad.r, max(rad.g, rad.b)) > 0.008) {
+      if (shCaptured == 0) { shDir0 = shDir; shDist0 = shDist; shRad0 = rad * candMult; }
+      else if (shCaptured == 1) { shDir1 = shDir; shDist1 = shDist; shRad1 = rad * candMult; }
+      else { shDir2 = shDir; shDist2 = shDist; shRad2 = rad * candMult; }
+      shCaptured++;
+    } else {
+      total += rad * candMult;
     }
-
-    radiosityBleed = (softboxFloorBounce + rubyBounce + drlBounce + pylonGi) * (albedo * (1.0 - metallic)) * giStrength * ao;
   }
 
-  outGiOnly = diffuseIbl + radiosityBleed;
-  if (uDebugLens == 5) return specIbl;
-  return diffuseIbl + specIbl + radiosityBleed;
-}
-
-// -----------------------------------------------------------------------------
-// Engine 0: Sculpting MatCap Sphere Shading (+ Optional Light-Aware Blend)
-// -----------------------------------------------------------------------------
-vec3 evalMatCapSurface(vec3 N, vec3 P, vec3 V, float matId, vec3 albedo, vec3 emissive) {
-  vec2 nv = vec2(dot(N, uCamRight), dot(N, uCamUp));
-  float len2 = dot(nv, nv);
-  float nz = sqrt(max(0.0, 1.0 - min(len2, 1.0)));
-  // Rich sculpted automotive clay/ceramic MatCap enclosure curve
-  float keyCurve = clamp(dot(normalize(vec3(nv, nz)), normalize(vec3(-0.35, 0.72, 0.6))), 1e-4, 1.0);
-  float rimCurve = pow(max(1.0 - nz, 1e-4), 2.6);
-  vec3 baseClay = (matId > 9.5 && matId < 10.5) ? vec3(0.22, 0.34, 0.56) : albedo * 0.68 + vec3(0.14);
-  vec3 matcap = baseClay * (0.32 + 0.68 * pow(keyCurve, 1.35)) + vec3(0.28, 0.32, 0.38) * rimCurve + vec3(pow(keyCurve, 26.0) * 0.45);
-
-  if (uMatCapLightBlend == 1) {
-    int dummyCuts;
-    float dummyLux;
-    vec3 directFill = shadePointDirect(P, N, V, albedo * 0.5, 0.15, 0.42, 0.35, false, false, gl_FragCoord.xy, dummyCuts, dummyLux);
-    vec3 shEnv = evalEnvironmentHarmonics(N) * 0.35;
-    matcap = matcap * 0.68 + shEnv + directFill * 0.55;
+  // Phase 3: Explicit scalar shadow evaluation (zero dynamic indexing in shadow loop!)
+  if (shCaptured > 0) {
+    float v0 = fastSdfShadow
+      ? traceGdfConeShadow(P + N * 0.02, shDir0, min(shDist0 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.02, shDir0, min(shDist0 - 0.14, 15.0), 0.04);
+    total += shRad0 * v0;
   }
-  return matcap + emissive * 0.5;
-}
+  if (shCaptured > 1) {
+    float v1 = fastSdfShadow
+      ? traceGdfConeShadow(P + N * 0.02, shDir1, min(shDist1 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.02, shDir1, min(shDist1 - 0.14, 15.0), 0.04);
+    total += shRad1 * v1;
+  }
+  if (shCaptured > 2) {
+    float v2 = fastSdfShadow
+      ? traceGdfConeShadow(P + N * 0.02, shDir2, min(shDist2 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.02, shDir2, min(shDist2 - 0.14, 15.0), 0.04);
+    total += shRad2 * v2;
+  }
 
-// -----------------------------------------------------------------------------
-// Heatmap & False-Colour Photometric Diagnostic Palettes
-// -----------------------------------------------------------------------------
-vec3 infernoPalette(float t) {
-  t = clamp(t, 0.0, 1.0);
-  vec3 c0 = vec3(0.04, 0.05, 0.16);
-  vec3 c1 = vec3(0.32, 0.09, 0.48);
-  vec3 c2 = vec3(0.85, 0.25, 0.22);
-  vec3 c3 = vec3(0.98, 0.88, 0.25);
-  if (t < 0.33) return mix(c0, c1, t / 0.33);
-  if (t < 0.66) return mix(c1, c2, (t - 0.33) / 0.33);
-  return mix(c2, c3, (t - 0.66) / 0.34);
+  outCutEvals = loopCount;
+  return total + tailApprox;
 }
 
 void main() {
   vec2 ndc = vUv * 2.0 - 1.0;
   float aspect = uResolution.x / max(uResolution.y, 1.0);
-
-  // Subtle deterministic sub-pixel jitter in Progressive Path Tracer mode
-  vec2 jitter = vec2(0.0);
-  if (uRenderEngine == 4) {
-    vec2 shift = vec2(hash12(gl_FragCoord.xy), hash12(gl_FragCoord.xy + 19.7));
-    jitter = (r2Sequence(uAccumFrame, shift) - 0.5) / uResolution * 1.4;
-  }
-
-  vec3 rd = normalize(
-    uCamForward +
-    uCamRight * ((ndc.x + jitter.x * 2.0) * aspect * uTanHalfFov) +
-    uCamUp * ((ndc.y + jitter.y * 2.0) * uTanHalfFov)
-  );
+  vec3 rd = normalize(uCamForward + uCamRight * (ndc.x * aspect * uTanHalfFov) + uCamUp * (ndc.y * uTanHalfFov));
   vec3 ro = uCamPos;
 
-  // Primary Ray March
   float t = 0.05;
   float hitMat = -1.0;
   vec3 hitLocalCar = vec3(0.0);
-  for (int i = 0; i < 110; ++i) {
-    vec3 p = ro + rd * t;
-    vec2 d = mapScene(p, hitLocalCar);
-    if (d.x < 0.0018) {
-      hitMat = d.y;
-      break;
-    }
-    t += clamp(d.x, 0.01, 1.4);
-    if (t > 45.0) break;
+  for (int i = 0; i < 96; ++i) {
+    vec2 d = mapScene(ro + rd * t, hitLocalCar);
+    if (d.x < 0.002) { hitMat = d.y; break; }
+    t += clamp(d.x, 0.012, 1.4);
+    if (t > 42.0) break;
   }
 
   vec3 finalRgb = vec3(0.0);
-
   if (hitMat < 0.0) {
     finalRgb = evalEnvironmentSky(rd);
     if (uDebugLens == 1 || uDebugLens == 2 || uDebugLens == 4) finalRgb *= 0.25;
@@ -1244,125 +886,235 @@ void main() {
     vec3 P = ro + rd * t;
     vec3 N = calcNormal(P);
     vec3 V = -rd;
-
     vec3 albedo, emissive;
     float metallic, rough, clearcoat;
     evalMaterial(hitMat, P, hitLocalCar, N, albedo, metallic, rough, clearcoat, emissive);
 
-    if (uRenderEngine == 0) {
-      finalRgb = evalMatCapSurface(N, P, V, hitMat, albedo, emissive);
-    } else if (uRenderEngine == 4) {
-      // Progressive Deterministic Path Tracer (Sobol / R2 (0,2)) + 1 Bounce Reflections/GI
-      int cutEvals;
-      float luxTotal;
-      vec3 direct = shadePointDirect(P, N, V, albedo, metallic, rough, clearcoat, true, false, gl_FragCoord.xy, cutEvals, luxTotal);
-      vec3 rad = direct + emissive;
+    bool isMatCap = (uRenderEngine == 0);
+    bool fastSdf = (uRenderEngine == 1);
+    bool doSh = !isMatCap;
 
-      // Stochastic secondary ray (specular clearcoat/metal or cosine diffuse bounce)
-      vec2 shift = vec2(hash12(gl_FragCoord.xy * 1.37), hash12(gl_FragCoord.xy + 41.3));
-      vec2 xi = r2Sequence(uAccumFrame * 3 + 7, shift);
+    int cutEvals;
+    float luxTotal;
+    vec3 direct = (isMatCap && uMatCapLightBlend == 0)
+      ? vec3(0.0)
+      : shadePointRealTime(P, N, V, albedo, metallic, rough, clearcoat, doSh, fastSdf, gl_FragCoord.xy, cutEvals, luxTotal);
 
-      vec3 ortho1 = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
-      vec3 ortho2 = cross(N, ortho1);
+    if (isMatCap) {
+      vec2 nv = vec2(dot(N, uCamRight), dot(N, uCamUp));
+      float nz = sqrt(max(0.0, 1.0 - min(dot(nv, nv), 1.0)));
+      float keyCurve = clamp(dot(normalize(vec3(nv, nz)), normalize(vec3(-0.35, 0.72, 0.6))), 1e-4, 1.0);
+      vec3 baseClay = (hitMat > 9.5 && hitMat < 10.5) ? vec3(0.22, 0.34, 0.56) : albedo * 0.68 + vec3(0.14);
+      vec3 matcap = baseClay * (0.32 + 0.68 * pow(keyCurve, 1.35))
+        + vec3(0.28, 0.32, 0.38) * pow(max(1.0 - nz, 1e-4), 2.6)
+        + vec3(pow(keyCurve, 26.0) * 0.45);
+      finalRgb = (uMatCapLightBlend == 1)
+        ? matcap * 0.68 + evalEnvironmentHarmonics(N) * 0.35 + direct * 0.55 + emissive * 0.5
+        : matcap + emissive * 0.5;
+    } else {
+      float ao = (uRenderEngine == 1 || uRenderEngine == 3) ? calcSdfAmbientOcclusion(P, N) : 1.0;
+      float effClearcoat = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? 0.0 : clearcoat;
+      float effRough = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? max(rough, 0.65) : rough;
 
-      float specProb = clamp(mix(0.25, 0.92, max(metallic, clearcoat)), 0.15, 0.92);
-      vec3 bounceDir;
-      vec3 bounceWeight;
-      if (xi.x < specProb) {
-        vec3 R = reflect(-V, N);
-        float effR = clearcoat > 0.5 && xi.y < 0.5 ? 0.045 : rough;
-        float phi = xi.y * TWO_PI;
-        float rCone = effR * effR * sqrt(xi.x / specProb);
-        bounceDir = normalize(R + (ortho1 * cos(phi) + ortho2 * sin(phi)) * rCone);
-        float nDotV = max(dot(N, V), 1e-4);
-        vec3 F = fresnelSchlick(nDotV, mix(vec3(0.04), albedo, max(metallic, clearcoat * 0.25)));
-        bounceWeight = F / specProb;
-      } else {
-        float phi = xi.y * TWO_PI;
-        float u = (xi.x - specProb) / max(1.0 - specProb, 1e-4);
-        float cosT = sqrt(1.0 - u);
-        float sinT = sqrt(u);
-        bounceDir = normalize(ortho1 * cos(phi) * sinT + ortho2 * sin(phi) * sinT + N * cosT);
-        bounceWeight = (albedo * (1.0 - metallic)) / (1.0 - specProb);
+      vec3 diffuseIbl = evalEnvironmentHarmonics(N) * (albedo * (1.0 - metallic)) * ao;
+      vec3 R = reflect(-V, N);
+      vec3 envSpec = mix(evalEnvironmentSky(R), evalEnvironmentHarmonics(R), clamp(effRough * 1.15, 0.0, 1.0));
+      float nDotV = max(dot(N, V), 1e-4);
+      vec3 specIbl = envSpec * fresnelSchlick(nDotV, mix(vec3(0.04), albedo, metallic)) * ao;
+      if (effClearcoat > 0.01) {
+        float Fc = fresnelSchlick(nDotV, vec3(0.04)).r * effClearcoat;
+        specIbl = specIbl * (1.0 - Fc * 0.65) + evalEnvironmentSky(R) * Fc;
       }
 
-      // Trace 1 secondary ray cleanly
-      float t2 = 0.04;
-      float m2 = -1.0;
-      vec3 lc2 = vec3(0.0);
-      vec3 ro2 = P + N * 0.015;
-      for (int s = 0; s < 56; ++s) {
-        vec2 d2 = mapScene(ro2 + bounceDir * t2, lc2);
-        if (d2.x < 0.004) {
-          m2 = d2.y;
-          break;
-        }
-        t2 += clamp(d2.x, 0.02, 1.2);
-        if (t2 > 22.0) break;
+      vec3 radBleed = vec3(0.0);
+      if (uRenderEngine == 1 || uRenderEngine == 3) {
+        float giStr = (uRenderEngine == 3) ? 1.0 : 0.62;
+        float floorFacing = clamp(-N.y * 0.5 + 0.5, 0.0, 1.0);
+        float underMask = clamp(length(P.xz - uCarPos.xz) * 0.45, 0.35, 1.0);
+        vec3 warmBounce = vec3(0.11, 0.12, 0.13) * exp(-dot(P.xz, P.xz) * 0.08) * floorFacing * underMask;
+        if (uEnvPreset >= 1) warmBounce += uSunColor * 0.085 * floorFacing * underMask;
+        vec3 carF = vec3(sin(uCarYaw), 0.0, cos(uCarYaw));
+        vec3 tailPos = uCarPos - carF * 2.2;
+        vec3 nosePos = uCarPos + carF * 2.2;
+        vec3 rubyB = vec3(0.85, 0.04, 0.02) * (1.0 + uBrakeActive * 2.2) / (dot(P - tailPos, P - tailPos) + 0.45) * 0.52;
+        vec3 drlB = vec3(0.35, 0.42, 0.55) * max(uDrlActive, uHeadlampIntensity) / (dot(P - nosePos, P - nosePos) + 0.45) * 0.45;
+        radBleed = (warmBounce + rubyB + drlB) * (albedo * (1.0 - metallic)) * giStr * ao;
       }
 
-      if (m2 < 0.0) {
-        rad += bounceWeight * evalEnvironmentSky(bounceDir);
-      } else {
-        vec3 P2 = ro2 + bounceDir * t2;
-        vec3 N2 = calcNormal(P2);
-        vec3 a2, e2;
-        float mt2, r2m, cc2;
-        evalMaterial(m2, P2, lc2, N2, a2, mt2, r2m, cc2, e2);
-        int c2;
-        float lx2;
-        vec3 d2Light = shadePointDirect(P2, N2, -bounceDir, a2, mt2, r2m, cc2, true, true, gl_FragCoord.xy + 5.0, c2, lx2);
-        rad += bounceWeight * (d2Light + e2 + evalEnvironmentHarmonics(N2) * a2 * 0.35);
-      }
-      finalRgb = rad;
+      vec3 giOnly = diffuseIbl + radBleed;
+      vec3 envGi = (uDebugLens == 5) ? specIbl : (giOnly + specIbl);
 
       if (uDebugLens == 1) finalRgb = infernoPalette(float(cutEvals) / 10.0);
       else if (uDebugLens == 2) finalRgb = infernoPalette(log2(1.0 + luxTotal * 1.4) / 5.5);
-    } else {
-      // Engines 1 (SDF), 2 (OpenPBR Direct), 3 (RealTime GI)
-      bool fastSdf = (uRenderEngine == 1);
-      int cutEvals;
-      float luxTotal;
-      vec3 direct = shadePointDirect(P, N, V, albedo, metallic, rough, clearcoat, true, fastSdf, gl_FragCoord.xy, cutEvals, luxTotal);
-      float ao = (uRenderEngine == 1 || uRenderEngine == 3) ? calcSdfAmbientOcclusion(P, N) : 1.0;
-      vec3 giOut;
-      vec3 envGi = evalEnvironmentAndIndirectGi(P, N, V, albedo, metallic, rough, clearcoat, ao, uRenderEngine, giOut);
-
-      // Specular floor / clearcoat reflection of bright Softbox & Pyres
-      if (uDebugLens == 1) {
-        finalRgb = infernoPalette(float(cutEvals) / 10.0);
-      } else if (uDebugLens == 2) {
-        finalRgb = infernoPalette(log2(1.0 + luxTotal * 1.4) / 5.5);
-      } else if (uDebugLens == 3) {
-        // Shadows & AO Only
-        float sunSh = traceGdfConeShadow(P + N * 0.02, normalize(vec3(0.45, 0.85, 0.3)), 14.0, fastSdf ? 8.0 : 28.0);
-        finalRgb = vec3(sunSh * ao);
-      } else if (uDebugLens == 4) {
-        finalRgb = giOut * 2.2;
-      } else if (uDebugLens == 5) {
-        finalRgb = direct + envGi + emissive * 0.1;
-      } else {
-        finalRgb = direct + envGi + emissive;
-      }
+      else if (uDebugLens == 3) finalRgb = vec3(traceGdfConeShadow(P + N * 0.02, normalize(vec3(0.45, 0.85, 0.3)), 14.0, fastSdf ? 8.0 : 26.0) * ao);
+      else if (uDebugLens == 4) finalRgb = giOnly * 2.2;
+      else if (uDebugLens == 5) finalRgb = direct + envGi + emissive * 0.1;
+      else finalRgb = direct + envGi + emissive;
     }
   }
 
-  // Accumulate when in Path Tracer (Engine 4), overwrite when in Real-Time modes
-  if (uRenderEngine == 4 && uAccumFrame > 0) {
-    vec4 prev = texelFetch(uPrevAccumTex, ivec2(gl_FragCoord.xy), 0);
-    fragColor = prev + vec4(min(finalRgb, vec3(32.0)), 1.0);
+  fragColor = vec4(max(finalRgb, vec3(0.0)), 1.0);
+}
+`;
+
+// Program 2: Dedicated lean Progressive Deterministic (0,2) Path Tracer (Engine 4)
+const PATHTRACER_FRAGMENT_SRC =
+  SHARED_GLSL_COMMON +
+  `
+vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, float rough, float clearcoat, vec2 xi, out int outEvals) {
+  outEvals = 0;
+  vec3 total = vec3(0.0);
+
+  if (uEnvPreset >= 1 && dot(N, uSunDir) > 0.0) {
+    float vis = traceExactShadow(P + N * 0.02, uSunDir, 18.0, 0.04);
+    total += evalOpenPbrBrdf(N, V, uSunDir, albedo, metallic, rough, clearcoat, 0.045, 1.0, uSunDir) * uSunColor * vis;
+  }
+
+  if (uLuminaireCount <= 0) return total;
+
+  // Stochastic descent through binary Photometric Partition (1/Pdf importance draw x 3 cuts)
+  for (int c = 0; c < 3; ++c) {
+    int cellIdx = 0;
+    float pdf = 1.0;
+    float u = fract(xi.x + float(c) * 0.33333);
+    int pickedLum = -1;
+
+    for (int lvl = 0; lvl < 10; ++lvl) {
+      vec4 n0, n1, n2, n3;
+      fetchPartitionCell(cellIdx, n0, n1, n2, n3);
+      int link = int(floor(n1.w + 0.5));
+      if (link < 0) {
+        pickedLum = -link - 1;
+        break;
+      }
+      if (link + 1 >= uPartitionCellCount) break;
+      vec4 ln0, ln1, ln2, ln3, rn0, rn1, rn2, rn3;
+      fetchPartitionCell(link, ln0, ln1, ln2, ln3);
+      fetchPartitionCell(link + 1, rn0, rn1, rn2, rn3);
+      float wL = max(partitionCellImportance(P, N, ln0, ln1, ln2, ln3), 1e-6);
+      float wR = max(partitionCellImportance(P, N, rn0, rn1, rn2, rn3), 1e-6);
+      float pL = wL / (wL + wR);
+      if (u < pL) {
+        cellIdx = link;
+        pdf *= pL;
+        u = u / max(pL, 1e-4);
+      } else {
+        cellIdx = link + 1;
+        pdf *= (1.0 - pL);
+        u = (u - pL) / max(1.0 - pL, 1e-4);
+      }
+    }
+
+    if (pickedLum >= 0 && pickedLum < uLuminaireCount && pdf > 1e-4) {
+      vec3 shDir;
+      float shDist, luxVal;
+      vec3 rad = evalUnifiedLuminaireNoShadow(pickedLum, P, N, V, albedo, metallic, rough, clearcoat, shDir, shDist, luxVal);
+      float vis = (shDist > 0.08 && max(rad.r, max(rad.g, rad.b)) > 0.002)
+        ? traceExactShadow(P + N * 0.02, shDir, min(shDist - 0.14, 15.0), 0.04)
+        : 1.0;
+      total += (rad * vis) / (pdf * 3.0);
+      outEvals++;
+    }
+  }
+  return total;
+}
+
+void main() {
+  vec2 ndc = vUv * 2.0 - 1.0;
+  float aspect = uResolution.x / max(uResolution.y, 1.0);
+  vec2 shift = vec2(hash12(gl_FragCoord.xy), hash12(gl_FragCoord.xy + 19.7));
+  vec2 jitter = (r2Sequence(uAccumFrame, shift) - 0.5) / uResolution * 1.4;
+  vec3 rd = normalize(uCamForward + uCamRight * ((ndc.x + jitter.x * 2.0) * aspect * uTanHalfFov) + uCamUp * ((ndc.y + jitter.y * 2.0) * uTanHalfFov));
+  vec3 ro = uCamPos;
+
+  float t = 0.05;
+  float hitMat = -1.0;
+  vec3 hitLocalCar = vec3(0.0);
+  for (int i = 0; i < 96; ++i) {
+    vec2 d = mapScene(ro + rd * t, hitLocalCar);
+    if (d.x < 0.002) { hitMat = d.y; break; }
+    t += clamp(d.x, 0.012, 1.4);
+    if (t > 42.0) break;
+  }
+
+  vec3 finalRgb = vec3(0.0);
+  if (hitMat < 0.0) {
+    finalRgb = evalEnvironmentSky(rd);
   } else {
-    fragColor = vec4(finalRgb, 1.0);
+    vec3 P = ro + rd * t;
+    vec3 N = calcNormal(P);
+    vec3 V = -rd;
+    vec3 albedo, emissive;
+    float metallic, rough, clearcoat;
+    evalMaterial(hitMat, P, hitLocalCar, N, albedo, metallic, rough, clearcoat, emissive);
+
+    vec2 xi = r2Sequence(uAccumFrame * 3 + 7, shift);
+    int evals;
+    vec3 rad = traceStochasticNee(P, N, V, albedo, metallic, rough, clearcoat, xi, evals) + emissive;
+
+    vec3 ortho1 = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
+    vec3 ortho2 = cross(N, ortho1);
+    float specProb = clamp(mix(0.25, 0.92, max(metallic, clearcoat)), 0.15, 0.92);
+    vec2 bXi = r2Sequence(uAccumFrame * 5 + 11, shift);
+    vec3 bounceDir, bounceW;
+    if (bXi.x < specProb) {
+      vec3 R = reflect(-V, N);
+      float effR = clearcoat > 0.5 && bXi.y < 0.5 ? 0.045 : rough;
+      float phi = bXi.y * TWO_PI;
+      bounceDir = normalize(R + (ortho1 * cos(phi) + ortho2 * sin(phi)) * (effR * effR * sqrt(bXi.x / specProb)));
+      bounceW = fresnelSchlick(max(dot(N, V), 1e-4), mix(vec3(0.04), albedo, max(metallic, clearcoat * 0.25))) / specProb;
+    } else {
+      float phi = bXi.y * TWO_PI;
+      float u = (bXi.x - specProb) / max(1.0 - specProb, 1e-4);
+      bounceDir = normalize(ortho1 * cos(phi) * sqrt(u) + ortho2 * sin(phi) * sqrt(u) + N * sqrt(1.0 - u));
+      bounceW = (albedo * (1.0 - metallic)) / (1.0 - specProb);
+    }
+
+    float t2 = 0.04;
+    float m2 = -1.0;
+    vec3 lc2 = vec3(0.0);
+    vec3 ro2 = P + N * 0.02;
+    for (int s = 0; s < 42; ++s) {
+      vec2 d2 = mapScene(ro2 + bounceDir * t2, lc2);
+      if (d2.x < 0.005) { m2 = d2.y; break; }
+      t2 += clamp(d2.x, 0.025, 1.2);
+      if (t2 > 20.0) break;
+    }
+    if (m2 < 0.0) {
+      rad += bounceW * evalEnvironmentSky(bounceDir);
+    } else {
+      vec3 P2 = ro2 + bounceDir * t2;
+      vec3 N2 = calcNormal(P2);
+      vec3 a2, e2;
+      float mt2, r2m, cc2;
+      evalMaterial(m2, P2, lc2, N2, a2, mt2, r2m, cc2, e2);
+      rad += bounceW * (e2 + evalEnvironmentHarmonics(N2) * (a2 * (1.0 - mt2)));
+      if (uEnvPreset >= 1 && dot(N2, uSunDir) > 0.0) {
+        float v2 = traceGdfConeShadow(P2 + N2 * 0.02, uSunDir, 12.0, 10.0);
+        rad += bounceW * evalOpenPbrBrdf(N2, -bounceDir, uSunDir, a2, mt2, r2m, cc2, 0.045, 1.0, uSunDir) * uSunColor * v2;
+      }
+    }
+    finalRgb = rad;
+    if (uDebugLens == 1) finalRgb = infernoPalette(float(evals) / 4.0);
+  }
+
+  vec3 clampedRgb = clamp(finalRgb, vec3(0.0), vec3(32.0));
+  if (uAccumFrame > 0) {
+    vec4 prev = texelFetch(uPrevAccumTex, ivec2(gl_FragCoord.xy), 0);
+    fragColor = prev + vec4(clampedRgb, 1.0);
+  } else {
+    fragColor = vec4(clampedRgb, 1.0);
   }
 }
 `;
 
 function compileShader(gl, type, source) {
   const shader = gl.createShader(type);
+  if (!shader) throw new Error("createShader failed (WebGL context lost)");
   gl.shaderSource(shader, source);
   gl.compileShader(shader);
   if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(shader);
+    const info = gl.getShaderInfoLog(shader) || "(empty shader log)";
     gl.deleteShader(shader);
     throw new Error(`GLSL compile failed: ${info}`);
   }
@@ -1379,14 +1131,31 @@ function linkProgram(gl, vsSource, fsSource) {
   gl.deleteShader(vs);
   gl.deleteShader(fs);
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    throw new Error(`Program link failed: ${gl.getProgramInfoLog(prog)}`);
+    const log = gl.getProgramInfoLog(prog) || (gl.isContextLost() ? "WebGL context lost during link" : "(empty link log)");
+    throw new Error(`Program link failed: ${log}`);
   }
   return prog;
 }
 
+const MAIN_UNIFORM_NAMES = [
+  "uResolution", "uCamPos", "uCamRight", "uCamUp", "uCamForward", "uTanHalfFov",
+  "uLightRegisterTex", "uIesAtlasTex", "uPrevAccumTex",
+  "uLuminaireCount", "uPartitionCellCount", "uRenderEngine", "uSchedulerMode",
+  "uDebugLens", "uEnvPreset", "uMatCapLightBlend", "uSdfVoxelDefectDemo",
+  "uAccumFrame", "uTimeSec", "uExposure",
+  "uCarPos", "uCarYaw", "uPrevCarPos", "uPrevCarYaw",
+  "uHeadlampIntensity", "uHighBeamActive", "uDrlActive", "uBrakeActive",
+  "uTurnSignalActive", "uEmissivePylonCount",
+  "uSunDir", "uSunColor", "uEnvSh[0]",
+];
+
 export class LightingGpuViewport {
   constructor(canvas) {
     this.canvas = canvas;
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      this.contextLost = true;
+    });
     const gl = canvas.getContext("webgl2", {
       antialias: false,
       alpha: false,
@@ -1396,14 +1165,15 @@ export class LightingGpuViewport {
       throw new Error("WebGL2 is required for LightingArchitectureLab.");
     }
     this.gl = gl;
+    this.contextLost = false;
     this.floatFboExt = gl.getExtension("EXT_color_buffer_float");
     this.halfFloatFboExt = gl.getExtension("EXT_color_buffer_half_float");
 
-    this.mainProg = linkProgram(gl, VERTEX_SHADER_SRC, MAIN_FRAGMENT_SRC);
+    this.rtProg = linkProgram(gl, VERTEX_SHADER_SRC, REALTIME_FRAGMENT_SRC);
+    this.ptProg = null; // Compiled on first click of PathTracer tab so initial boot is instant!
     this.blitProg = linkProgram(gl, VERTEX_SHADER_SRC, BLIT_FRAGMENT_SRC);
     this.emptyVao = gl.createVertexArray();
 
-    // Light Register Texture (256 x 16 RGBA32F, NEAREST)
     this.lightRegisterTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.lightRegisterTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 16, 0, gl.RGBA, gl.FLOAT, null);
@@ -1412,20 +1182,9 @@ export class LightingGpuViewport {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    // 128 x 256 R32F IES Candela Atlas Texture
     this.iesAtlasTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.iesAtlasTex);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.R32F,
-      IES_THETA_SAMPLES,
-      IES_PHI_SAMPLES * IES_PROFILE_COUNT,
-      0,
-      gl.RED,
-      gl.FLOAT,
-      null
-    );
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, IES_THETA_SAMPLES, IES_PHI_SAMPLES * IES_PROFILE_COUNT, 0, gl.RED, gl.FLOAT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -1438,42 +1197,8 @@ export class LightingGpuViewport {
     this.accumIndex = 0;
     this.accumFrame = 0;
 
-    this.mainUniforms = this._collectUniforms(this.mainProg, [
-      "uResolution",
-      "uCamPos",
-      "uCamRight",
-      "uCamUp",
-      "uCamForward",
-      "uTanHalfFov",
-      "uLightRegisterTex",
-      "uIesAtlasTex",
-      "uPrevAccumTex",
-      "uLuminaireCount",
-      "uPartitionCellCount",
-      "uRenderEngine",
-      "uSchedulerMode",
-      "uDebugLens",
-      "uEnvPreset",
-      "uMatCapLightBlend",
-      "uSdfVoxelDefectDemo",
-      "uAccumFrame",
-      "uTimeSec",
-      "uExposure",
-      "uCarPos",
-      "uCarYaw",
-      "uPrevCarPos",
-      "uPrevCarYaw",
-      "uHeadlampIntensity",
-      "uHighBeamActive",
-      "uDrlActive",
-      "uBrakeActive",
-      "uTurnSignalActive",
-      "uEmissivePylonCount",
-      "uSunDir",
-      "uSunColor",
-      "uEnvSh[0]",
-    ]);
-
+    this.rtUniforms = this._collectUniforms(this.rtProg, MAIN_UNIFORM_NAMES);
+    this.ptUniforms = null;
     this.blitUniforms = {
       uAccumTex: gl.getUniformLocation(this.blitProg, "uAccumTex"),
       uExposure: gl.getUniformLocation(this.blitProg, "uExposure"),
@@ -1491,17 +1216,7 @@ export class LightingGpuViewport {
   uploadIesAtlas(floatArray) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.iesAtlasTex);
-    gl.texSubImage2D(
-      gl.TEXTURE_2D,
-      0,
-      0,
-      0,
-      IES_THETA_SAMPLES,
-      IES_PHI_SAMPLES * IES_PROFILE_COUNT,
-      gl.RED,
-      gl.FLOAT,
-      floatArray
-    );
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, IES_THETA_SAMPLES, IES_PHI_SAMPLES * IES_PROFILE_COUNT, gl.RED, gl.FLOAT, floatArray);
   }
 
   uploadLightRegister(texData) {
@@ -1551,6 +1266,8 @@ export class LightingGpuViewport {
 
   renderViewport(params) {
     const gl = this.gl;
+    if (this.contextLost || gl.isContextLost()) return;
+
     const renderScale = params.renderScale || 1.0;
     const w = Math.max(240, Math.floor(this.canvas.clientWidth * renderScale));
     const h = Math.max(160, Math.floor(this.canvas.clientHeight * renderScale));
@@ -1560,30 +1277,36 @@ export class LightingGpuViewport {
       this.canvas.height = h;
     }
 
-    this._ensureAccumTargets(w, h);
+    const isPt = params.renderEngine === 4;
+    if (isPt && !this.ptProg) {
+      this.ptProg = linkProgram(gl, VERTEX_SHADER_SRC, PATHTRACER_FRAGMENT_SRC);
+      this.ptUniforms = this._collectUniforms(this.ptProg, MAIN_UNIFORM_NAMES);
+    }
 
+    this._ensureAccumTargets(w, h);
     const readIdx = this.accumIndex;
     const writeIdx = 1 - this.accumIndex;
 
+    const prog = isPt ? this.ptProg : this.rtProg;
+    const u = isPt ? this.ptUniforms : this.rtUniforms;
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbos[writeIdx]);
     gl.viewport(0, 0, w, h);
-
-    gl.useProgram(this.mainProg);
+    gl.useProgram(prog);
     gl.bindVertexArray(this.emptyVao);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.lightRegisterTex);
-    gl.uniform1i(this.mainUniforms.uLightRegisterTex, 0);
+    gl.uniform1i(u.uLightRegisterTex, 0);
 
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.iesAtlasTex);
-    gl.uniform1i(this.mainUniforms.uIesAtlasTex, 1);
+    gl.uniform1i(u.uIesAtlasTex, 1);
 
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.accumTextures[readIdx]);
-    gl.uniform1i(this.mainUniforms.uPrevAccumTex, 2);
+    gl.uniform1i(u.uPrevAccumTex, 2);
 
-    const u = this.mainUniforms;
     gl.uniform2f(u.uResolution, w, h);
     gl.uniform3fv(u.uCamPos, params.camPos);
     gl.uniform3fv(u.uCamRight, params.camRight);
@@ -1620,7 +1343,6 @@ export class LightingGpuViewport {
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    // Tone-mapped blit to default canvas
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.blitProg);
@@ -1631,10 +1353,6 @@ export class LightingGpuViewport {
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     this.accumIndex = writeIdx;
-    if (params.renderEngine === 4) {
-      this.accumFrame = Math.min(this.accumFrame + 1, 256);
-    } else {
-      this.accumFrame = 0;
-    }
+    this.accumFrame = isPt ? Math.min(this.accumFrame + 1, 256) : 0;
   }
 }

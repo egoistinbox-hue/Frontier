@@ -217,13 +217,15 @@ function buildActiveLuminaires(labConfiguration) {
     rgbIntensity: [brakeEnabled ? 6.8 : 2.1, 0.08, 0.05],
   });
 
-  // 7. Many Emissive / Point Pylons (Stress Test 0..48 matching shader geometry!)
+  // 7. Many Emissive / Point Pylons (3 rings x 16 slots = 48 max, exact match to O(1) shader ring SDF!)
   const pylonTotal = Math.min(48, emissivePylonCount);
   for (let i = 0; i < pylonTotal; ++i) {
-    const ringIdx = Math.floor(i / 16);
-    const ang = (i / Math.max(pylonTotal, 1)) * Math.PI * 2.0 * (1.0 + ringIdx * 0.5) + 0.35;
-    const rad = 4.2 + ringIdx * 1.45;
-    const pos = [Math.cos(ang) * rad, 0.42 + 0.14 * Math.sin(i * 1.7), Math.sin(ang) * rad + 0.6];
+    const ring = Math.floor(i / 16);
+    const sector = i % 16;
+    const rad = 4.25 + ring * 1.2;
+    const phase = ring * 0.19635;
+    const ang = sector * ((Math.PI * 2.0) / 16.0) + phase;
+    const pos = [Math.cos(ang) * rad, 0.40 + 0.10 * Math.sin(i * 1.7), Math.sin(ang) * rad + 0.5];
 
     const hue = (i * 0.27) % 1.0;
     const r = Math.max(0.1, Math.min(1.0, Math.abs(hue * 6 - 3) - 1));
@@ -248,7 +250,14 @@ function initLabApp() {
   const hudTelemetry = document.getElementById("hudTelemetry");
   const hudDiagnosis = document.getElementById("hudDiagnosis");
 
-  const viewport = new LightingGpuViewport(glCanvas);
+  let viewport;
+  try {
+    viewport = new LightingGpuViewport(glCanvas);
+  } catch (err) {
+    hudDiagnosis.className = "hud-note alert";
+    hudDiagnosis.textContent = `WebGL2 initialization error: ${err.message}`;
+    return;
+  }
   const iesAtlas = buildPackedIesTextureAtlas();
   viewport.uploadIesAtlas(iesAtlas);
 
@@ -496,7 +505,7 @@ function initLabApp() {
     const camUp = norm3(cross3(camRight, camForward));
 
     viewport.renderViewport({
-      renderScale: Math.min(window.devicePixelRatio || 1.0, 1.25),
+      renderScale: Math.min(window.devicePixelRatio || 1.0, 1.0),
       camPos,
       camRight,
       camUp,

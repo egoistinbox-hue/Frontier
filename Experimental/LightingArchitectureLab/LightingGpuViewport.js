@@ -1,10 +1,15 @@
-// LightingGpuViewport.js — Modular fast-compiling WebGL2 GPU shader engine
-// (splits Real-Time Multi-Mode program and Progressive Path-Tracer program to keep
-// ANGLE/D3D11/Metal shader link times under ~50 ms and avoid GPU watchdog timeouts).
+// LightingGpuViewport.js — Hardware WebGL2 Forward Rasterizer + Analytic SDF Visibility
+// Renders crisp triangle surfaces at 60-144 FPS while keeping SDF soft-cone shadows,
+// 128x32 Type-C IES LUTs, Unified Photometric Partition PriorityCut, and Progressive PT.
 
 import { IES_PHI_SAMPLES, IES_PROFILE_COUNT, IES_THETA_SAMPLES } from "./PhotometricGoniometry.js";
+import {
+  buildSinglePylonGeometry,
+  buildStaticEnvironmentGeometry,
+  buildVehicleGeometry,
+} from "./SceneSurfaceBuilder.js";
 
-const VERTEX_SHADER_SRC = `#version 300 es
+const SKY_VERTEX_SRC = `#version 300 es
 precision highp float;
 precision highp int;
 
@@ -14,12 +19,140 @@ const vec2 QUAD_VERTS[3] = vec2[3](
   vec2(-1.0,  3.0)
 );
 
-out vec2 vUv;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform vec3 uCamForward;
+uniform float uTanHalfFov;
+uniform float uAspect;
+
+out vec3 vRayDir;
 
 void main() {
-  vec2 p = QUAD_VERTS[gl_VertexID];
-  vUv = p * 0.5 + 0.5;
-  gl_Position = vec4(p, 0.0, 1.0);
+  vec2 ndc = QUAD_VERTS[gl_VertexID];
+  vRayDir = uCamForward + uCamRight * (ndc.x * uAspect * uTanHalfFov) + uCamUp * (ndc.y * uTanHalfFov);
+  gl_Position = vec4(ndc, 0.9999, 1.0);
+}
+`;
+
+const SKY_FRAGMENT_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+
+in vec3 vRayDir;
+out vec4 fragColor;
+
+uniform int uEnvPreset;
+uniform int uDebugLens;
+uniform int uIsPathTracer;
+uniform int uAccumFrame;
+uniform sampler2D uPrevAccumTex;
+uniform vec3 uSunDir;
+uniform vec3 uSunColor;
+
+vec3 evalSky(vec3 dir) {
+  float y = dir.y;
+  float sunDot = max(dot(dir, uSunDir), 1e-4);
+  if (uEnvPreset == 0) {
+    float t = clamp(y * 1.4, 0.0, 1.0);
+    float coveRing = exp(-pow((y - 0.28) / 0.12, 2.0)) * 0.26;
+    return mix(vec3(0.025, 0.028, 0.036), vec3(0.05, 0.068, 0.095), t) + vec3(0.9, 0.94, 1.05) * coveRing;
+  } else if (uEnvPreset == 1) {
+    float up = max(y, 1e-4);
+    vec3 sky = mix(vec3(0.32, 0.44, 0.52), vec3(0.11, 0.28, 0.68), pow(up, 0.65));
+    float sunGlow = pow(sunDot, 22.0) * 1.4 + pow(sunDot, 420.0) * 14.0;
+    return (y < 0.0 ? vec3(0.05, 0.08, 0.045) : sky) + uSunColor * sunGlow;
+  } else {
+    float up = max(y, 1e-4);
+    vec3 sky = mix(vec3(0.55, 0.44, 0.36), vec3(0.15, 0.30, 0.62), pow(up, 0.6));
+    float sunGlow = pow(sunDot, 16.0) * 1.6 + pow(sunDot, 360.0) * 16.0;
+    return (y < 0.0 ? vec3(0.08, 0.075, 0.07) : sky) + uSunColor * sunGlow;
+  }
+}
+
+void main() {
+  vec3 sky = evalSky(normalize(vRayDir));
+  if (uDebugLens == 1 || uDebugLens == 2 || uDebugLens == 4) sky *= 0.25;
+  if (uIsPathTracer == 1 && uAccumFrame > 0) {
+    vec4 prev = texelFetch(uPrevAccumTex, ivec2(gl_FragCoord.xy), 0);
+    fragColor = prev + vec4(min(sky, vec3(32.0)), 1.0);
+  } else {
+    fragColor = vec4(sky, 1.0);
+  }
+}
+`;
+
+const GEOM_VERTEX_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in float aMatId;
+
+uniform vec3 uObjPos;
+uniform float uObjYaw;
+uniform int uIsPylonInstanced;
+uniform int uEmissivePylonCount;
+
+uniform vec3 uCamPos;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform vec3 uCamForward;
+uniform float uTanHalfFov;
+uniform float uAspect;
+uniform vec2 uPtJitter;
+
+out vec3 vWorldPos;
+out vec3 vWorldNormal;
+out vec3 vLocalPos;
+out float vMatId;
+
+const float TWO_PI = 6.28318530718;
+
+vec2 rotXZ(vec2 p, float yaw) {
+  float c = cos(yaw);
+  float s = sin(yaw);
+  return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+
+void main() {
+  vec3 localP = aPos;
+  vec3 worldP;
+  vec3 worldN;
+  float outMat = aMatId;
+
+  if (uIsPylonInstanced == 1) {
+    int idx = gl_InstanceID;
+    int ring = idx / 16;
+    int sector = idx - ring * 16;
+    float rad = 4.25 + float(ring) * 1.2;
+    float phase = float(ring) * 0.19635;
+    float a = float(sector) * (TWO_PI / 16.0) + phase;
+    vec3 center = vec3(cos(a) * rad, 0.30 + 0.10 * sin(float(idx) * 1.7), sin(a) * rad + 0.5);
+    worldP = localP + center;
+    worldN = aNormal;
+    outMat = 20.0 + float(idx);
+  } else {
+    worldP = vec3(rotXZ(localP.xz, uObjYaw), localP.y).xzy + uObjPos;
+    worldN = normalize(vec3(rotXZ(aNormal.xz, uObjYaw), aNormal.y).xzy);
+  }
+
+  vWorldPos = worldP;
+  vWorldNormal = worldN;
+  vLocalPos = localP;
+  vMatId = outMat;
+
+  vec3 rel = worldP - uCamPos;
+  float vx = dot(rel, uCamRight);
+  float vy = dot(rel, uCamUp);
+  float vz = dot(rel, uCamForward);
+
+  const float zNear = 0.15;
+  const float zFar = 75.0;
+  float clipX = vx / max(uTanHalfFov * uAspect, 1e-4) + uPtJitter.x * vz;
+  float clipY = vy / max(uTanHalfFov, 1e-4) + uPtJitter.y * vz;
+  float clipZ = (vz * (zFar + zNear) - 2.0 * zFar * zNear) / (zFar - zNear);
+  gl_Position = vec4(clipX, clipY, clipZ, vz);
 }
 `;
 
@@ -51,12 +184,27 @@ void main() {
 }
 `;
 
-// Shared lean GLSL core (O(1) analytic pylon rings + single luminaire eval site)
-const SHARED_GLSL_COMMON = `#version 300 es
+const BLIT_VERTEX_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+const vec2 QUAD_VERTS[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+out vec2 vUv;
+void main() {
+  vec2 p = QUAD_VERTS[gl_VertexID];
+  vUv = p * 0.5 + 0.5;
+  gl_Position = vec4(p, 0.0, 1.0);
+}
+`;
+
+// Ultra-lean Shared Lighting + Analytical Scene SDF Shadow Core (NO primary march, NO calcNormal!)
+const SURFACE_GLSL_COMMON = `#version 300 es
 precision highp float;
 precision highp int;
 
-in vec2 vUv;
+in vec3 vWorldPos;
+in vec3 vWorldNormal;
+in vec3 vLocalPos;
+in float vMatId;
 out vec4 fragColor;
 
 uniform vec2 uResolution;
@@ -64,7 +212,6 @@ uniform vec3 uCamPos;
 uniform vec3 uCamRight;
 uniform vec3 uCamUp;
 uniform vec3 uCamForward;
-uniform float uTanHalfFov;
 
 uniform sampler2D uLightRegisterTex;
 uniform sampler2D uIesAtlasTex;
@@ -80,14 +227,11 @@ uniform int uMatCapLightBlend;
 uniform int uSdfVoxelDefectDemo;
 uniform int uAccumFrame;
 uniform float uTimeSec;
-uniform float uExposure;
 
 uniform vec3 uCarPos;
 uniform float uCarYaw;
 uniform vec3 uPrevCarPos;
-uniform float uPrevCarYaw;
 uniform float uHeadlampIntensity;
-uniform float uHighBeamActive;
 uniform float uDrlActive;
 uniform float uBrakeActive;
 uniform float uTurnSignalActive;
@@ -115,195 +259,44 @@ float sdBox(vec3 p, vec3 b) {
   return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
-float sdRoundBox(vec3 p, vec3 b, float r) {
-  vec3 q = abs(p) - b;
-  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
-}
-
-float sdCylinderY(vec3 p, float h, float r) {
-  vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
-  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
-}
-
-float sdCylinderX(vec3 p, float h, float r) {
-  vec2 d = abs(vec2(length(p.yz), p.x)) - vec2(r, h);
-  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
-}
-
-float smin(float a, float b, float k) {
-  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-  return mix(b, a, h) - k * h * (1.0 - h);
-}
-
-vec2 rotateXZ(vec2 p, float yaw) {
+vec2 rotXZ(vec2 p, float yaw) {
   float c = cos(yaw);
   float s = sin(yaw);
   return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
 }
 
-vec2 mapVehicle(vec3 worldP, vec3 carPos, float carYaw, out vec3 localOut) {
-  vec3 p = worldP - carPos;
-  p.xz = rotateXZ(p.xz, -carYaw);
-  localOut = p;
+// Fast 7-primitive analytical scene SDF used strictly for soft SDF cone shadows, AO & PT bounce!
+float mapShadowSdf(vec3 p) {
+  float d = p.y;
+  vec3 cp = p - uCarPos;
+  cp.xz = rotXZ(cp.xz, -uCarYaw);
+  d = min(d, sdBox(cp - vec3(0.0, 0.48, 0.0), vec3(0.94, 0.30, 2.12)));
+  d = min(d, sdBox(cp - vec3(0.0, 0.92, -0.25), vec3(0.68, 0.24, 0.96)));
+  d = min(d, length(p - vec3(-2.55, 0.46, 2.4)) - 0.46);
+  d = min(d, length(p - vec3(-2.55, 0.46, 1.0)) - 0.46);
+  d = min(d, length(p - vec3(-2.55, 0.46, -0.4)) - 0.46);
 
-  float boundD = length(p - vec3(0.0, 0.72, 0.0)) - 3.1;
-  if (boundD > 0.45) {
-    return vec2(boundD, 10.0);
+  if (uEnvPreset == 1) {
+    d = min(d, length(p.xz - vec2(5.6, -2.8)) - 0.28);
+    d = min(d, length(p.xz - vec2(-5.8, -2.2)) - 0.25);
+    d = min(d, length(p.xz - vec2(6.2, 3.2)) - 0.30);
+    d = min(d, length(p.xz - vec2(-6.0, 3.6)) - 0.26);
+  } else if (uEnvPreset == 2) {
+    d = min(d, sdBox(p - vec3(-6.2, 1.35, -3.5), vec3(0.28, 1.35, 2.0)));
+    d = min(d, sdBox(p - vec3(-6.2, 1.35, 5.2), vec3(0.28, 1.35, 2.1)));
+    d = min(d, sdBox(p - vec3(-6.2, 3.35, 0.5), vec3(0.24, 0.95, 7.5)));
   }
-
-  vec3 chP = p - vec3(0.0, 0.48, 0.0);
-  float wedgeSlope = clamp((p.z + 2.0) / 4.2, 1e-4, 1.0);
-  float bodyHeight = mix(0.32, 0.20, pow(wedgeSlope, 1.6));
-  float chassis = sdRoundBox(chP, vec3(0.92, bodyHeight, 2.08), 0.14);
-
-  vec3 mirP = vec3(abs(p.x), p.y, p.z);
-  float frontFender = sdRoundBox(mirP - vec3(0.79, 0.51, 1.32), vec3(0.18, 0.18, 0.45), 0.11);
-  float rearFender = sdRoundBox(mirP - vec3(0.83, 0.54, -1.28), vec3(0.20, 0.21, 0.48), 0.12);
-  chassis = smin(chassis, min(frontFender, rearFender), 0.12);
-
-  vec3 cabP = p - vec3(0.0, 0.88, -0.26);
-  cabP.y += max(0.0, cabP.z - 0.1) * 0.25;
-  cabP.y += max(0.0, -cabP.z - 0.15) * 0.14;
-  float cabin = sdRoundBox(cabP, vec3(0.68, 0.26, 0.96), 0.17);
-
-  vec3 wheelMir = vec3(abs(p.x) - 0.88, p.y - 0.34, abs(p.z) - 1.32);
-  float wheelCut = sdCylinderX(wheelMir, 0.22, 0.41);
-  float body = max(smin(chassis, cabin, 0.14), -wheelCut);
-
-  float wingBlade = sdRoundBox(p - vec3(0.0, 0.99, -2.02), vec3(0.86, 0.025, 0.16), 0.012);
-  float wingPosts = sdBox(vec3(abs(p.x) - 0.44, p.y - 0.85, p.z + 1.96), vec3(0.03, 0.14, 0.07));
-  float bestD = min(body, min(wingBlade, wingPosts));
-  float bestM = 10.0;
-
-  if (p.y > 0.72 && abs(p.x) < 0.72 && p.z > -1.35 && p.z < 0.78) {
-    float cabinShell = max(cabin, -(p.y - 0.74));
-    if (cabinShell < bestD + 0.012) {
-      bestD = cabinShell;
-      bestM = 11.0;
-    }
-  }
-
-  float tireD = sdCylinderX(wheelMir, 0.14, 0.34);
-  if (tireD < bestD) { bestD = tireD; bestM = 12.0; }
-  float rimD = sdCylinderX(wheelMir - vec3(0.02, 0.0, 0.0), 0.145, 0.23);
-  if (rimD < bestD) { bestD = rimD; bestM = 13.0; }
-
-  float headLampD = sdRoundBox(vec3(abs(p.x) - 0.68, p.y - 0.50, p.z - 2.09), vec3(0.18, 0.042, 0.06), 0.016);
-  if (headLampD < bestD) { bestD = headLampD; bestM = 14.0; }
-
-  float tailLampD = sdRoundBox(p - vec3(0.0, 0.61, -2.14), vec3(0.84, 0.034, 0.045), 0.015);
-  if (tailLampD < bestD) { bestD = tailLampD; bestM = 15.0; }
-
-  return vec2(bestD, bestM);
+  return d;
 }
 
-// O(1) analytic ring distance for up to 48 emissive pylons (3 rings x 16 slots)
-vec2 mapAnalyticPylonRings(vec3 p) {
-  if (uEmissivePylonCount <= 0 || p.y > 1.0) return vec2(10.0, -1.0);
-  vec2 c = p.xz - vec2(0.0, 0.5);
-  float r = length(c);
-  if (r < 3.6 || r > 7.4) return vec2(min(abs(r - 4.25), 1.0) + 0.15, -1.0);
-
-  float bestD = 10.0;
-  float bestM = -1.0;
-  float angRaw = (abs(c.x) + abs(c.y) < 1e-4) ? 0.0 : atan(c.y, c.x);
-
-  for (int ring = 0; ring < 3; ++ring) {
-    int ringStart = ring * 16;
-    if (ringStart >= uEmissivePylonCount) break;
-    float rad = 4.25 + float(ring) * 1.2;
-    if (abs(r - rad) > 0.65) continue;
-
-    float phase = float(ring) * 0.19635;
-    float sector = mod(floor((angRaw - phase) / (TWO_PI / 16.0) + 0.5) + 16.0, 16.0);
-    int idx = ringStart + int(sector);
-    if (idx < uEmissivePylonCount) {
-      float a = sector * (TWO_PI / 16.0) + phase;
-      vec3 pp = vec3(cos(a) * rad, 0.30 + 0.10 * sin(float(idx) * 1.7), sin(a) * rad + 0.5);
-      float pd = sdBox(p - pp, vec3(0.065, 0.28, 0.065));
-      if (pd < bestD) {
-        bestD = pd;
-        bestM = 20.0 + float(idx);
-      }
-    }
-  }
-  return vec2(bestD, bestM);
-}
-
-vec2 mapScene(vec3 p, out vec3 localCarP) {
-  vec2 res = mapVehicle(p, uCarPos, uCarYaw, localCarP);
-
-  if (p.y < res.x) {
-    res = vec2(p.y, 1.0);
-  }
-
-  if (uEnvPreset == 0) {
-    float calWall = sdBox(p - vec3(0.0, 1.9, 7.6), vec3(6.8, 1.9, 0.2));
-    float sideWall = sdBox(p - vec3(-6.8, 2.0, 1.0), vec3(0.25, 2.0, 6.8));
-    float rearWall = sdBox(p - vec3(0.0, 2.0, -6.8), vec3(6.8, 2.0, 0.25));
-    float envD = min(calWall, min(sideWall, rearWall));
-    if (envD < res.x) res = vec2(envD, 2.0);
-  } else if (uEnvPreset == 1) {
-    float calWall = sdBox(p - vec3(0.0, 1.7, 7.8), vec3(7.2, 1.7, 0.25));
-    if (calWall < res.x) res = vec2(calWall, 2.0);
-    // 4 sculpted forest trunks outside central pad
-    float t1 = sdCylinderY(p - vec3(5.6, 2.5, -2.8), 2.5, 0.28);
-    float t2 = sdCylinderY(p - vec3(-5.8, 2.5, -2.2), 2.5, 0.25);
-    float t3 = sdCylinderY(p - vec3(6.2, 2.5, 3.2), 2.5, 0.30);
-    float t4 = sdCylinderY(p - vec3(-6.0, 2.5, 3.6), 2.5, 0.26);
-    float td = min(min(t1, t2), min(t3, t4));
-    if (td < res.x) res = vec2(td, 7.0);
-  } else {
-    float backWall = sdBox(p - vec3(0.0, 2.2, 7.8), vec3(8.5, 2.2, 0.22));
-    float leftWallUpper = sdBox(p - vec3(-6.2, 3.35, 0.5), vec3(0.24, 0.95, 7.5));
-    float leftPillarA = sdBox(p - vec3(-6.2, 1.35, -3.5), vec3(0.28, 1.35, 2.0));
-    float leftPillarB = sdBox(p - vec3(-6.2, 1.35, 5.2), vec3(0.28, 1.35, 2.1));
-    float ceilingBeam = sdBox(p - vec3(0.0, 4.35, 1.2), vec3(7.5, 0.25, 7.5));
-    float archD = min(min(backWall, ceilingBeam), min(leftWallUpper, min(leftPillarA, leftPillarB)));
-    if (archD < res.x) res = vec2(archD, 2.0);
-  }
-
-  float sChrome = length(p - vec3(-2.55, 0.46, 2.4)) - 0.46;
-  if (sChrome < res.x) res = vec2(sChrome, 3.0);
-
-  float sOrange = length(p - vec3(-2.55, 0.46, 1.0)) - 0.46;
-  if (sOrange < res.x) res = vec2(sOrange, 4.0);
-
-  float sMatte = length(p - vec3(-2.55, 0.46, -0.4)) - 0.46;
-  if (sMatte < res.x) res = vec2(sMatte, 5.0);
-
-  float softboxMesh = sdBox(p - vec3(0.2, 3.88, 0.2), vec3(1.85, 0.04, 0.85));
-  if (softboxMesh < res.x) res = vec2(softboxMesh, 6.0);
-
-  vec2 pylonRes = mapAnalyticPylonRings(p);
-  if (pylonRes.x < res.x && pylonRes.y > 0.0) res = pylonRes;
-
-  return res;
-}
-
-float mapDistanceOnly(vec3 p) {
-  vec3 dummy;
-  return mapScene(p, dummy).x;
-}
-
-vec3 calcNormal(vec3 p) {
-  const vec2 e = vec2(0.0024, -0.0024);
-  return normalize(
-    e.xyy * mapDistanceOnly(p + e.xyy) +
-    e.yyx * mapDistanceOnly(p + e.yyx) +
-    e.yxy * mapDistanceOnly(p + e.yxy) +
-    e.xxx * mapDistanceOnly(p + e.xxx)
-  );
-}
-
-float traceExactShadow(vec3 ro, vec3 rd, float maxT, float bias) {
-  float t = max(bias, 0.04);
+float traceExactShadow(vec3 ro, vec3 rd, float maxT) {
+  float t = 0.05;
   float minRes = 1.0;
-  for (int i = 0; i < 24; ++i) {
-    float h = mapDistanceOnly(ro + rd * t);
-    if (h < 0.003) return 0.0;
+  for (int i = 0; i < 16; ++i) {
+    float h = mapShadowSdf(ro + rd * t);
+    if (h < 0.004) return 0.0;
     minRes = min(minRes, 18.0 * h / t);
-    t += clamp(h, 0.05, 0.75);
+    t += clamp(h, 0.06, 0.85);
     if (t >= maxT) break;
   }
   return clamp(minRes, 0.0, 1.0);
@@ -312,11 +305,11 @@ float traceExactShadow(vec3 ro, vec3 rd, float maxT, float bias) {
 float traceGdfConeShadow(vec3 ro, vec3 rd, float maxT, float coneSoftness) {
   float t = 0.06;
   float res = 1.0;
-  for (int i = 0; i < 12; ++i) {
-    float h = mapDistanceOnly(ro + rd * t);
-    if (h < 0.0025) return 0.0;
+  for (int i = 0; i < 10; ++i) {
+    float h = mapShadowSdf(ro + rd * t);
+    if (h < 0.003) return 0.0;
     res = min(res, coneSoftness * h / t);
-    t += clamp(h * 1.2, 0.09, 0.85);
+    t += clamp(h * 1.2, 0.10, 0.95);
     if (t >= maxT) break;
   }
   return clamp(res * res * (3.0 - 2.0 * res), 0.0, 1.0);
@@ -325,29 +318,29 @@ float traceGdfConeShadow(vec3 ro, vec3 rd, float maxT, float coneSoftness) {
 float calcSdfAmbientOcclusion(vec3 pos, vec3 nor) {
   float occ = 0.0;
   float sca = 1.0;
-  for (int i = 0; i < 4; ++i) {
-    float h = 0.04 + 0.18 * float(i);
-    float d = mapDistanceOnly(pos + h * nor);
+  for (int i = 0; i < 3; ++i) {
+    float h = 0.06 + 0.22 * float(i);
+    float d = mapShadowSdf(pos + h * nor);
     occ += (h - d) * sca;
-    sca *= 0.70;
+    sca *= 0.65;
   }
-  return clamp(1.0 - 1.55 * occ, 0.20, 1.0);
+  return clamp(1.0 - 1.45 * occ, 0.22, 1.0);
 }
 
 void fetchLuminaire(int idx, out vec4 t0, out vec4 t1, out vec4 t2, out vec4 t3) {
   int base = idx * 4;
-  t0 = texelFetch(uLightRegisterTex, ivec2((base + 0) % 256, (base + 0) / 256), 0);
-  t1 = texelFetch(uLightRegisterTex, ivec2((base + 1) % 256, (base + 1) / 256), 0);
-  t2 = texelFetch(uLightRegisterTex, ivec2((base + 2) % 256, (base + 2) / 256), 0);
-  t3 = texelFetch(uLightRegisterTex, ivec2((base + 3) % 256, (base + 3) / 256), 0);
+  t0 = texelFetch(uLightRegisterTex, ivec2((base + 0) & 255, (base + 0) >> 8), 0);
+  t1 = texelFetch(uLightRegisterTex, ivec2((base + 1) & 255, (base + 1) >> 8), 0);
+  t2 = texelFetch(uLightRegisterTex, ivec2((base + 2) & 255, (base + 2) >> 8), 0);
+  t3 = texelFetch(uLightRegisterTex, ivec2((base + 3) & 255, (base + 3) >> 8), 0);
 }
 
 void fetchPartitionCell(int cellIdx, out vec4 n0, out vec4 n1, out vec4 n2, out vec4 n3) {
   int base = 512 + cellIdx * 4;
-  n0 = texelFetch(uLightRegisterTex, ivec2((base + 0) % 256, (base + 0) / 256), 0);
-  n1 = texelFetch(uLightRegisterTex, ivec2((base + 1) % 256, (base + 1) / 256), 0);
-  n2 = texelFetch(uLightRegisterTex, ivec2((base + 2) % 256, (base + 2) / 256), 0);
-  n3 = texelFetch(uLightRegisterTex, ivec2((base + 3) % 256, (base + 3) / 256), 0);
+  n0 = texelFetch(uLightRegisterTex, ivec2((base + 0) & 255, (base + 0) >> 8), 0);
+  n1 = texelFetch(uLightRegisterTex, ivec2((base + 1) & 255, (base + 1) >> 8), 0);
+  n2 = texelFetch(uLightRegisterTex, ivec2((base + 2) & 255, (base + 2) >> 8), 0);
+  n3 = texelFetch(uLightRegisterTex, ivec2((base + 3) & 255, (base + 3) >> 8), 0);
 }
 
 float sampleIesAtlas128x32(int profileOrd, vec3 dirFromLight, vec3 beamAxis, vec3 zeroAzimuth) {
@@ -367,8 +360,8 @@ float sampleIesAtlas128x32(int profileOrd, vec3 dirFromLight, vec3 beamAxis, vec
   if (phi < 0.0) phi += TWO_PI;
 
   float phiF = (phi / TWO_PI) * 32.0;
-  int p0 = int(floor(phiF)) % 32;
-  int p1 = (p0 + 1) % 32;
+  int p0 = int(floor(phiF)) & 31;
+  int p1 = (p0 + 1) & 31;
   float pf = phiF - float(int(floor(phiF)));
 
   int rowBase = clamp(profileOrd, 0, 7) * 32;
@@ -451,7 +444,6 @@ vec3 evalUnifiedLuminaireNoShadow(
   outLuxNoVis = 0.0;
 
   if (cat == 2 || cat == 4) {
-    // AreaQuad LTC
     vec3 center = t0.xyz;
     float halfW = t0.w;
     vec3 upAxis = normalize(t1.xyz);
@@ -695,9 +687,8 @@ vec3 infernoPalette(float t) {
 }
 `;
 
-// Program 1: Real-Time Engines 0, 1, 2, 3 — single luminaire evaluation loop!
 const REALTIME_FRAGMENT_SRC =
-  SHARED_GLSL_COMMON +
+  SURFACE_GLSL_COMMON +
   `
 vec3 shadePointRealTime(
   vec3 P, vec3 N, vec3 V,
@@ -713,8 +704,8 @@ vec3 shadePointRealTime(
   if (uEnvPreset >= 1) {
     float sunVis = 1.0;
     if (doShadows && dot(N, uSunDir) > 0.0) {
-      sunVis = fastSdfShadow ? traceGdfConeShadow(P + N * 0.02, uSunDir, 18.0, 12.0)
-                             : traceExactShadow(P + N * 0.02, uSunDir, 20.0, 0.04);
+      sunVis = fastSdfShadow ? traceGdfConeShadow(P + N * 0.025, uSunDir, 18.0, 10.0)
+                             : traceExactShadow(P + N * 0.025, uSunDir, 20.0);
     }
     total += evalOpenPbrBrdf(N, V, uSunDir, albedo, metallic, rough, clearcoat, 0.045, 1.0, uSunDir) * uSunColor * sunVis;
     outLuxTotal += max(dot(N, uSunDir), 0.0) * dot(uSunColor, vec3(0.3, 0.6, 0.1)) * sunVis;
@@ -722,7 +713,6 @@ vec3 shadePointRealTime(
 
   if (uLuminaireCount <= 0) return total;
 
-  // Phase 1: Candidate selection into compact 12-entry array (initialized for ANGLE/FXC!)
   const int MAX_CAND = 12;
   int candIds[12] = int[12](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
   int candCount = 0;
@@ -730,7 +720,7 @@ vec3 shadePointRealTime(
   vec3 tailApprox = vec3(0.0);
 
   if (uSchedulerMode == 2) {
-    // Direct reference evaluates 0..min(uLuminaireCount, 32) via the single loop below
+    // Direct Brute-Force evaluates 0..min(uLuminaireCount, 32)
   } else if (uRenderEngine == 0) {
     int cap = min(uLuminaireCount, 4);
     for (int i = 0; i < 4; ++i) {
@@ -813,7 +803,6 @@ vec3 shadePointRealTime(
     }
   }
 
-  // Phase 2: Analytical luminaire sum (zero shadow rays and zero dynamic shadow arrays!)
   vec3 shDir0 = vec3(0.0, 1.0, 0.0); float shDist0 = 0.0; vec3 shRad0 = vec3(0.0);
   vec3 shDir1 = vec3(0.0, 1.0, 0.0); float shDist1 = 0.0; vec3 shRad1 = vec3(0.0);
   vec3 shDir2 = vec3(0.0, 1.0, 0.0); float shDist2 = 0.0; vec3 shRad2 = vec3(0.0);
@@ -838,23 +827,22 @@ vec3 shadePointRealTime(
     }
   }
 
-  // Phase 3: Explicit scalar shadow evaluation (zero dynamic indexing in shadow loop!)
   if (shCaptured > 0) {
     float v0 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.02, shDir0, min(shDist0 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.02, shDir0, min(shDist0 - 0.14, 15.0), 0.04);
+      ? traceGdfConeShadow(P + N * 0.025, shDir0, min(shDist0 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.025, shDir0, min(shDist0 - 0.14, 15.0));
     total += shRad0 * v0;
   }
   if (shCaptured > 1) {
     float v1 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.02, shDir1, min(shDist1 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.02, shDir1, min(shDist1 - 0.14, 15.0), 0.04);
+      ? traceGdfConeShadow(P + N * 0.025, shDir1, min(shDist1 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.025, shDir1, min(shDist1 - 0.14, 15.0));
     total += shRad1 * v1;
   }
   if (shCaptured > 2) {
     float v2 = fastSdfShadow
-      ? traceGdfConeShadow(P + N * 0.02, shDir2, min(shDist2 - 0.14, 14.0), 9.0)
-      : traceExactShadow(P + N * 0.02, shDir2, min(shDist2 - 0.14, 15.0), 0.04);
+      ? traceGdfConeShadow(P + N * 0.025, shDir2, min(shDist2 - 0.14, 14.0), 9.0)
+      : traceExactShadow(P + N * 0.025, shDir2, min(shDist2 - 0.14, 15.0));
     total += shRad2 * v2;
   }
 
@@ -863,116 +851,95 @@ vec3 shadePointRealTime(
 }
 
 void main() {
-  vec2 ndc = vUv * 2.0 - 1.0;
-  float aspect = uResolution.x / max(uResolution.y, 1.0);
-  vec3 rd = normalize(uCamForward + uCamRight * (ndc.x * aspect * uTanHalfFov) + uCamUp * (ndc.y * uTanHalfFov));
-  vec3 ro = uCamPos;
+  vec3 P = vWorldPos;
+  vec3 N = normalize(vWorldNormal);
+  if (!gl_FrontFacing) N = -N;
+  vec3 V = normalize(uCamPos - P);
 
-  float t = 0.05;
-  float hitMat = -1.0;
-  vec3 hitLocalCar = vec3(0.0);
-  for (int i = 0; i < 96; ++i) {
-    vec2 d = mapScene(ro + rd * t, hitLocalCar);
-    if (d.x < 0.002) { hitMat = d.y; break; }
-    t += clamp(d.x, 0.012, 1.4);
-    if (t > 42.0) break;
-  }
+  vec3 albedo, emissive;
+  float metallic, rough, clearcoat;
+  evalMaterial(vMatId, P, vLocalPos, N, albedo, metallic, rough, clearcoat, emissive);
+
+  bool isMatCap = (uRenderEngine == 0);
+  bool fastSdf = (uRenderEngine == 1);
+  bool doSh = !isMatCap;
+
+  int cutEvals;
+  float luxTotal;
+  vec3 direct = (isMatCap && uMatCapLightBlend == 0)
+    ? vec3(0.0)
+    : shadePointRealTime(P, N, V, albedo, metallic, rough, clearcoat, doSh, fastSdf, gl_FragCoord.xy, cutEvals, luxTotal);
 
   vec3 finalRgb = vec3(0.0);
-  if (hitMat < 0.0) {
-    finalRgb = evalEnvironmentSky(rd);
-    if (uDebugLens == 1 || uDebugLens == 2 || uDebugLens == 4) finalRgb *= 0.25;
+  if (isMatCap) {
+    vec2 nv = vec2(dot(N, uCamRight), dot(N, uCamUp));
+    float nz = sqrt(max(0.0, 1.0 - min(dot(nv, nv), 1.0)));
+    float keyCurve = clamp(dot(normalize(vec3(nv, nz)), normalize(vec3(-0.35, 0.72, 0.6))), 1e-4, 1.0);
+    vec3 baseClay = (vMatId > 9.5 && vMatId < 10.5) ? vec3(0.22, 0.34, 0.56) : albedo * 0.68 + vec3(0.14);
+    vec3 matcap = baseClay * (0.32 + 0.68 * pow(keyCurve, 1.35))
+      + vec3(0.28, 0.32, 0.38) * pow(max(1.0 - nz, 1e-4), 2.6)
+      + vec3(pow(keyCurve, 26.0) * 0.45);
+    finalRgb = (uMatCapLightBlend == 1)
+      ? matcap * 0.68 + evalEnvironmentHarmonics(N) * 0.35 + direct * 0.55 + emissive * 0.5
+      : matcap + emissive * 0.5;
   } else {
-    vec3 P = ro + rd * t;
-    vec3 N = calcNormal(P);
-    vec3 V = -rd;
-    vec3 albedo, emissive;
-    float metallic, rough, clearcoat;
-    evalMaterial(hitMat, P, hitLocalCar, N, albedo, metallic, rough, clearcoat, emissive);
+    float ao = (uRenderEngine == 1 || uRenderEngine == 3) ? calcSdfAmbientOcclusion(P, N) : 1.0;
+    float effClearcoat = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? 0.0 : clearcoat;
+    float effRough = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? max(rough, 0.65) : rough;
 
-    bool isMatCap = (uRenderEngine == 0);
-    bool fastSdf = (uRenderEngine == 1);
-    bool doSh = !isMatCap;
-
-    int cutEvals;
-    float luxTotal;
-    vec3 direct = (isMatCap && uMatCapLightBlend == 0)
-      ? vec3(0.0)
-      : shadePointRealTime(P, N, V, albedo, metallic, rough, clearcoat, doSh, fastSdf, gl_FragCoord.xy, cutEvals, luxTotal);
-
-    if (isMatCap) {
-      vec2 nv = vec2(dot(N, uCamRight), dot(N, uCamUp));
-      float nz = sqrt(max(0.0, 1.0 - min(dot(nv, nv), 1.0)));
-      float keyCurve = clamp(dot(normalize(vec3(nv, nz)), normalize(vec3(-0.35, 0.72, 0.6))), 1e-4, 1.0);
-      vec3 baseClay = (hitMat > 9.5 && hitMat < 10.5) ? vec3(0.22, 0.34, 0.56) : albedo * 0.68 + vec3(0.14);
-      vec3 matcap = baseClay * (0.32 + 0.68 * pow(keyCurve, 1.35))
-        + vec3(0.28, 0.32, 0.38) * pow(max(1.0 - nz, 1e-4), 2.6)
-        + vec3(pow(keyCurve, 26.0) * 0.45);
-      finalRgb = (uMatCapLightBlend == 1)
-        ? matcap * 0.68 + evalEnvironmentHarmonics(N) * 0.35 + direct * 0.55 + emissive * 0.5
-        : matcap + emissive * 0.5;
-    } else {
-      float ao = (uRenderEngine == 1 || uRenderEngine == 3) ? calcSdfAmbientOcclusion(P, N) : 1.0;
-      float effClearcoat = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? 0.0 : clearcoat;
-      float effRough = (uSdfVoxelDefectDemo == 1 && uRenderEngine == 1) ? max(rough, 0.65) : rough;
-
-      vec3 diffuseIbl = evalEnvironmentHarmonics(N) * (albedo * (1.0 - metallic)) * ao;
-      vec3 R = reflect(-V, N);
-      vec3 envSpec = mix(evalEnvironmentSky(R), evalEnvironmentHarmonics(R), clamp(effRough * 1.15, 0.0, 1.0));
-      float nDotV = max(dot(N, V), 1e-4);
-      vec3 specIbl = envSpec * fresnelSchlick(nDotV, mix(vec3(0.04), albedo, metallic)) * ao;
-      if (effClearcoat > 0.01) {
-        float Fc = fresnelSchlick(nDotV, vec3(0.04)).r * effClearcoat;
-        specIbl = specIbl * (1.0 - Fc * 0.65) + evalEnvironmentSky(R) * Fc;
-      }
-
-      vec3 radBleed = vec3(0.0);
-      if (uRenderEngine == 1 || uRenderEngine == 3) {
-        float giStr = (uRenderEngine == 3) ? 1.0 : 0.62;
-        float floorFacing = clamp(-N.y * 0.5 + 0.5, 0.0, 1.0);
-        float underMask = clamp(length(P.xz - uCarPos.xz) * 0.45, 0.35, 1.0);
-        vec3 warmBounce = vec3(0.11, 0.12, 0.13) * exp(-dot(P.xz, P.xz) * 0.08) * floorFacing * underMask;
-        if (uEnvPreset >= 1) warmBounce += uSunColor * 0.085 * floorFacing * underMask;
-        vec3 carF = vec3(sin(uCarYaw), 0.0, cos(uCarYaw));
-        vec3 tailPos = uCarPos - carF * 2.2;
-        vec3 nosePos = uCarPos + carF * 2.2;
-        vec3 rubyB = vec3(0.85, 0.04, 0.02) * (1.0 + uBrakeActive * 2.2) / (dot(P - tailPos, P - tailPos) + 0.45) * 0.52;
-        vec3 drlB = vec3(0.35, 0.42, 0.55) * max(uDrlActive, uHeadlampIntensity) / (dot(P - nosePos, P - nosePos) + 0.45) * 0.45;
-        radBleed = (warmBounce + rubyB + drlB) * (albedo * (1.0 - metallic)) * giStr * ao;
-      }
-
-      vec3 giOnly = diffuseIbl + radBleed;
-      vec3 envGi = (uDebugLens == 5) ? specIbl : (giOnly + specIbl);
-
-      if (uDebugLens == 1) finalRgb = infernoPalette(float(cutEvals) / 10.0);
-      else if (uDebugLens == 2) finalRgb = infernoPalette(log2(1.0 + luxTotal * 1.4) / 5.5);
-      else if (uDebugLens == 3) finalRgb = vec3(traceGdfConeShadow(P + N * 0.02, normalize(vec3(0.45, 0.85, 0.3)), 14.0, fastSdf ? 8.0 : 26.0) * ao);
-      else if (uDebugLens == 4) finalRgb = giOnly * 2.2;
-      else if (uDebugLens == 5) finalRgb = direct + envGi + emissive * 0.1;
-      else finalRgb = direct + envGi + emissive;
+    vec3 diffuseIbl = evalEnvironmentHarmonics(N) * (albedo * (1.0 - metallic)) * ao;
+    vec3 R = reflect(-V, N);
+    vec3 envSpec = mix(evalEnvironmentSky(R), evalEnvironmentHarmonics(R), clamp(effRough * 1.15, 0.0, 1.0));
+    float nDotV = max(dot(N, V), 1e-4);
+    vec3 specIbl = envSpec * fresnelSchlick(nDotV, mix(vec3(0.04), albedo, metallic)) * ao;
+    if (effClearcoat > 0.01) {
+      float Fc = fresnelSchlick(nDotV, vec3(0.04)).r * effClearcoat;
+      specIbl = specIbl * (1.0 - Fc * 0.65) + evalEnvironmentSky(R) * Fc;
     }
+
+    vec3 radBleed = vec3(0.0);
+    if (uRenderEngine == 1 || uRenderEngine == 3) {
+      float giStr = (uRenderEngine == 3) ? 1.0 : 0.62;
+      float floorFacing = clamp(-N.y * 0.5 + 0.5, 0.0, 1.0);
+      float underMask = clamp(length(P.xz - uCarPos.xz) * 0.45, 0.35, 1.0);
+      vec3 warmBounce = vec3(0.11, 0.12, 0.13) * exp(-dot(P.xz, P.xz) * 0.08) * floorFacing * underMask;
+      if (uEnvPreset >= 1) warmBounce += uSunColor * 0.085 * floorFacing * underMask;
+      vec3 carF = vec3(sin(uCarYaw), 0.0, cos(uCarYaw));
+      vec3 tailPos = uCarPos - carF * 2.2;
+      vec3 nosePos = uCarPos + carF * 2.2;
+      vec3 rubyB = vec3(0.85, 0.04, 0.02) * (1.0 + uBrakeActive * 2.2) / (dot(P - tailPos, P - tailPos) + 0.45) * 0.52;
+      vec3 drlB = vec3(0.35, 0.42, 0.55) * max(uDrlActive, uHeadlampIntensity) / (dot(P - nosePos, P - nosePos) + 0.45) * 0.45;
+      radBleed = (warmBounce + rubyB + drlB) * (albedo * (1.0 - metallic)) * giStr * ao;
+    }
+
+    vec3 giOnly = diffuseIbl + radBleed;
+    vec3 envGi = (uDebugLens == 5) ? specIbl : (giOnly + specIbl);
+
+    if (uDebugLens == 1) finalRgb = infernoPalette(float(cutEvals) / 10.0);
+    else if (uDebugLens == 2) finalRgb = infernoPalette(log2(1.0 + luxTotal * 1.4) / 5.5);
+    else if (uDebugLens == 3) finalRgb = vec3(traceGdfConeShadow(P + N * 0.025, normalize(vec3(0.45, 0.85, 0.3)), 14.0, fastSdf ? 8.0 : 26.0) * ao);
+    else if (uDebugLens == 4) finalRgb = giOnly * 2.2;
+    else if (uDebugLens == 5) finalRgb = direct + envGi + emissive * 0.1;
+    else finalRgb = direct + envGi + emissive;
   }
 
   fragColor = vec4(max(finalRgb, vec3(0.0)), 1.0);
 }
 `;
 
-// Program 2: Dedicated lean Progressive Deterministic (0,2) Path Tracer (Engine 4)
 const PATHTRACER_FRAGMENT_SRC =
-  SHARED_GLSL_COMMON +
+  SURFACE_GLSL_COMMON +
   `
 vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, float rough, float clearcoat, vec2 xi, out int outEvals) {
   outEvals = 0;
   vec3 total = vec3(0.0);
 
   if (uEnvPreset >= 1 && dot(N, uSunDir) > 0.0) {
-    float vis = traceExactShadow(P + N * 0.02, uSunDir, 18.0, 0.04);
+    float vis = traceExactShadow(P + N * 0.025, uSunDir, 18.0);
     total += evalOpenPbrBrdf(N, V, uSunDir, albedo, metallic, rough, clearcoat, 0.045, 1.0, uSunDir) * uSunColor * vis;
   }
-
   if (uLuminaireCount <= 0) return total;
 
-  // Stochastic descent through binary Photometric Partition (1/Pdf importance draw x 3 cuts)
   for (int c = 0; c < 3; ++c) {
     int cellIdx = 0;
     float pdf = 1.0;
@@ -983,10 +950,7 @@ vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, flo
       vec4 n0, n1, n2, n3;
       fetchPartitionCell(cellIdx, n0, n1, n2, n3);
       int link = int(floor(n1.w + 0.5));
-      if (link < 0) {
-        pickedLum = -link - 1;
-        break;
-      }
+      if (link < 0) { pickedLum = -link - 1; break; }
       if (link + 1 >= uPartitionCellCount) break;
       vec4 ln0, ln1, ln2, ln3, rn0, rn1, rn2, rn3;
       fetchPartitionCell(link, ln0, ln1, ln2, ln3);
@@ -994,15 +958,8 @@ vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, flo
       float wL = max(partitionCellImportance(P, N, ln0, ln1, ln2, ln3), 1e-6);
       float wR = max(partitionCellImportance(P, N, rn0, rn1, rn2, rn3), 1e-6);
       float pL = wL / (wL + wR);
-      if (u < pL) {
-        cellIdx = link;
-        pdf *= pL;
-        u = u / max(pL, 1e-4);
-      } else {
-        cellIdx = link + 1;
-        pdf *= (1.0 - pL);
-        u = (u - pL) / max(1.0 - pL, 1e-4);
-      }
+      if (u < pL) { cellIdx = link; pdf *= pL; u /= max(pL, 1e-4); }
+      else { cellIdx = link + 1; pdf *= (1.0 - pL); u = (u - pL) / max(1.0 - pL, 1e-4); }
     }
 
     if (pickedLum >= 0 && pickedLum < uLuminaireCount && pdf > 1e-4) {
@@ -1010,7 +967,7 @@ vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, flo
       float shDist, luxVal;
       vec3 rad = evalUnifiedLuminaireNoShadow(pickedLum, P, N, V, albedo, metallic, rough, clearcoat, shDir, shDist, luxVal);
       float vis = (shDist > 0.08 && max(rad.r, max(rad.g, rad.b)) > 0.002)
-        ? traceExactShadow(P + N * 0.02, shDir, min(shDist - 0.14, 15.0), 0.04)
+        ? traceExactShadow(P + N * 0.025, shDir, min(shDist - 0.14, 15.0))
         : 1.0;
       total += (rad * vis) / (pdf * 3.0);
       outEvals++;
@@ -1020,85 +977,58 @@ vec3 traceStochasticNee(vec3 P, vec3 N, vec3 V, vec3 albedo, float metallic, flo
 }
 
 void main() {
-  vec2 ndc = vUv * 2.0 - 1.0;
-  float aspect = uResolution.x / max(uResolution.y, 1.0);
+  vec3 P = vWorldPos;
+  vec3 N = normalize(vWorldNormal);
+  if (!gl_FrontFacing) N = -N;
+  vec3 V = normalize(uCamPos - P);
+
+  vec3 albedo, emissive;
+  float metallic, rough, clearcoat;
+  evalMaterial(vMatId, P, vLocalPos, N, albedo, metallic, rough, clearcoat, emissive);
+
   vec2 shift = vec2(hash12(gl_FragCoord.xy), hash12(gl_FragCoord.xy + 19.7));
-  vec2 jitter = (r2Sequence(uAccumFrame, shift) - 0.5) / uResolution * 1.4;
-  vec3 rd = normalize(uCamForward + uCamRight * ((ndc.x + jitter.x * 2.0) * aspect * uTanHalfFov) + uCamUp * ((ndc.y + jitter.y * 2.0) * uTanHalfFov));
-  vec3 ro = uCamPos;
+  vec2 xi = r2Sequence(uAccumFrame * 3 + 7, shift);
+  int evals;
+  vec3 rad = traceStochasticNee(P, N, V, albedo, metallic, rough, clearcoat, xi, evals) + emissive;
 
-  float t = 0.05;
-  float hitMat = -1.0;
-  vec3 hitLocalCar = vec3(0.0);
-  for (int i = 0; i < 96; ++i) {
-    vec2 d = mapScene(ro + rd * t, hitLocalCar);
-    if (d.x < 0.002) { hitMat = d.y; break; }
-    t += clamp(d.x, 0.012, 1.4);
-    if (t > 42.0) break;
-  }
-
-  vec3 finalRgb = vec3(0.0);
-  if (hitMat < 0.0) {
-    finalRgb = evalEnvironmentSky(rd);
+  vec3 ortho1 = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
+  vec3 ortho2 = cross(N, ortho1);
+  float specProb = clamp(mix(0.25, 0.92, max(metallic, clearcoat)), 0.15, 0.92);
+  vec2 bXi = r2Sequence(uAccumFrame * 5 + 11, shift);
+  vec3 bounceDir, bounceW;
+  if (bXi.x < specProb) {
+    vec3 R = reflect(-V, N);
+    float effR = clearcoat > 0.5 && bXi.y < 0.5 ? 0.045 : rough;
+    float phi = bXi.y * TWO_PI;
+    bounceDir = normalize(R + (ortho1 * cos(phi) + ortho2 * sin(phi)) * (effR * effR * sqrt(bXi.x / specProb)));
+    bounceW = fresnelSchlick(max(dot(N, V), 1e-4), mix(vec3(0.04), albedo, max(metallic, clearcoat * 0.25))) / specProb;
   } else {
-    vec3 P = ro + rd * t;
-    vec3 N = calcNormal(P);
-    vec3 V = -rd;
-    vec3 albedo, emissive;
-    float metallic, rough, clearcoat;
-    evalMaterial(hitMat, P, hitLocalCar, N, albedo, metallic, rough, clearcoat, emissive);
-
-    vec2 xi = r2Sequence(uAccumFrame * 3 + 7, shift);
-    int evals;
-    vec3 rad = traceStochasticNee(P, N, V, albedo, metallic, rough, clearcoat, xi, evals) + emissive;
-
-    vec3 ortho1 = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0.0, 1.0, 0.0)) : cross(N, vec3(1.0, 0.0, 0.0)));
-    vec3 ortho2 = cross(N, ortho1);
-    float specProb = clamp(mix(0.25, 0.92, max(metallic, clearcoat)), 0.15, 0.92);
-    vec2 bXi = r2Sequence(uAccumFrame * 5 + 11, shift);
-    vec3 bounceDir, bounceW;
-    if (bXi.x < specProb) {
-      vec3 R = reflect(-V, N);
-      float effR = clearcoat > 0.5 && bXi.y < 0.5 ? 0.045 : rough;
-      float phi = bXi.y * TWO_PI;
-      bounceDir = normalize(R + (ortho1 * cos(phi) + ortho2 * sin(phi)) * (effR * effR * sqrt(bXi.x / specProb)));
-      bounceW = fresnelSchlick(max(dot(N, V), 1e-4), mix(vec3(0.04), albedo, max(metallic, clearcoat * 0.25))) / specProb;
-    } else {
-      float phi = bXi.y * TWO_PI;
-      float u = (bXi.x - specProb) / max(1.0 - specProb, 1e-4);
-      bounceDir = normalize(ortho1 * cos(phi) * sqrt(u) + ortho2 * sin(phi) * sqrt(u) + N * sqrt(1.0 - u));
-      bounceW = (albedo * (1.0 - metallic)) / (1.0 - specProb);
-    }
-
-    float t2 = 0.04;
-    float m2 = -1.0;
-    vec3 lc2 = vec3(0.0);
-    vec3 ro2 = P + N * 0.02;
-    for (int s = 0; s < 42; ++s) {
-      vec2 d2 = mapScene(ro2 + bounceDir * t2, lc2);
-      if (d2.x < 0.005) { m2 = d2.y; break; }
-      t2 += clamp(d2.x, 0.025, 1.2);
-      if (t2 > 20.0) break;
-    }
-    if (m2 < 0.0) {
-      rad += bounceW * evalEnvironmentSky(bounceDir);
-    } else {
-      vec3 P2 = ro2 + bounceDir * t2;
-      vec3 N2 = calcNormal(P2);
-      vec3 a2, e2;
-      float mt2, r2m, cc2;
-      evalMaterial(m2, P2, lc2, N2, a2, mt2, r2m, cc2, e2);
-      rad += bounceW * (e2 + evalEnvironmentHarmonics(N2) * (a2 * (1.0 - mt2)));
-      if (uEnvPreset >= 1 && dot(N2, uSunDir) > 0.0) {
-        float v2 = traceGdfConeShadow(P2 + N2 * 0.02, uSunDir, 12.0, 10.0);
-        rad += bounceW * evalOpenPbrBrdf(N2, -bounceDir, uSunDir, a2, mt2, r2m, cc2, 0.045, 1.0, uSunDir) * uSunColor * v2;
-      }
-    }
-    finalRgb = rad;
-    if (uDebugLens == 1) finalRgb = infernoPalette(float(evals) / 4.0);
+    float phi = bXi.y * TWO_PI;
+    float u = (bXi.x - specProb) / max(1.0 - specProb, 1e-4);
+    bounceDir = normalize(ortho1 * cos(phi) * sqrt(u) + ortho2 * sin(phi) * sqrt(u) + N * sqrt(1.0 - u));
+    bounceW = (albedo * (1.0 - metallic)) / (1.0 - specProb);
   }
 
+  float t2 = 0.05;
+  bool hit2 = false;
+  vec3 ro2 = P + N * 0.025;
+  for (int s = 0; s < 20; ++s) {
+    float d2 = mapShadowSdf(ro2 + bounceDir * t2);
+    if (d2 < 0.01) { hit2 = true; break; }
+    t2 += clamp(d2, 0.05, 1.2);
+    if (t2 > 18.0) break;
+  }
+  if (!hit2) {
+    rad += bounceW * evalEnvironmentSky(bounceDir);
+  } else {
+    vec3 P2 = ro2 + bounceDir * t2;
+    vec3 bAlb = (P2.y < 0.04) ? vec3(0.14) : vec3(0.42);
+    rad += bounceW * evalEnvironmentHarmonics(vec3(0.0, 1.0, 0.0)) * bAlb;
+  }
+
+  vec3 finalRgb = (uDebugLens == 1) ? infernoPalette(float(evals) / 4.0) : rad;
   vec3 clampedRgb = clamp(finalRgb, vec3(0.0), vec3(32.0));
+
   if (uAccumFrame > 0) {
     vec4 prev = texelFetch(uPrevAccumTex, ivec2(gl_FragCoord.xy), 0);
     fragColor = prev + vec4(clampedRgb, 1.0);
@@ -1137,15 +1067,44 @@ function linkProgram(gl, vsSource, fsSource) {
   return prog;
 }
 
-const MAIN_UNIFORM_NAMES = [
-  "uResolution", "uCamPos", "uCamRight", "uCamUp", "uCamForward", "uTanHalfFov",
-  "uLightRegisterTex", "uIesAtlasTex", "uPrevAccumTex",
+function createSurfaceGpuBuffers(gl, geom) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+  const norBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, norBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+
+  const matBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, matBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, geom.matIds, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
+
+  const idxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.STATIC_DRAW);
+
+  gl.bindVertexArray(null);
+  return { vao, indexCount: geom.indices.length, buffers: [posBuf, norBuf, matBuf, idxBuf] };
+}
+
+const SURFACE_UNIFORM_NAMES = [
+  "uObjPos", "uObjYaw", "uIsPylonInstanced", "uEmissivePylonCount",
+  "uCamPos", "uCamRight", "uCamUp", "uCamForward", "uTanHalfFov", "uAspect", "uPtJitter",
+  "uResolution", "uLightRegisterTex", "uIesAtlasTex", "uPrevAccumTex",
   "uLuminaireCount", "uPartitionCellCount", "uRenderEngine", "uSchedulerMode",
   "uDebugLens", "uEnvPreset", "uMatCapLightBlend", "uSdfVoxelDefectDemo",
-  "uAccumFrame", "uTimeSec", "uExposure",
-  "uCarPos", "uCarYaw", "uPrevCarPos", "uPrevCarYaw",
-  "uHeadlampIntensity", "uHighBeamActive", "uDrlActive", "uBrakeActive",
-  "uTurnSignalActive", "uEmissivePylonCount",
+  "uAccumFrame", "uTimeSec", "uCarPos", "uCarYaw", "uPrevCarPos",
+  "uHeadlampIntensity", "uDrlActive", "uBrakeActive", "uTurnSignalActive",
   "uSunDir", "uSunColor", "uEnvSh[0]",
 ];
 
@@ -1161,18 +1120,27 @@ export class LightingGpuViewport {
       alpha: false,
       powerPreference: "high-performance",
     });
-    if (!gl) {
-      throw new Error("WebGL2 is required for LightingArchitectureLab.");
-    }
+    if (!gl) throw new Error("WebGL2 is required for LightingArchitectureLab.");
+
     this.gl = gl;
     this.contextLost = false;
     this.floatFboExt = gl.getExtension("EXT_color_buffer_float");
     this.halfFloatFboExt = gl.getExtension("EXT_color_buffer_half_float");
 
-    this.rtProg = linkProgram(gl, VERTEX_SHADER_SRC, REALTIME_FRAGMENT_SRC);
-    this.ptProg = null; // Compiled on first click of PathTracer tab so initial boot is instant!
-    this.blitProg = linkProgram(gl, VERTEX_SHADER_SRC, BLIT_FRAGMENT_SRC);
+    this.skyProg = linkProgram(gl, SKY_VERTEX_SRC, SKY_FRAGMENT_SRC);
+    this.rtProg = linkProgram(gl, GEOM_VERTEX_SRC, REALTIME_FRAGMENT_SRC);
+    this.ptProg = null;
+    this.blitProg = linkProgram(gl, BLIT_VERTEX_SRC, BLIT_FRAGMENT_SRC);
     this.emptyVao = gl.createVertexArray();
+
+    // Build GPU triangle geometry buffers
+    this.vehicleSurf = createSurfaceGpuBuffers(gl, buildVehicleGeometry());
+    this.pylonSurf = createSurfaceGpuBuffers(gl, buildSinglePylonGeometry());
+    this.envSurfs = [
+      createSurfaceGpuBuffers(gl, buildStaticEnvironmentGeometry(0)),
+      createSurfaceGpuBuffers(gl, buildStaticEnvironmentGeometry(1)),
+      createSurfaceGpuBuffers(gl, buildStaticEnvironmentGeometry(2)),
+    ];
 
     this.lightRegisterTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.lightRegisterTex);
@@ -1193,11 +1161,17 @@ export class LightingGpuViewport {
     this.accumWidth = 0;
     this.accumHeight = 0;
     this.accumTextures = [null, null];
+    this.accumDepths = [null, null];
     this.accumFbos = [null, null];
     this.accumIndex = 0;
     this.accumFrame = 0;
 
-    this.rtUniforms = this._collectUniforms(this.rtProg, MAIN_UNIFORM_NAMES);
+    this.skyUniforms = this._collectUniforms(this.skyProg, [
+      "uCamRight", "uCamUp", "uCamForward", "uTanHalfFov", "uAspect",
+      "uEnvPreset", "uDebugLens", "uIsPathTracer", "uAccumFrame", "uPrevAccumTex",
+      "uSunDir", "uSunColor",
+    ]);
+    this.rtUniforms = this._collectUniforms(this.rtProg, SURFACE_UNIFORM_NAMES);
     this.ptUniforms = null;
     this.blitUniforms = {
       uAccumTex: gl.getUniformLocation(this.blitProg, "uAccumTex"),
@@ -1207,9 +1181,7 @@ export class LightingGpuViewport {
 
   _collectUniforms(prog, names) {
     const out = {};
-    for (const n of names) {
-      out[n] = this.gl.getUniformLocation(prog, n);
-    }
+    for (const n of names) out[n] = this.gl.getUniformLocation(prog, n);
     return out;
   }
 
@@ -1244,6 +1216,7 @@ export class LightingGpuViewport {
 
     for (let i = 0; i < 2; ++i) {
       if (this.accumTextures[i]) gl.deleteTexture(this.accumTextures[i]);
+      if (this.accumDepths[i]) gl.deleteRenderbuffer(this.accumDepths[i]);
       if (this.accumFbos[i]) gl.deleteFramebuffer(this.accumFbos[i]);
 
       const tex = gl.createTexture();
@@ -1254,11 +1227,22 @@ export class LightingGpuViewport {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
+      const depthRb = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+
       const fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && internalFmt !== gl.RGBA8) {
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      }
 
       this.accumTextures[i] = tex;
+      this.accumDepths[i] = depthRb;
       this.accumFbos[i] = fbo;
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1271,7 +1255,6 @@ export class LightingGpuViewport {
     const renderScale = params.renderScale || 1.0;
     const w = Math.max(240, Math.floor(this.canvas.clientWidth * renderScale));
     const h = Math.max(160, Math.floor(this.canvas.clientHeight * renderScale));
-
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
@@ -1279,21 +1262,48 @@ export class LightingGpuViewport {
 
     const isPt = params.renderEngine === 4;
     if (isPt && !this.ptProg) {
-      this.ptProg = linkProgram(gl, VERTEX_SHADER_SRC, PATHTRACER_FRAGMENT_SRC);
-      this.ptUniforms = this._collectUniforms(this.ptProg, MAIN_UNIFORM_NAMES);
+      this.ptProg = linkProgram(gl, GEOM_VERTEX_SRC, PATHTRACER_FRAGMENT_SRC);
+      this.ptUniforms = this._collectUniforms(this.ptProg, SURFACE_UNIFORM_NAMES);
     }
 
     this._ensureAccumTargets(w, h);
     const readIdx = this.accumIndex;
     const writeIdx = 1 - this.accumIndex;
-
-    const prog = isPt ? this.ptProg : this.rtProg;
-    const u = isPt ? this.ptUniforms : this.rtUniforms;
+    const aspect = w / Math.max(h, 1);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFbos[writeIdx]);
     gl.viewport(0, 0, w, h);
-    gl.useProgram(prog);
+
+    // 1. Background Sky / Studio Cove Pass (always writes background, disables depth write)
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.useProgram(this.skyProg);
     gl.bindVertexArray(this.emptyVao);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.accumTextures[readIdx]);
+    gl.uniform1i(this.skyUniforms.uPrevAccumTex, 2);
+    gl.uniform3fv(this.skyUniforms.uCamRight, params.camRight);
+    gl.uniform3fv(this.skyUniforms.uCamUp, params.camUp);
+    gl.uniform3fv(this.skyUniforms.uCamForward, params.camForward);
+    gl.uniform1f(this.skyUniforms.uTanHalfFov, params.tanHalfFov);
+    gl.uniform1f(this.skyUniforms.uAspect, aspect);
+    gl.uniform1i(this.skyUniforms.uEnvPreset, params.envPreset);
+    gl.uniform1i(this.skyUniforms.uDebugLens, params.debugLens);
+    gl.uniform1i(this.skyUniforms.uIsPathTracer, isPt ? 1 : 0);
+    gl.uniform1i(this.skyUniforms.uAccumFrame, this.accumFrame);
+    gl.uniform3fv(this.skyUniforms.uSunDir, params.sunDir);
+    gl.uniform3fv(this.skyUniforms.uSunColor, params.sunColor);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 2. Forward Surface Geometry Pass with Hardware Depth Test
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.depthMask(true);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+
+    const prog = isPt ? this.ptProg : this.rtProg;
+    const u = isPt ? this.ptUniforms : this.rtUniforms;
+    gl.useProgram(prog);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.lightRegisterTex);
@@ -1307,12 +1317,21 @@ export class LightingGpuViewport {
     gl.bindTexture(gl.TEXTURE_2D, this.accumTextures[readIdx]);
     gl.uniform1i(u.uPrevAccumTex, 2);
 
+    let jx = 0.0, jy = 0.0;
+    if (isPt && this.accumFrame > 0) {
+      const a1 = 0.754877666, a2 = 0.569840291;
+      jx = (((this.accumFrame * a1) % 1) - 0.5) / w;
+      jy = (((this.accumFrame * a2) % 1) - 0.5) / h;
+    }
+
     gl.uniform2f(u.uResolution, w, h);
     gl.uniform3fv(u.uCamPos, params.camPos);
     gl.uniform3fv(u.uCamRight, params.camRight);
     gl.uniform3fv(u.uCamUp, params.camUp);
     gl.uniform3fv(u.uCamForward, params.camForward);
     gl.uniform1f(u.uTanHalfFov, params.tanHalfFov);
+    gl.uniform1f(u.uAspect, aspect);
+    gl.uniform2f(u.uPtJitter, jx, jy);
 
     gl.uniform1i(u.uLuminaireCount, params.luminaireCount);
     gl.uniform1i(u.uPartitionCellCount, params.partitionCellCount);
@@ -1324,14 +1343,11 @@ export class LightingGpuViewport {
     gl.uniform1i(u.uSdfVoxelDefectDemo, params.sdfVoxelDefectDemo ? 1 : 0);
     gl.uniform1i(u.uAccumFrame, this.accumFrame);
     gl.uniform1f(u.uTimeSec, params.timeSec);
-    gl.uniform1f(u.uExposure, params.exposure);
 
     gl.uniform3fv(u.uCarPos, params.carPos);
     gl.uniform1f(u.uCarYaw, params.carYaw);
     gl.uniform3fv(u.uPrevCarPos, params.prevCarPos);
-    gl.uniform1f(u.uPrevCarYaw, params.prevCarYaw);
     gl.uniform1f(u.uHeadlampIntensity, params.headlampIntensity);
-    gl.uniform1f(u.uHighBeamActive, params.highBeamActive ? 1.0 : 0.0);
     gl.uniform1f(u.uDrlActive, params.drlActive ? 1.0 : 0.0);
     gl.uniform1f(u.uBrakeActive, params.brakeActive ? 1.0 : 0.0);
     gl.uniform1f(u.uTurnSignalActive, params.turnSignalActive ? 1.0 : 0.0);
@@ -1341,11 +1357,36 @@ export class LightingGpuViewport {
     gl.uniform3fv(u.uSunColor, params.sunColor);
     gl.uniform3fv(u["uEnvSh[0]"], params.envSh);
 
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // Draw 2a: Static Lobby Stage (floor, walls, spheres, softbox)
+    const envSurf = this.envSurfs[params.envPreset] || this.envSurfs[0];
+    gl.uniform3f(u.uObjPos, 0.0, 0.0, 0.0);
+    gl.uniform1f(u.uObjYaw, 0.0);
+    gl.uniform1i(u.uIsPylonInstanced, 0);
+    gl.bindVertexArray(envSurf.vao);
+    gl.drawElements(gl.TRIANGLES, envSurf.indexCount, gl.UNSIGNED_SHORT, 0);
 
+    // Draw 2b: Hero GT Coupe
+    gl.uniform3fv(u.uObjPos, params.carPos);
+    gl.uniform1f(u.uObjYaw, params.carYaw);
+    gl.uniform1i(u.uIsPylonInstanced, 0);
+    gl.bindVertexArray(this.vehicleSurf.vao);
+    gl.drawElements(gl.TRIANGLES, this.vehicleSurf.indexCount, gl.UNSIGNED_SHORT, 0);
+
+    // Draw 2c: Instanced Emissive Light Pylons (0..48 in 1 GPU call!)
+    if (params.emissivePylonCount > 0) {
+      gl.uniform3f(u.uObjPos, 0.0, 0.0, 0.0);
+      gl.uniform1f(u.uObjYaw, 0.0);
+      gl.uniform1i(u.uIsPylonInstanced, 1);
+      gl.bindVertexArray(this.pylonSurf.vao);
+      gl.drawElementsInstanced(gl.TRIANGLES, this.pylonSurf.indexCount, gl.UNSIGNED_SHORT, 0, Math.min(48, params.emissivePylonCount));
+    }
+
+    // 3. Tone-mapped ACES + Gamma Blit to Canvas
+    gl.disable(gl.DEPTH_TEST);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.blitProg);
+    gl.bindVertexArray(this.emptyVao);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.accumTextures[writeIdx]);
     gl.uniform1i(this.blitUniforms.uAccumTex, 0);

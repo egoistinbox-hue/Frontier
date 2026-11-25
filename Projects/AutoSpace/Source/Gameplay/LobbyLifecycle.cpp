@@ -10,6 +10,7 @@
 #include "Source/Gameplay/LobbyLifecycle.h"
 
 #include "Engine/Codecs/PhotometrySpaceCodec.h"
+#include "Engine/Mathematics/CoordinateSpace.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,6 +50,16 @@ void LobbyLifecycle::ClearLobbyObjects() noexcept
     ManagedCategoryHandles.clear();
     FolderTokens.clear();
     SceneSyncBridge.ClearBindings();
+#if FRONTIER_PROFILE_EDITOR
+    if (EditorBridge != nullptr)
+    {
+        EditorBridge->Unbind();
+    }
+    if (BoundOutliner != nullptr)
+    {
+        BoundOutliner->ClearAll();
+    }
+#endif
     WorldRegister.ClearAll();
     WorldScene = {};
     GeometryAssets.clear();
@@ -423,8 +434,12 @@ void LobbyLifecycle::AppendParticleEmitter(
     {
         if (auto CloudOpt = ParticleTemplates.ConstructParticleCloud(ParticleSpecs, TemplateId, NodeId))
         {
-            CloudOpt->Evaluated.Count    = std::max(16u, std::min(ParticleCount, 1024u));
-            CloudOpt->Evaluated.Position = { WorldOriginZUp.X, WorldOriginZUp.Z, -WorldOriginZUp.Y };
+            CloudOpt->Evaluated.Count = std::max(16u, std::min(ParticleCount, 1024u));
+            const Axis3D ParticleOriginYUp = ConvertVectorBetweenBases(
+                WorldOriginZUp,
+                WorldCoordinateBasis::RightHandedZUp,
+                WorldCoordinateBasis::RightHandedYUp);
+            CloudOpt->Evaluated.Position = { ParticleOriginYUp.X, ParticleOriginYUp.Y, ParticleOriginYUp.Z };
             ParticleClouds.push_back(std::move(*CloudOpt));
         }
     }
@@ -459,7 +474,7 @@ void LobbyLifecycle::FinalizeWorldSceneAcceleration()
                 {
                     continue;
                 }
-                const Axis3D FlatN = NormalizeVectorSafe(CrossN, { 0.0f, 0.0f, 1.0f });
+                const Axis3D FlatN = NormalizeAxis(CrossN, { 0.0f, 0.0f, 1.0f });
                 SpatialAcceleration::RayTrianglePrimitive Prim {};
                 Prim.Corner0          = P0;
                 Prim.Edge01           = P1 - P0;
@@ -470,17 +485,15 @@ void LobbyLifecycle::FinalizeWorldSceneAcceleration()
                 WorldPrims.push_back(Prim);
 
                 SpatialAcceleration::TriangleSmoothNormals SN {};
-                SN.Normal0 = (Tri.PackedNormal0 != 0u) ? NormalizeVectorSafe(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal0), FlatN) : FlatN;
-                SN.Normal1 = (Tri.PackedNormal1 != 0u) ? NormalizeVectorSafe(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal1), FlatN) : FlatN;
-                SN.Normal2 = (Tri.PackedNormal2 != 0u) ? NormalizeVectorSafe(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal2), FlatN) : FlatN;
+                SN.Normal0 = (Tri.PackedNormal0 != 0u) ? NormalizeAxis(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal0), FlatN) : FlatN;
+                SN.Normal1 = (Tri.PackedNormal1 != 0u) ? NormalizeAxis(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal1), FlatN) : FlatN;
+                SN.Normal2 = (Tri.PackedNormal2 != 0u) ? NormalizeAxis(SpatialAcceleration::UnpackClusterOctahedralUnitVector(Tri.PackedNormal2), FlatN) : FlatN;
                 WorldNormals.push_back(SN);
             }
         }
     }
 
     (void)WorldScene.SceneTree.BuildFromTrianglePrimitivesWithNormals(WorldPrims, WorldNormals);
-    WorldScene.CompressedSceneTree.Reset();
-    (void)WorldScene.CompressedSceneTree.BuildFromPrimitives(WorldPrims, WorldNormals);
 }
 
 void LobbyLifecycle::TickSimulation(double FixedDeltaSeconds) noexcept
@@ -500,31 +513,6 @@ void LobbyLifecycle::TickSimulation(double FixedDeltaSeconds) noexcept
             static_cast<float>(SimulationClockSeconds),
             Dt);
     }
-}
-
-bool LobbyLifecycle::RenderVisualProof(
-    const std::filesystem::path& OutputDirectory,
-    const std::filesystem::path& RepoRoot,
-    uint32_t                     WidthPx,
-    uint32_t                     HeightPx,
-    std::string&                 OutDiagnostic)
-{
-    return RenderWorldVisualProof(
-        WorldScene,
-        CameraPresets,
-        ActivePolicy.ActiveCameraPresetIndex,
-        ActivePolicy.EnableEngineParticles,
-        ParticleClouds,
-        ParticleSimulation,
-        ParticleRenderer,
-        ParticleRegion,
-        SimulationClockSeconds,
-        LobbyPolicyEngine::QuerySlug(ActivePolicy.SelectedLobby),
-        OutputDirectory,
-        RepoRoot,
-        WidthPx,
-        HeightPx,
-        OutDiagnostic);
 }
 
 LobbyLifecycleTelemetry LobbyLifecycle::InspectTelemetry() const noexcept

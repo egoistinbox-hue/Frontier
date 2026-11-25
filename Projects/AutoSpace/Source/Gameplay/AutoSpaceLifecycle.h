@@ -68,12 +68,6 @@ public:
     // Switches active lobby inside the same MainWorld.WorldSpace level (zero level switching)
     [[nodiscard]] bool SelectStudioLobby(StudioLobbyId Lobby, std::string& OutDiagnostic);
 
-    [[nodiscard]] bool RenderLobbyVisualProof(
-        const std::filesystem::path& OutputDirectory,
-        uint32_t                     WidthPx,
-        uint32_t                     HeightPx,
-        std::string&                 OutDiagnostic);
-
     uint32_t RunBoundedTicks(uint32_t MaximumOuterTicks, double WallStepSeconds = 1.0 / 60.0) noexcept;
 
     [[nodiscard]] bool VerifyProjectContracts(std::string& OutDiagnostic) const;
@@ -84,6 +78,7 @@ public:
 
     [[nodiscard]] AutoSpaceLoopMetrics                   InspectMetrics() const noexcept;
     [[nodiscard]] const AutoSpacePolicyBundle&           InspectPolicies() const noexcept { return Policies; }
+    [[nodiscard]] LobbyLifecycle&                        AccessLobbyLifecycle() noexcept { return Lobby; }
     [[nodiscard]] const LobbyLifecycle&                  InspectLobbyLifecycle() const noexcept { return Lobby; }
     [[nodiscard]] Frontier::Lifecycle::RuntimeLifecycle& AccessRuntimeLoop() noexcept { return RuntimeLoop; }
     [[nodiscard]] Frontier::Lifecycle::RuntimeWorldHost& AccessWorldHost() noexcept { return WorldHost; }

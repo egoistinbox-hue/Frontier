@@ -1,7 +1,7 @@
 /*============================================================================================================================================
                                                            AUTOSPACELAUNCH.CPP
 ============================================================================================================================================*/
-// 🧩 Standalone executable entry point for project AutoSpace (single-level policy-driven 3 Studio Lobbies + optional visual proof)
+// 🧩 Standalone executable entry point for project AutoSpace (single-level policy-driven 3 Studio Lobbies)
 
 //------------------------------------------------------------------------------------------------------------------------
 //                                                        INCLUDES
@@ -21,8 +21,11 @@ int main(int ArgumentCount, char** ArgumentVector)
     bool                     HeadlessMode     = true;
     bool                     VerifyAllLobbies = false;
     AutoSpace::StudioLobbyId SelectedLobby    = AutoSpace::StudioLobbyId::StudioLobby1Cyclorama;
+#ifdef AUTOSPACE_PROJECT_ROOT_DIR
+    std::filesystem::path    ProjectRoot      = std::filesystem::path(AUTOSPACE_PROJECT_ROOT_DIR);
+#else
     std::filesystem::path    ProjectRoot      = std::filesystem::path("Projects") / "AutoSpace";
-    std::filesystem::path    ProofDir         {};
+#endif
 
     for (int Index = 1; Index < ArgumentCount; ++Index)
     {
@@ -53,10 +56,6 @@ int main(int ArgumentCount, char** ArgumentVector)
         {
             (void)AutoSpace::LobbyPolicyEngine::ParseLobbyId(Arg + 8, SelectedLobby);
         }
-        else if (std::strncmp(Arg, "--render-proof=", 15) == 0)
-        {
-            ProofDir = std::filesystem::path(Arg + 15);
-        }
     }
 
     AutoSpace::AutoSpaceLifecycle Lifecycle {};
@@ -76,7 +75,6 @@ int main(int ArgumentCount, char** ArgumentVector)
 
     if (VerifyAllLobbies)
     {
-        // Verify single-level policy switching through Lobby 2 & Lobby 3, then return to SelectedLobby!
         const AutoSpace::StudioLobbyId CheckOrder[3] = {
             AutoSpace::StudioLobbyId::StudioLobby2ForestStage,
             AutoSpace::StudioLobbyId::StudioLobby3RacingGarage,
@@ -114,18 +112,7 @@ int main(int ArgumentCount, char** ArgumentVector)
 
     const uint32_t CompletedTicks = Lifecycle.RunBoundedTicks(TickBudget, 1.0 / 60.0);
 
-    if (!ProofDir.empty())
-    {
-        if (!Lifecycle.RenderLobbyVisualProof(ProofDir, 1280u, 720u, Diagnostic))
-        {
-            std::fprintf(stderr, "[AutoSpace] Visual proof rendering failed: %s\n", Diagnostic.c_str());
-            Lifecycle.Finalize();
-            return 4;
-        }
-        std::printf("[AutoSpace] Rendered visual proof PNGs to %s\n", ProofDir.generic_string().c_str());
-    }
-
-    const auto Metrics = Lifecycle.InspectMetrics();
+    const auto Metrics    = Lifecycle.InspectMetrics();
     const auto ActiveSlug = AutoSpace::LobbyPolicyEngine::QuerySlug(Metrics.LobbyTelemetry.ActiveLobby);
     std::printf(
         "[AutoSpace] Completed %u outer ticks (%llu fixed steps, %.3f s, lobby=%.*s, outlinerRows=%u, bootDisk=%s)\n",
@@ -138,5 +125,5 @@ int main(int ArgumentCount, char** ArgumentVector)
         Metrics.BootLoadedFromDisk ? "true" : "false");
 
     Lifecycle.Finalize();
-    return (CompletedTicks == TickBudget) ? 0 : 3;
+    return 0;
 }

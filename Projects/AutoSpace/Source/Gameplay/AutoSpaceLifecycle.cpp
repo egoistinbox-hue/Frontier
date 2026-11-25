@@ -65,7 +65,11 @@ bool AutoSpaceLifecycle::Initialize(
     std::filesystem::path EffectiveProjectRoot = ProjectRootPath;
     if (EffectiveProjectRoot.empty())
     {
+#ifdef AUTOSPACE_PROJECT_ROOT_DIR
+        EffectiveProjectRoot = std::filesystem::path(AUTOSPACE_PROJECT_ROOT_DIR);
+#else
         EffectiveProjectRoot = std::filesystem::path("Projects") / "AutoSpace";
+#endif
     }
     RepositoryRoot = LocateFrontierRepositoryRoot(EffectiveProjectRoot);
 
@@ -157,20 +161,6 @@ bool AutoSpaceLifecycle::SelectStudioLobby(StudioLobbyId LobbyId, std::string& O
     }
     Metrics.LobbyTelemetry = Lobby.InspectTelemetry();
     return true;
-}
-
-bool AutoSpaceLifecycle::RenderLobbyVisualProof(
-    const std::filesystem::path& OutputDirectory,
-    uint32_t                     WidthPx,
-    uint32_t                     HeightPx,
-    std::string&                 OutDiagnostic)
-{
-    if (!Initialized)
-    {
-        OutDiagnostic = "AutoSpaceLifecycle is not initialized.";
-        return false;
-    }
-    return Lobby.RenderVisualProof(OutputDirectory, RepositoryRoot, WidthPx, HeightPx, OutDiagnostic);
 }
 
 uint32_t AutoSpaceLifecycle::RunBoundedTicks(uint32_t MaximumOuterTicks, double WallStepSeconds) noexcept

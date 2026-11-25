@@ -15,13 +15,55 @@
 #include "Engine/World/WorldInstanceRegister.h"
 #include "Source/Geometry/StudioProceduralSurface.h"
 #include "Source/Policies/LobbyPolicy.h"
-#include "Source/Utility/StudioRenderUtility.h"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace AutoSpace
 {
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                       STRUCTURES
+//------------------------------------------------------------------------------------------------------------------------
+
+struct HtmlAimAngles
+{
+    float YawDeg   = 0.0f; // [deg] - HTML Y-up azimuth yaw
+    float PitchDeg = 0.0f; // [deg] - HTML Y-up elevation pitch
+};
+
+struct StudioCameraPresetView
+{
+    std::string                                       Id     {};
+    std::string                                       Label  {};
+    Frontier::GeometricRaster::PerspectiveCameraBasis Camera {};
+};
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                               SCENE PLACEMENT HELPERS
+//------------------------------------------------------------------------------------------------------------------------
+
+[[nodiscard]] HtmlAimAngles ComputeHtmlAimAngles(
+    Frontier::Mathematics::Axis3D FromHtml,
+    Frontier::Mathematics::Axis3D TargetHtml) noexcept;
+
+[[nodiscard]] uint64_t HashStableId64(std::string_view Text) noexcept;
+
+[[nodiscard]] Frontier::GeometricRaster::PolygonalAreaQuadLight MakeAimedAreaQuadLight(
+    Frontier::Mathematics::Axis3D    CenterWorld,
+    Frontier::Mathematics::Axis3D    AimTargetWorld,
+    float                            WidthMeters,
+    float                            HeightMeters,
+    Frontier::Mathematics::LinearRGB Radiance,
+    bool                             TwoSided = false) noexcept;
+
+[[nodiscard]] Frontier::GeometricRaster::PhotometricPointRadiator MakeAimedPhotometricSpotLight(
+    Frontier::Mathematics::Axis3D    PosWorld,
+    Frontier::Mathematics::Axis3D    TargetWorld,
+    Frontier::Mathematics::LinearRGB PeakRgb,
+    float                            RangeMeters,
+    uint32_t                         ProfileOrdinal = 2u) noexcept;
 
 //------------------------------------------------------------------------------------------------------------------------
 //                                                       INTERFACE

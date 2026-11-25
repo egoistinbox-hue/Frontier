@@ -7,7 +7,7 @@ add_library(AutoSpaceProject STATIC
     Source/Policies/LobbyPolicy.cpp
     Source/Policies/AutoSpacePolicies.cpp
     Source/Geometry/StudioProceduralSurface.cpp
-    Source/Utility/StudioRenderUtility.cpp
+    Source/Levels/StudioLobbyWorldBuilder.cpp
     Source/Levels/Lobby1CycloramaLevel.cpp
     Source/Levels/Lobby2ForestStageLevel.cpp
     Source/Levels/Lobby3RacingGarageLevel.cpp
@@ -20,6 +20,10 @@ target_include_directories(AutoSpaceProject PUBLIC
 )
 target_link_libraries(AutoSpaceProject PUBLIC
     FrontierEngine
+    FrontierCompileSettings
+)
+target_compile_definitions(AutoSpaceProject PUBLIC
+    AUTOSPACE_PROJECT_ROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_compile_features(AutoSpaceProject PUBLIC cxx_std_20)
 

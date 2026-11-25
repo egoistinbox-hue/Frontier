@@ -241,6 +241,7 @@ set(FRONTIER_UI_COMPONENT_SOURCES
     Engine/Components/Panes/ExecutionSequencePane.cpp
     Engine/Components/Panes/OutlinerPanel.cpp
     Engine/Components/Panes/InspectorPanel.cpp
+    Engine/Components/Panes/BotanicalInspectorSection.cpp
     Engine/Components/Panes/ViewportPanel.cpp
     Engine/Components/Panes/ViewportProjectionPane.cpp
     Engine/Components/Panes/DeterministicPathTracerPane.cpp
@@ -951,6 +952,7 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/GeometrySpace/Procedural/ProceduralGeometry.cpp
     Engine/GeometrySpace/Procedural/Botanical/BotanicalSpeciesSchema.cpp
     Engine/GeometrySpace/Procedural/Botanical/BotanicalThinLeafSdf.cpp
+    Engine/GeometrySpace/Procedural/Botanical/BotanicalWeldedManifold.cpp
     Engine/GeometrySpace/Procedural/Botanical/BotanicalGenerator.cpp
     Engine/GeometrySpace/Procedural/Botanical/BotanicalWorldPartition.cpp
     Engine/GeometrySpace/Procedural/Botanical/BotanicalThumbnailBaker.cpp

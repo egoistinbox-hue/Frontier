@@ -175,21 +175,8 @@ BakedPlantThumbnail BakePlant3dThumbnail(
         const int minY = std::clamp(static_cast<int>(std::floor(std::min({ y0, y1, y2 }))), 0, static_cast<int>(ssH) - 1);
         const int maxY = std::clamp(static_cast<int>(std::ceil( std::max({ y0, y1, y2 }))), 0, static_cast<int>(ssH) - 1);
 
-        // Double-sided foliage normal orientation toward camera
-        V3 n = tri.Normal;
-        if (Dot3(n, camFwd) > 0.0f) n = Mul3(n, -1.0f);
-
-        const float ndl  = std::max(0.0f, Dot3(n, keyDir));
-        const float sss  = (tri.Part == BotanicalPartTag::Leaf) ? std::max(0.0f, Dot3(Mul3(n, -1.0f), keyDir)) * 0.42f : 0.0f;
-        const float rim  = std::pow(1.0f - std::clamp(std::fabs(Dot3(n, camFwd)), 0.0f, 1.0f), 2.2f) * std::max(0.25f, Dot3(n, rimDir) * 0.5f + 0.5f);
-        const float hemi = 0.5f + 0.5f * n[2];
-
         const float avgZ = (tri.V0[2] + tri.V1[2] + tri.V2[2]) * 0.3333f;
         const float heightAo = 0.55f + 0.45f * std::clamp((avgZ - bMin[2]) / std::max(0.2f, spanZ), 0.0f, 1.0f);
-
-        const float litR = tri.ColorLin[0] * (1.35f * ndl + 0.34f * hemi + sss * 1.15f) * heightAo + rim * 0.09f;
-        const float litG = tri.ColorLin[1] * (1.35f * ndl + 0.38f * hemi + sss * 1.35f) * heightAo + rim * 0.12f;
-        const float litB = tri.ColorLin[2] * (1.28f * ndl + 0.44f * hemi + sss * 0.65f) * heightAo + rim * 0.08f;
 
         const float invArea = 1.0f / area;
         for (int py = minY; py <= maxY; ++py)
@@ -208,6 +195,19 @@ BakedPlantThumbnail BakePlant3dThumbnail(
                 if (depth < depthBuf[idx])
                 {
                     depthBuf[idx] = depth;
+                    V3 n = Norm3({
+                        w0 * tri.N0[0] + w1 * tri.N1[0] + w2 * tri.N2[0],
+                        w0 * tri.N0[1] + w1 * tri.N1[1] + w2 * tri.N2[1],
+                        w0 * tri.N0[2] + w1 * tri.N1[2] + w2 * tri.N2[2]
+                    });
+                    if (Dot3(n, camFwd) > 0.0f) n = Mul3(n, -1.0f);
+                    const float ndl  = std::max(0.0f, Dot3(n, keyDir));
+                    const float sss  = (tri.Part == BotanicalPartTag::Leaf) ? std::max(0.0f, Dot3(Mul3(n, -1.0f), keyDir)) * 0.42f : 0.0f;
+                    const float rim  = std::pow(1.0f - std::clamp(std::fabs(Dot3(n, camFwd)), 0.0f, 1.0f), 2.2f) * std::max(0.25f, Dot3(n, rimDir) * 0.5f + 0.5f);
+                    const float hemi = 0.5f + 0.5f * n[2];
+                    const float litR = tri.ColorLin[0] * (1.35f * ndl + 0.34f * hemi + sss * 1.15f) * heightAo + rim * 0.09f;
+                    const float litG = tri.ColorLin[1] * (1.35f * ndl + 0.38f * hemi + sss * 1.35f) * heightAo + rim * 0.12f;
+                    const float litB = tri.ColorLin[2] * (1.28f * ndl + 0.44f * hemi + sss * 0.65f) * heightAo + rim * 0.08f;
                     colorBuf[idx] = { litR, litG, litB, 1.0f };
                 }
             }

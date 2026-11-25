@@ -421,7 +421,9 @@ void RenderBotanical3dScene(
         return true;
     };
 
-    auto rasterTri = [&](const V3& v0, const V3& v1, const V3& v2, const V3& nIn, const V3& baseCol, BotanicalPartTag part, float hFrac)
+    auto rasterTri = [&](const V3& v0, const V3& v1, const V3& v2,
+                         const V3& n0In, const V3& n1In, const V3& n2In,
+                         const V3& baseCol, BotanicalPartTag part, float hFrac)
     {
         float x0 = 0.0f, y0 = 0.0f, z0 = 0.0f;
         float x1 = 0.0f, y1 = 0.0f, z1 = 0.0f;
@@ -435,25 +437,10 @@ void RenderBotanical3dScene(
         const int minY = std::clamp(static_cast<int>(std::floor(std::min({ y0, y1, y2 }))), 0, vpH - 1);
         const int maxY = std::clamp(static_cast<int>(std::ceil( std::max({ y0, y1, y2 }))), 0, vpH - 1);
 
-        V3 n = nIn;
-        if (Dot3(n, fwd) > 0.0f) n = Mul3(n, -1.0f);
-        const float ndl  = std::max(0.0f, Dot3(n, sunDir));
-        const float sss  = (part == BotanicalPartTag::Leaf) ? std::max(0.0f, Dot3(Mul3(n, -1.0f), sunDir)) * 0.45f : 0.0f;
-        const float hemi = 0.5f + 0.5f * n[2];
         const float ao   = 0.52f + 0.48f * std::clamp(hFrac, 0.0f, 1.0f);
-        const float rim  = std::pow(1.0f - std::clamp(std::fabs(Dot3(n, fwd)), 0.0f, 1.0f), 2.5f) * 0.06f;
-
         const float avgDepth = (z0 + z1 + z2) * 0.3333f;
         const float fog = 1.0f - std::exp(-avgDepth * 0.011f);
-        const V3 lit {
-            baseCol[0] * (1.42f * ndl + 0.30f * hemi + sss * 1.10f) * ao + rim,
-            baseCol[1] * (1.38f * ndl + 0.34f * hemi + sss * 1.32f) * ao + rim * 1.2f,
-            baseCol[2] * (1.26f * ndl + 0.42f * hemi + sss * 0.62f) * ao + rim * 0.8f
-        };
         const V3 haze { 0.45f, 0.58f, 0.75f };
-        const uint8_t cr = LinToSrgb(AcesTone(lit[0] * (1.0f - fog) + haze[0] * fog));
-        const uint8_t cg = LinToSrgb(AcesTone(lit[1] * (1.0f - fog) + haze[1] * fog));
-        const uint8_t cb = LinToSrgb(AcesTone(lit[2] * (1.0f - fog) + haze[2] * fog));
 
         const float invArea = 1.0f / area;
         for (int py = minY; py <= maxY; ++py)
@@ -471,6 +458,24 @@ void RenderBotanical3dScene(
                 if (depth < zBuf[idx])
                 {
                     zBuf[idx] = depth;
+                    V3 n = Norm3({
+                        w0 * n0In[0] + w1 * n1In[0] + w2 * n2In[0],
+                        w0 * n0In[1] + w1 * n1In[1] + w2 * n2In[1],
+                        w0 * n0In[2] + w1 * n1In[2] + w2 * n2In[2]
+                    });
+                    if (Dot3(n, fwd) > 0.0f) n = Mul3(n, -1.0f);
+                    const float ndl  = std::max(0.0f, Dot3(n, sunDir));
+                    const float sss  = (part == BotanicalPartTag::Leaf) ? std::max(0.0f, Dot3(Mul3(n, -1.0f), sunDir)) * 0.45f : 0.0f;
+                    const float hemi = 0.5f + 0.5f * n[2];
+                    const float rim  = std::pow(1.0f - std::clamp(std::fabs(Dot3(n, fwd)), 0.0f, 1.0f), 2.5f) * 0.06f;
+                    const V3 lit {
+                        baseCol[0] * (1.42f * ndl + 0.30f * hemi + sss * 1.10f) * ao + rim,
+                        baseCol[1] * (1.38f * ndl + 0.34f * hemi + sss * 1.32f) * ao + rim * 1.2f,
+                        baseCol[2] * (1.26f * ndl + 0.42f * hemi + sss * 0.62f) * ao + rim * 0.8f
+                    };
+                    const uint8_t cr = LinToSrgb(AcesTone(lit[0] * (1.0f - fog) + haze[0] * fog));
+                    const uint8_t cg = LinToSrgb(AcesTone(lit[1] * (1.0f - fog) + haze[1] * fog));
+                    const uint8_t cb = LinToSrgb(AcesTone(lit[2] * (1.0f - fog) + haze[2] * fog));
                     canvas.BlendPx(vpX + px, vpY + py, cr, cg, cb, 255u);
                 }
             }
@@ -496,7 +501,9 @@ void RenderBotanical3dScene(
         for (const auto& tri : act.Mesh.Triangles)
         {
             const float hFrac = ((tri.V0[2] + tri.V1[2] + tri.V2[2]) * 0.3333f - act.Mesh.BoundsMin[2]) / spanZ;
-            rasterTri(xform(tri.V0), xform(tri.V1), xform(tri.V2), xformN(tri.Normal), tri.ColorLin, tri.Part, hFrac);
+            rasterTri(xform(tri.V0), xform(tri.V1), xform(tri.V2),
+                      xformN(tri.N0), xformN(tri.N1), xformN(tri.N2),
+                      tri.ColorLin, tri.Part, hFrac);
         }
     }
 
@@ -513,8 +520,8 @@ void RenderBotanical3dScene(
         const V3 p2 = Add3(lf.PositionMeters, axL);
         const V3 p3 = Sub3(lf.PositionMeters, axW);
         const V3 n  = Norm3(Cross3(Sub3(p1, p0), Sub3(p2, p0)));
-        rasterTri(p0, p1, p2, n, lf.ColorLinear, BotanicalPartTag::Leaf, (lf.State == FallingLeafState::Active) ? 0.9f : 0.45f);
-        rasterTri(p0, p2, p3, n, lf.ColorLinear, BotanicalPartTag::Leaf, (lf.State == FallingLeafState::Active) ? 0.9f : 0.45f);
+        rasterTri(p0, p1, p2, n, n, n, lf.ColorLinear, BotanicalPartTag::Leaf, (lf.State == FallingLeafState::Active) ? 0.9f : 0.45f);
+        rasterTri(p0, p2, p3, n, n, n, lf.ColorLinear, BotanicalPartTag::Leaf, (lf.State == FallingLeafState::Active) ? 0.9f : 0.45f);
     }
 }
 
@@ -584,15 +591,26 @@ int main()
     const BotanicalPlantBuildResult coconutMesh = BuildBotanicalPlant(*spCoconut, leafAtlas, 202u, 2u, true);
     const BotanicalPlantBuildResult oakMesh     = BuildBotanicalPlant(*spOak,     leafAtlas, 301u, 2u, true);
 
+    const auto& oakRep  = oakMesh.WoodManifoldReport;
+    const auto& dateRep = dateMesh.WoodManifoldReport;
+    const auto& cocoRep = coconutMesh.WoodManifoldReport;
+    const bool oakManifoldOk  = oakRep.Closed && oakRep.Manifold && oakRep.Components == 1u && oakRep.EulerCharacteristic == 2 && oakMesh.WoodBuildStats.Junctions >= 8u;
+    const bool palmManifoldOk = dateRep.Closed && dateRep.Manifold && dateRep.Components == 1u && dateRep.EulerCharacteristic == 2
+                             && cocoRep.Closed && cocoRep.Manifold && cocoRep.Components == 1u && cocoRep.EulerCharacteristic == 2;
+
     const bool gate2 = swordMesh.LeafTriCount > 400u && brackenMesh.LeafTriCount > 400u
                     && dateMesh.LeafTriCount > 800u && dateMesh.FruitTriCount > 200u
                     && coconutMesh.LeafTriCount > 800u && oakMesh.LeafTriCount > 800u
+                    && oakManifoldOk && palmManifoldOk
                     && oakMesh.Network.Faces.size() == oakMesh.Triangles.size()
                     && oakMesh.SdfVolume.OccupiedBricks > 12u;
     if (gate2) ++passedGates;
-    std::cout << "[Gate 2/8] Procedural Ferns -> Palms -> Oak (+Z Up)        : " << (gate2 ? "PASS" : "FAIL")
-              << " (Sword=" << swordMesh.Triangles.size() << "t, DatePalm=" << dateMesh.Triangles.size()
-              << "t, Oak=" << oakMesh.Triangles.size() << "t, OakBricks=" << oakMesh.SdfVolume.OccupiedBricks << ")\n";
+    std::cout << "[Gate 2/8] Welded Manifold Ferns -> Palms -> Oak (+Z Up)   : " << (gate2 ? "PASS" : "FAIL")
+              << " (Oak: V-E+F=" << oakRep.EulerCharacteristic << " Comp=" << oakRep.Components
+              << " Open=" << oakRep.BoundaryEdges << " Welds=" << oakMesh.WoodBuildStats.Junctions
+              << " Forks=" << oakMesh.WoodBuildStats.Forks
+              << ", DatePalm: V-E+F=" << dateRep.EulerCharacteristic << " Comp=" << dateRep.Components
+              << ", CocoPalm: V-E+F=" << cocoRep.EulerCharacteristic << " Comp=" << cocoRep.Components << ")\n";
 
     // ----------------------------------------------------------------------------------------------------------------
     // GATE 3: 2.5D Thin-Leaf 100% Survival (0.6mm) + 0.000mm Wood Joint Seam + 0.0000 Wind Bark Swim
@@ -820,9 +838,9 @@ int main()
         { "Sword Fern Cluster A",   swordMesh,   { -2.1f, -1.6f, 0.0f },  0.31f, 1.15f },
         { "Sword Fern Cluster B",   swordMesh,   {  1.9f, -2.0f, 0.0f },  1.95f, 1.05f },
         { "Bracken Fern Patch",     brackenMesh, { -0.3f, -2.7f, 0.0f },  4.18f, 1.12f },
-        { "Medjool Date Palm Hero", dateMesh,    { -4.6f,  2.2f, 0.0f },  0.61f, 1.00f },
-        { "Coastal Coconut Palm",   coconutMesh, {  4.8f,  2.6f, 0.0f },  2.65f, 0.98f },
-        { "Ancient English Oak",    oakMesh,     {  0.2f,  5.6f, 0.0f },  0.26f, 1.00f },
+        { "Medjool Date Palm Hero", dateMesh,    { -5.0f,  2.2f, 0.0f },  0.61f, 1.00f },
+        { "Coastal Coconut Palm",   coconutMesh, {  5.2f,  2.4f, 0.0f },  5.65f, 0.98f },
+        { "Ancient English Oak",    oakMesh,     {  0.0f,  5.6f, 0.0f },  0.26f, 1.00f },
     };
     (void)idxSwordA; (void)idxSwordB; (void)idxBracken; (void)idxDate; (void)idxCoco;
 
@@ -914,82 +932,131 @@ int main()
     // CENTER PANE: Live Sunlit 3D Viewport of Projects/Untitled (x: 314..1250, y: 36..920)
     const int vpX = 314, vpY = 36, vpW = 936, vpH = 884;
     RenderBotanical3dScene(uiCanvas, vpX, vpY, vpW, vpH, sceneActors, worldPart.Leaves(), leafAtlas,
-        { 0.3f, -10.8f, 3.6f }, { 0.1f, 2.2f, 2.5f }, sunDir, true, true);
+        { 0.1f, -13.2f, 4.1f }, { 0.0f, 2.2f, 3.2f }, sunDir, true, true);
     // Viewport subtle floating HUD pill (bottom-left)
     uiCanvas.FillRoundedRect(vpX + 16, vpY + 14, 412, 28, 12.0f, { 14u, 14u, 16u, 210u }, { 64u, 64u, 70u, 200u });
     uiCanvas.DrawText(vpX + 28, vpY + 24, "PROJECTS/UNTITLED  |  FERNS -> PALMS -> OAK  |  2.5D THIN-LEAF SDF", 1, { 222u, 222u, 219u, 255u });
     uiCanvas.FillRoundedRect(vpX + 16, vpY + vpH - 42, 488, 28, 12.0f, { 14u, 14u, 16u, 210u }, { 62u, 82u, 58u, 220u });
     uiCanvas.DrawText(vpX + 28, vpY + vpH - 32, "SDF SURVIVAL: 100.0%  |  BARK SWIM: 0.000  |  WORLDPARTITION SNAP: 0.00", 1, { 162u, 214u, 134u, 255u });
 
-    // RIGHT PANE: Frontier Geometry-Style Native Botanical Inspector (x: 1252..1600)
+    // RIGHT PANE: Exact Native Frontier Editor Inspector (`ScalarSlider::ConstructWithReadout` + `CapsuleButton::ConstructSegmented` + `ExclusiveSelector`)
     uiCanvas.FillRect(1250, 36, 2, 884, { 38u, 38u, 38u, 255u });
     uiCanvas.FillRect(1252, 36, 348, 884, { 18u, 18u, 18u, 255u });
     uiCanvas.DrawText(1268, 52, "INSPECTOR", 2, { 235u, 235u, 235u, 255u });
-    uiCanvas.DrawText(1476, 56, "ENGLISH OAK", 1, { 255u, 180u, 84u, 255u });
+    uiCanvas.DrawText(1476, 56, "ENGLISH OAK", 1, { 235u, 235u, 235u, 255u });
 
-    // Helper: Draw Native Frontier Geometry-Style Slider inside Inspector Card
-    auto drawNativeSlider = [&](int x, int y, int w, const char* label, const char* valStr, float frac)
+    // Exact 1:1 Frontier Editor `ScalarSlider::ConstructWithReadout` (from ScalarSlider.cpp & 02-ConstraintDetails.png!):
+    // - Label in muted dim ink above row
+    // - Left: Two-cell split capsule (`[ 8.80 | M ]`) with pure-black Field cell, dark Inset unit cell, hairline seam & rounded border
+    // - Right: Thick pill rail (`#252525`) + soft neutral light-gray fill (`#AEAEAE`) + crisp pure-white circular knob (`#FAFAFA`)
+    auto drawFrontierScalarSlider = [&](int x, int y, int w, const char* label, const char* numStr, const char* unitStr, float frac)
     {
-        uiCanvas.DrawText(x, y, label, 1, { 176u, 176u, 176u, 255u });
-        uiCanvas.DrawText(x + w - static_cast<int>(std::string(valStr).size()) * 6, y, valStr, 1, { 235u, 235u, 235u, 255u });
-        uiCanvas.FillRoundedRect(x, y + 14, w, 6, 3.0f, { 42u, 42u, 42u, 255u });
-        const int fillW = std::max(8, static_cast<int>(std::round(static_cast<float>(w) * std::clamp(frac, 0.0f, 1.0f))));
-        uiCanvas.FillRoundedRect(x, y + 14, fillW, 6, 3.0f, { 162u, 184u, 124u, 255u });
-        uiCanvas.FillCircle(static_cast<float>(x + fillW), static_cast<float>(y + 17), 6.0f, { 235u, 235u, 235u, 255u });
+        uiCanvas.DrawText(x, y, label, 1, { 154u, 154u, 154u, 255u });
+        const int ctrlY = y + 12;
+        const int rowH = 26;
+        const int capW = 92;
+        const int unitW = (unitStr && unitStr[0] != '\0') ? 32 : 0;
+        const int numW = capW - unitW;
+        const float capR = static_cast<float>(rowH) * 0.5f;
+
+        // Two-cell split readout capsule
+        uiCanvas.FillRoundedRect(x, ctrlY, capW, rowH, capR, { 27u, 27u, 27u, 255u }, { 56u, 56u, 56u, 255u });
+        uiCanvas.FillRoundedRect(x, ctrlY, numW, rowH, capR, { 0u, 0u, 0u, 255u });
+        if (unitW > 0)
+        {
+            uiCanvas.FillRect(x + static_cast<int>(capR), ctrlY + 1, numW - static_cast<int>(capR), rowH - 2, { 0u, 0u, 0u, 255u });
+            uiCanvas.FillRect(x + numW, ctrlY + 1, 1, rowH - 2, { 56u, 56u, 56u, 255u });
+        }
+        const int numTxtW = static_cast<int>(std::string(numStr).size()) * 6;
+        uiCanvas.DrawText(x + (numW - numTxtW) / 2, ctrlY + 9, numStr, 1, { 242u, 242u, 242u, 255u });
+        if (unitW > 0)
+        {
+            const int unitTxtW = static_cast<int>(std::string(unitStr).size()) * 6;
+            uiCanvas.DrawText(x + numW + (unitW - unitTxtW) / 2, ctrlY + 9, unitStr, 1, { 142u, 142u, 142u, 255u });
+        }
+
+        // Right: Exact Frontier thick neutral pill slider (SliderTrack -> SliderFill -> SliderThumb)
+        const int gap = 12;
+        const int slX = x + capW + gap;
+        const int slW = std::max(40, w - capW - gap);
+        const int railH = 22;
+        const int railY = ctrlY + (rowH - railH) / 2;
+        const float railR = static_cast<float>(railH) * 0.5f;
+        const float knobR = 10.0f;
+        const float minCx = static_cast<float>(slX) + railR;
+        const float maxCx = static_cast<float>(slX + slW) - railR;
+        const float knobCx = minCx + (maxCx - minCx) * std::clamp(frac, 0.0f, 1.0f);
+
+        uiCanvas.FillRoundedRect(slX, railY, slW, railH, railR, { 37u, 37u, 37u, 255u }, { 56u, 56u, 56u, 255u });
+        const int fillW = std::max(railH, static_cast<int>(std::round(knobCx + knobR - static_cast<float>(slX))));
+        uiCanvas.FillRoundedRect(slX, railY, std::min(slW, fillW), railH, railR, { 174u, 174u, 174u, 255u });
+        uiCanvas.FillCircle(knobCx, static_cast<float>(railY) + railR, knobR, { 250u, 250u, 250u, 255u });
     };
 
-    // Card 1: Species Asset Card (GenericSurface #1A1A1A, 22px radius — exact Frontier Geometry Inspector design!)
-    uiCanvas.FillRoundedRect(1264, 82, 324, 152, 22.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1282, 98, "BOTANICAL SPECIES ASSET", 1, { 214u, 219u, 207u, 255u });
+    // Exact Frontier `ExclusiveSelector::Construct` (44x24 rounded toggle switch — white track + dark thumb when ON)
+    auto drawFrontierToggle = [&](int x, int y, int w, const char* label, bool on)
+    {
+        uiCanvas.DrawText(x, y + 6, label, 1, { 164u, 164u, 164u, 255u });
+        const int tw = 42, th = 22;
+        const int tx = x + w - tw;
+        uiCanvas.FillRoundedRect(tx, y, tw, th, 11.0f,
+            on ? std::array<uint8_t,4>{ 242u, 242u, 242u, 255u } : std::array<uint8_t,4>{ 28u, 28u, 28u, 255u },
+            on ? std::array<uint8_t,4>{ 242u, 242u, 242u, 255u } : std::array<uint8_t,4>{ 62u, 62u, 62u, 255u });
+        uiCanvas.FillCircle(on ? static_cast<float>(tx + tw - 11) : static_cast<float>(tx + 11),
+                            static_cast<float>(y + 11), 8.5f,
+                            on ? std::array<uint8_t,4>{ 16u, 16u, 16u, 255u } : std::array<uint8_t,4>{ 140u, 140u, 140u, 255u });
+    };
+
+    // Card 1: Species Asset Card (GenericSurface #1A1A1A, 18px radius — exact Frontier Inspector Section!)
+    uiCanvas.FillRoundedRect(1264, 82, 324, 152, 18.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
+    uiCanvas.DrawText(1282, 98, "BOTANICAL SPECIES ASSET", 1, { 222u, 222u, 222u, 255u });
     uiCanvas.FillRect(1282, 114, 288, 1, { 52u, 52u, 52u, 255u });
     uiCanvas.BlitThumb(1282, 124, 58, 58, thOak, 10.0f);
-    // Native DropdownSelector pill
-    uiCanvas.FillRoundedRect(1350, 126, 220, 26, 8.0f, { 17u, 17u, 17u, 255u }, { 56u, 56u, 56u, 255u });
-    uiCanvas.DrawText(1360, 136, "ENGLISHOAK.BOTANICAL     V", 1, { 235u, 235u, 235u, 255u });
-    // Native ExclusiveSelector (FERN | PALM | TREE)
-    uiCanvas.FillRoundedRect(1350, 158, 220, 24, 12.0f, { 14u, 14u, 14u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1368, 167, "FERN", 1, { 130u, 130u, 130u, 255u });
-    uiCanvas.DrawText(1438, 167, "PALM", 1, { 130u, 130u, 130u, 255u });
-    uiCanvas.FillRoundedRect(1498, 160, 70, 20, 10.0f, { 46u, 54u, 40u, 255u }, { 162u, 184u, 124u, 220u });
-    uiCanvas.DrawText(1518, 167, "TREE", 1, { 235u, 235u, 235u, 255u });
-    // Native ConstructCream CapsuleButton
-    uiCanvas.FillRoundedRect(1282, 194, 138, 26, 13.0f, { 222u, 222u, 219u, 255u });
-    uiCanvas.DrawText(1306, 204, "REBUILD PLANT", 1, { 21u, 21u, 21u, 255u });
-    uiCanvas.FillRoundedRect(1430, 194, 140, 26, 13.0f, { 38u, 38u, 38u, 255u }, { 72u, 72u, 72u, 255u });
-    uiCanvas.DrawText(1450, 204, "BAKE 3D THUMB", 1, { 222u, 222u, 219u, 255u });
+    // Native DropdownSelector pill (#000000 Field)
+    uiCanvas.FillRoundedRect(1350, 126, 220, 26, 13.0f, { 0u, 0u, 0u, 255u }, { 56u, 56u, 56u, 255u });
+    uiCanvas.DrawText(1362, 136, "ENGLISHOAK.BOTANICAL    V", 1, { 242u, 242u, 242u, 255u });
+    // Exact Frontier Segmented Bar (`CapsuleButton::ConstructSegmented` — pure-white active pill, dark ink!)
+    uiCanvas.FillRoundedRect(1350, 158, 220, 26, 13.0f, { 8u, 8u, 8u, 255u }, { 52u, 52u, 52u, 255u });
+    uiCanvas.DrawText(1368, 168, "FERN", 1, { 134u, 134u, 134u, 255u });
+    uiCanvas.DrawText(1438, 168, "PALM", 1, { 134u, 134u, 134u, 255u });
+    uiCanvas.FillRoundedRect(1498, 160, 70, 22, 11.0f, { 244u, 244u, 244u, 255u });
+    uiCanvas.DrawText(1520, 168, "TREE", 1, { 16u, 16u, 16u, 255u });
+    // Native Frontier Primary / Secondary CapsuleButtons
+    uiCanvas.FillRoundedRect(1282, 196, 138, 26, 13.0f, { 242u, 242u, 242u, 255u });
+    uiCanvas.DrawText(1306, 206, "REBUILD PLANT", 1, { 16u, 16u, 16u, 255u });
+    uiCanvas.FillRoundedRect(1430, 196, 140, 26, 13.0f, { 34u, 34u, 34u, 255u }, { 66u, 66u, 66u, 255u });
+    uiCanvas.DrawText(1450, 206, "BAKE 3D THUMB", 1, { 232u, 232u, 232u, 255u });
 
-    // Card 2: Trunk, Roots & Canopy Morphology Card (Native Frontier ScalarSliders!)
-    uiCanvas.FillRoundedRect(1264, 248, 324, 230, 22.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1282, 264, "MORPHOLOGY & STEMS", 1, { 214u, 219u, 207u, 255u });
-    uiCanvas.FillRect(1282, 280, 288, 1, { 52u, 52u, 52u, 255u });
-    drawNativeSlider(1282, 294, 288, "TRUNK HEIGHT",         "8.80 M",  0.72f);
-    drawNativeSlider(1282, 330, 288, "ROOT FLARE & ROOTS",   "1.85 X",  0.64f);
-    drawNativeSlider(1282, 366, 288, "PIPE CONSERVATION",    "0.94",    0.84f);
-    drawNativeSlider(1282, 402, 288, "CANOPY LEAF DENSITY",  "1.05",    0.78f);
-    drawNativeSlider(1282, 438, 288, "BARK 3D FBM RELIEF",   "0.78",    0.78f);
+    // Card 2: Welded Manifold Morphology Card (Exact Frontier Split Readout + Thick Pill Sliders!)
+    uiCanvas.FillRoundedRect(1264, 246, 324, 252, 18.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
+    uiCanvas.DrawText(1282, 262, "WELDED MORPHOLOGY (V-E+F=2)", 1, { 222u, 222u, 222u, 255u });
+    uiCanvas.FillRect(1282, 278, 288, 1, { 52u, 52u, 52u, 255u });
+    drawFrontierScalarSlider(1282, 288, 288, "TRUNK HEIGHT",         "8.80", "M",   0.72f);
+    drawFrontierScalarSlider(1282, 336, 288, "ROOT FLARE & ROOTS",   "1.85", "X",   0.64f);
+    drawFrontierScalarSlider(1282, 384, 288, "PIPE CONSERVATION",    "0.94", "",    0.84f);
+    drawFrontierScalarSlider(1282, 432, 288, "CANOPY LEAF DENSITY",  "1.05", "X",   0.78f);
 
     // Card 3: 2.5D Thin-Leaf SDF & Canopy Brick Accelerator Card
-    uiCanvas.FillRoundedRect(1264, 492, 324, 166, 22.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1282, 508, "2.5D THIN-LEAF SDF & BRICKS", 1, { 214u, 219u, 207u, 255u });
-    uiCanvas.FillRect(1282, 524, 288, 1, { 52u, 52u, 52u, 255u });
-    uiCanvas.DrawText(1282, 538, "ARCHETYPE:  LOBED_OAK (64X64 EDT)", 1, { 162u, 184u, 124u, 255u });
-    uiCanvas.DrawText(1282, 558, "BRICKS: 16^3 CANOPY  |  0.6MM SHEET", 1, { 176u, 176u, 176u, 255u });
-    drawNativeSlider(1282, 580, 288, "CONEWID BEER-LAMBERT", "1.00 X", 0.50f);
-    drawNativeSlider(1282, 616, 288, "REST-SPACE BARK FREQ", "8.80",   0.58f);
+    uiCanvas.FillRoundedRect(1264, 510, 324, 178, 18.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
+    uiCanvas.DrawText(1282, 526, "2.5D THIN-LEAF SDF & BRICKS", 1, { 222u, 222u, 222u, 255u });
+    uiCanvas.FillRect(1282, 542, 288, 1, { 52u, 52u, 52u, 255u });
+    drawFrontierScalarSlider(1282, 552, 288, "CONEWID BEER-LAMBERT", "1.00", "X",   0.50f);
+    drawFrontierScalarSlider(1282, 600, 288, "REST-SPACE BARK FREQ", "8.80", "HZ",  0.58f);
+    drawFrontierToggle      (1282, 650, 288, "NOISY BARK CAPSULES",  true);
 
     // Card 4: WorldPartition GPU<->CPU & Falling Leaves Card
-    uiCanvas.FillRoundedRect(1264, 672, 324, 210, 22.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1282, 688, "WORLDPARTITION & WIND SIM", 1, { 214u, 219u, 207u, 255u });
-    uiCanvas.FillRect(1282, 704, 288, 1, { 52u, 52u, 52u, 255u });
-    uiCanvas.FillRoundedRect(1282, 716, 288, 24, 12.0f, { 14u, 14u, 14u, 255u }, { 48u, 48u, 48u, 255u });
-    uiCanvas.DrawText(1302, 725, "GPU ONLY", 1, { 112u, 152u, 206u, 255u });
-    uiCanvas.FillRoundedRect(1384, 718, 92, 20, 10.0f, { 52u, 46u, 28u, 255u }, { 255u, 180u, 84u, 220u });
-    uiCanvas.DrawText(1396, 725, "AUTO C1", 1, { 255u, 180u, 84u, 255u });
-    uiCanvas.DrawText(1490, 725, "CPU AUTH", 1, { 130u, 130u, 130u, 255u });
-    drawNativeSlider(1282, 752, 288, "WIND FLEXIBILITY",     "0.35",    0.35f);
-    drawNativeSlider(1282, 788, 288, "ABSCISSION SHED THR",  "18.0 N",  0.60f);
-    uiCanvas.DrawText(1282, 830, "CELL (0,0): DETERMINISTIC 120HZ CPU", 1, { 162u, 184u, 124u, 255u });
-    uiCanvas.DrawText(1282, 850, "4M SUBCELLS: ACTIVE / SLEEP / WAKE", 1, { 176u, 176u, 176u, 255u });
+    uiCanvas.FillRoundedRect(1264, 700, 324, 204, 18.0f, { 26u, 26u, 26u, 255u }, { 48u, 48u, 48u, 255u });
+    uiCanvas.DrawText(1282, 716, "WORLDPARTITION & WIND SIM", 1, { 222u, 222u, 222u, 255u });
+    uiCanvas.FillRect(1282, 732, 288, 1, { 52u, 52u, 52u, 255u });
+    // Exact Frontier Segmented Bar: GPU | AUTO C1 (pure-white active pill!) | CPU
+    uiCanvas.FillRoundedRect(1282, 742, 288, 26, 13.0f, { 8u, 8u, 8u, 255u }, { 52u, 52u, 52u, 255u });
+    uiCanvas.DrawText(1306, 752, "GPU ONLY", 1, { 134u, 134u, 134u, 255u });
+    uiCanvas.FillRoundedRect(1380, 744, 96, 22, 11.0f, { 244u, 244u, 244u, 255u });
+    uiCanvas.DrawText(1398, 752, "AUTO C1", 1, { 16u, 16u, 16u, 255u });
+    uiCanvas.DrawText(1494, 752, "CPU AUTH", 1, { 134u, 134u, 134u, 255u });
+    drawFrontierScalarSlider(1282, 778, 288, "WIND FLEXIBILITY",     "0.35", "X",   0.35f);
+    drawFrontierScalarSlider(1282, 826, 288, "ABSCISSION SHED THR",  "18.0", "N",   0.60f);
+    drawFrontierToggle      (1282, 874, 288, "DETACHED LEAF PHYSICS", true);
 
     const bool wroteUi = WriteRgba8PngFile(proofOutDir / "01_Untitled_Botanical_EditorUI_And_3DScene.png", uiCanvas.W, uiCanvas.H, uiCanvas.Pix);
 
@@ -1008,24 +1075,30 @@ int main()
     showcase.FillRoundedRect(24, 68, 354, 26, 8.0f, { 12u, 14u, 12u, 215u }, { 120u, 160u, 96u, 220u });
     showcase.DrawText(34, 77, "1. FERNS: SWORD & BRACKEN (CROSIERS + AURICLES)", 1, { 214u, 234u, 186u, 255u });
 
-    // Panel B: Palms Close-Up (MedjoolDatePalm + CoastalCoconutPalm)
+    // Panel B: Palms Close-Up (MedjoolDatePalm + CoastalCoconutPalm leaning gracefully outward!)
     std::vector<ScenePlantActor> palmPanel {
         { "MedjoolDatePalm",    dateMesh,    { -2.6f, 0.0f, 0.0f }, 0.55f, 1.0f },
-        { "CoastalCoconutPalm", coconutMesh, {  2.8f, 0.4f, 0.0f }, 2.35f, 0.96f },
+        { "CoastalCoconutPalm", coconutMesh, {  2.2f, 0.4f, 0.0f }, 5.65f, 0.96f },
     };
     RenderBotanical3dScene(showcase, 546, 60, 508, 490, palmPanel, {}, leafAtlas,
-        { 0.1f, -12.6f, 4.4f }, { 0.0f, 0.2f, 3.8f }, sunDir, true, false);
+        { 0.4f, -13.4f, 4.6f }, { 0.3f, 0.2f, 4.0f }, sunDir, true, false);
     showcase.FillRoundedRect(554, 68, 382, 26, 8.0f, { 12u, 14u, 12u, 215u }, { 210u, 174u, 102u, 220u });
     showcase.DrawText(564, 77, "2. PALMS: MEDJOOL DATE & COCONUT (FRONDS + FRUIT)", 1, { 236u, 216u, 162u, 255u });
 
-    // Panel C: Ancient English Oak Close-Up (full dome crown & roots framed!)
+    // Panel C: Ancient English Oak Close-Up (full dome crown & welded roots framed + macro welded root/branch collar inset!)
     std::vector<ScenePlantActor> oakPanel {
         { "EnglishOak", oakMesh, { 0.0f, 0.0f, 0.0f }, 0.22f, 1.0f },
     };
     RenderBotanical3dScene(showcase, 1076, 60, 508, 490, oakPanel, {}, leafAtlas,
         { 0.0f, -15.2f, 4.8f }, { 0.0f, 0.0f, 4.4f }, sunDir, true, false);
-    showcase.FillRoundedRect(1084, 68, 390, 26, 8.0f, { 12u, 14u, 12u, 215u }, { 142u, 184u, 124u, 220u });
-    showcase.DrawText(1094, 77, "3. ENGLISH OAK: ROOTS + PIPE LIMBS + LOBED CANOPY", 1, { 214u, 234u, 198u, 255u });
+    showcase.FillRoundedRect(1084, 68, 434, 26, 8.0f, { 12u, 14u, 12u, 215u }, { 142u, 184u, 124u, 220u });
+    showcase.DrawText(1094, 77, "3. ENGLISH OAK: 1 WELDED MESH (V-E+F=2, 0 OPEN EDGES)", 1, { 214u, 234u, 198u, 255u });
+
+    // Close-Up Macro Inset of Welded Root-Trunk Bezier Collars (bottom-right of Oak panel)
+    showcase.FillRoundedRect(1372, 342, 204, 200, 10.0f, { 12u, 14u, 16u, 240u }, { 212u, 226u, 192u, 230u });
+    RenderBotanical3dScene(showcase, 1376, 346, 196, 168, oakPanel, {}, leafAtlas,
+        { 0.4f, -3.55f, 1.05f }, { 0.0f, 0.0f, 0.62f }, sunDir, false, false);
+    showcase.DrawText(1384, 522, "WELDED ROOT-TRUNK COLLARS", 1, { 214u, 234u, 198u, 255u });
 
     // Bottom Strip: Outliner SVG Folder Icon + All 5 Baked 128x128 3D Plant Render Thumbnails!
     showcase.FillRoundedRect(16, 566, 1568, 178, 16.0f, { 22u, 23u, 25u, 255u }, { 48u, 52u, 56u, 255u });
@@ -1242,7 +1315,7 @@ int main()
 
         CanvasRgba frame(720u, 420u, { 16u, 16u, 18u, 255u });
         RenderBotanical3dScene(frame, 0, 0, 720, 420, sceneActors, animWp.Leaves(), leafAtlas,
-            { 0.3f + 0.65f * std::sin(t * 0.45f), -10.4f, 3.4f }, { 0.1f, 2.2f, 2.4f }, sunDir, false, true);
+            { 0.1f + 0.65f * std::sin(t * 0.45f), -13.0f, 4.0f }, { 0.0f, 2.2f, 3.1f }, sunDir, false, true);
         frame.FillRoundedRect(12, 10, 456, 26, 10.0f, { 12u, 14u, 16u, 210u }, { 78u, 96u, 68u, 220u });
         const auto atel = animWp.GetTelemetry();
         std::ostringstream hud;

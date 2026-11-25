@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frontier · Light Hierarchy, Directional Grid &amp; Error Lab</title>
+  <link rel="stylesheet" href="./LightHierarchyStudio.css" />
+</head>
+<body>
+  <div id="App">
+    <!-- ========================================================================
+         LEFT STAGE: 3 SYNCHRONIZED LIVE WEBGL VIEWPORTS
+         ======================================================================== -->
+    <main class="stage">
+      <header class="topbar">
+        <div class="brand">
+          <b>Light Hierarchy &amp; Baked Grid Lab</b>
+          <small>32 Raw Emitters &middot; Headlights (5+5) &middot; 5-Cluster &middot; Opposing Neon</small>
+          <span class="pill-badge">REALTIME WEBGL PBR</span>
+        </div>
+
+        <div class="cam-controls" id="CamPresetGroup">
+          <button class="active" data-cam="angle">3/4 Overview</button>
+          <button data-cam="top">Top-Down Grid</button>
+          <button data-cam="headlights">Headlights Close-Up</button>
+          <button data-cam="neon">Opposing Neon</button>
+        </div>
+      </header>
+
+      <section class="vp-grid">
+        <!-- VIEWPORT 1: GROUND TRUTH (ALL 32 INDIVIDUAL LIGHTS) -->
+        <div class="vp-card">
+          <canvas id="CanvasTruth"></canvas>
+          <canvas class="vp-overlay" id="OverlayTruth"></canvas>
+          <div class="vp-tag">
+            <span class="dot green"></span>
+            <div>
+              <b>Ground Truth Reference</b>
+              <small>32 individual emitters + real shadows + GGX</small>
+            </div>
+          </div>
+          <div class="vp-sub-legend">32 evals / pixel</div>
+        </div>
+
+        <!-- VIEWPORT 2: SELECTED LIGHT-MERGING ALGORITHM -->
+        <div class="vp-card">
+          <canvas id="CanvasApprox"></canvas>
+          <canvas class="vp-overlay" id="OverlayApprox"></canvas>
+          <div class="vp-tag">
+            <span class="dot amber" id="ApproxDot"></span>
+            <div>
+              <b id="ApproxTitle">Naive Centroid Merge</b>
+              <small id="ApproxSub">Averages headlights at car center (watch the error!)</small>
+            </div>
+          </div>
+          <div class="vp-sub-legend" id="ApproxEvalBadge">6 evals / pixel</div>
+        </div>
+
+        <!-- VIEWPORT 3: REAL-TIME PER-PIXEL ERROR HEATMAP |TRUTH - APPROX| -->
+        <div class="vp-card wide">
+          <canvas id="CanvasError"></canvas>
+          <canvas class="vp-overlay" id="OverlayError"></canvas>
+          <div class="vp-tag">
+            <span class="dot coral"></span>
+            <div>
+              <b>Live Per-Pixel Error Heatmap &nbsp;|&nbsp; |Ground Truth &minus; Approx|</b>
+              <small id="ErrorSubtitle">Bright yellow = BIG lighting/shadow/specular error &middot; Click floor to move Distance Probe</small>
+            </div>
+          </div>
+          <div class="heatmap-bar">
+            <span>0.00</span><i></i><span>BIG ERROR</span>
+          </div>
+        </div>
+      </section>
+
+      <footer class="stage-foot">
+        <span>Drag any viewport to <b>Orbit</b> &middot; Wheel to <b>Zoom</b> &middot; Click floor to place <b>Distance-LOD Probe</b></span>
+        <span>FPS <b id="FootFps">60</b> &middot; Grid <b id="FootGrid">16&times;16</b> &middot; Active Cut <b id="FootCut">6 lights</b></span>
+      </footer>
+    </main>
+
+    <!-- ========================================================================
+         RIGHT DOCK: PROJECT ZERO INSPECTOR & ERROR REFINEMENT ENGINE
+         ======================================================================== -->
+    <aside class="inspector">
+      <div class="inspector-scroll">
+        <div class="crumb">Frontier / Lighting / Nanite-for-Lights Lab</div>
+        <h1 class="hero-h1">Light-Merging Lab</h1>
+        <p class="hero-sub">Compare Naive Merge vs. Baked Directional Grid vs. Distance Light BVH</p>
+
+        <!-- Headlights Diagnostic Alert -->
+        <div class="status-banner warn" id="HeadlightStatusBanner">
+          <b id="HeadlightBannerTitle">Headlights MERGED @ Center (Naive Average Bug!)</b>
+          <span id="HeadlightBannerBody">Left (5) + Right (5) collapsed into 1 grille light &rarr; wrong shadows &amp; huge error.</span>
+        </div>
+
+        <!-- 2x2 Quantitative Error Telemetry -->
+        <div class="metric-grid">
+          <div class="metric-tile">
+            <b id="MetricRmse">0.000</b>
+            <span>GLOBAL RMSE ERROR</span>
+          </div>
+          <div class="metric-tile">
+            <b id="MetricPsnr">0.0<small>dB</small></b>
+            <span>QUALITY (PSNR)</span>
+          </div>
+          <div class="metric-tile">
+            <b id="MetricEvals">6.0<small>/px</small></b>
+            <span>AVG LIGHT EVALS</span>
+          </div>
+          <div class="metric-tile">
+            <b id="MetricSpeedup">5.3<small>&times;</small></b>
+            <span>LIGHT SPEEDUP</span>
+          </div>
+        </div>
+
+        <!-- 4 Algorithm Mode Cards -->
+        <div class="mode-grid" id="ModeSelector">
+          <button class="mode-btn active" data-mode="naive">
+            <small>01 &middot; NAIVE AVERAGE</small>
+            <b>Centroid Merge</b>
+          </button>
+          <button class="mode-btn" data-mode="grid">
+            <small>02 &middot; 1 SAMPLE / CELL</small>
+            <b>Baked Light Grid</b>
+          </button>
+          <button class="mode-btn" data-mode="nanite">
+            <small>03 &middot; DISTANCE BVH</small>
+            <b>Nanite Light LOD</b>
+          </button>
+          <button class="mode-btn" data-mode="hybrid">
+            <small>04 &middot; ERROR-GUIDED</small>
+            <b>Grid + Error Split</b>
+          </button>
+        </div>
+
+        <!-- Error-Guided Auto-Refinement Card -->
+        <div class="property-card">
+          <h3>Error-Guided Refinement <small id="RefineIterLabel">Step 0</small></h3>
+          <canvas id="ErrorChartCanvas" width="320" height="92"></canvas>
+          <button class="refine-btn" id="BtnAutoRefine">Use Measured Error to Improve Results</button>
+          <button class="refine-btn secondary" id="BtnResetRefine">Reset Error History</button>
+          <p class="card-note">
+            Measures per-cell residual error |Truth &minus; Approx|, switches to Error-Guided Hybrid if needed, and iteratively tightens the split gate &amp; grid resolution so ONLY high-error regions split.
+          </p>
+        </div>
+
+        <!-- Debug Overlays Quick Tiles -->
+        <div class="tiles">
+          <button class="quick-tile on" id="TileShowGrid">
+            <b>Show Light Grid</b>
+            <span id="TxtShowGrid">ON</span>
+          </button>
+          <button class="quick-tile on" id="TileShowLights">
+            <b>Show Light Tree</b>
+            <span id="TxtShowLights">ON</span>
+          </button>
+          <button class="quick-tile off" id="TileShowHybridMask">
+            <b>Hybrid Split Mask</b>
+            <span id="TxtShowHybridMask">OFF</span>
+          </button>
+          <button class="quick-tile on" id="TileAnimateDrone">
+            <b>Dynamic Drone</b>
+            <span id="TxtAnimateDrone">ON</span>
+          </button>
+        </div>
+
+        <!-- Interactive Algorithm Parameters -->
+        <div class="property-card">
+          <h3>Grid &amp; Distance-LOD Parameters <small>Live</small></h3>
+
+          <label class="field">
+            <span>Baked Directional Grid Resolution</span>
+            <div class="slider-pill">
+              <input id="RangeGridRes" type="range" min="6" max="32" step="2" value="16" />
+              <span class="split-value"><output id="OutGridRes">16&times;16</output><small>cell</small></span>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Nanite Light BVH Error Budget (Split Threshold)</span>
+            <div class="slider-pill">
+              <input id="RangeLodThreshold" type="range" min="0.04" max="0.90" step="0.02" value="0.24" />
+              <span class="split-value"><output id="OutLodThreshold">0.24</output><small>rad</small></span>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Hybrid High-Error Split Gate</span>
+            <div class="slider-pill">
+              <input id="RangeHybridGate" type="range" min="0.02" max="0.70" step="0.02" value="0.18" />
+              <span class="split-value"><output id="OutHybridGate">0.18</output><small>err</small></span>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Error Heatmap Contrast Gain</span>
+            <div class="slider-pill">
+              <input id="RangeErrorGain" type="range" min="1.0" max="12.0" step="0.5" value="4.5" />
+              <span class="split-value"><output id="OutErrorGain">4.5</output><small>&times;</small></span>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Floor Roughness (Lower = Exposes Specular Error!)</span>
+            <div class="slider-pill">
+              <input id="RangeRoughness" type="range" min="0.12" max="0.88" step="0.02" value="0.28" />
+              <span class="split-value"><output id="OutRoughness">0.28</output><small>r</small></span>
+            </div>
+          </label>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script type="module" src="./LightHierarchyStudio.js"></script>
+</body>
+</html>

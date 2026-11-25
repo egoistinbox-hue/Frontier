@@ -224,7 +224,12 @@ struct RaceTrackParams
 //                                                  FUNCTION PROTOTYPES
 //------------------------------------------------------------------------------------------------------------------------
 
-// Coordinate mapping: HTML StudioYUp (X, Y, Z) -> FrontierWorldZUp (X, -Z, Y) [proper +90 deg X rotation, det = +1]
+// Coordinate mapping: HTML StudioYUp (X, Y, Z) -> FrontierWorldZUp via Engine CoordinateSpace (det = +1)
+[[nodiscard]] Frontier::Mathematics::Axis3D ConvertHtmlPositionToWorldZUp(
+    float Hx,
+    float Hy,
+    float Hz) noexcept;
+
 [[nodiscard]] Frontier::Mathematics::Axis3D ConvertHtmlYUpToWorldZUp(
     Frontier::Mathematics::Axis3D HtmlPt,
     const StudioMeshBakeTransform& Transform = {}) noexcept;
@@ -232,6 +237,9 @@ struct RaceTrackParams
 [[nodiscard]] Frontier::Mathematics::Axis3D ConvertHtmlYUpNormalToWorldZUp(
     Frontier::Mathematics::Axis3D HtmlNormal,
     const StudioMeshBakeTransform& Transform = {}) noexcept;
+
+[[nodiscard]] Frontier::Mathematics::LinearRGB SrgbHexToLinearRgb(uint32_t HexRgb) noexcept;
+[[nodiscard]] float                            ComputeTripodMountHeight(const TripodParams& Params) noexcept;
 
 // Register all studio materials + vehicle shared materials into CompactMaterialRegister (slots >= 1)
 void RegisterStudioBaseMaterials(

@@ -154,7 +154,7 @@ void BuildLobby3RacingGarageLevel(IStudioLobbySceneBuilderContext& Ctx, const Lo
     Scene.Atmosphere.Medium.AtmosphereEnabled = false;
     Scene.Atmosphere.Solar.SolarEnabled       = true;
     Scene.Atmosphere.Clouds.CloudsEnabled     = true;
-    Scene.Sun.DirectionToSun                   = NormalizeVectorSafe({ -0.45f, 0.65f, 0.60f });
+    Scene.Sun.DirectionToSun                   = NormalizeAxis({ -0.45f, 0.65f, 0.60f }, { 0.0f, 0.0f, 1.0f });
     Scene.Sun.SolarIrradiance                  = { 3.2f, 2.8f, 2.3f };
     Scene.SkyRadiance                          = { 0.18f, 0.24f, 0.34f };
 

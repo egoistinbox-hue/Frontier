@@ -126,7 +126,7 @@ void BuildLobby1CycloramaLevel(IStudioLobbySceneBuilderContext& Ctx, const Lobby
                 BuildLightFixtureSurface({ "Barn-Door Fresnel", 0.48f, 0.48f, 0.42f, Aim.PitchDeg, 34.0f, 12u, 0.0f }, Palette, { 1.0f, Aim.YawDeg, 0.0f, 0.0f }),
                 FixPos, Palette.Resolve(StudioMaterialCode::DarkMetal), TripodTok, false);
 
-            const Axis3D AimDir  = NormalizeVectorSafe(HeroAimZUp - FixPos);
+            const Axis3D AimDir  = NormalizeAxis(HeroAimZUp - FixPos, { 0.0f, 0.0f, -1.0f });
             const Axis3D LampPos = FixPos + Axis3D{ 0.0f, 0.0f, 0.28f } + AimDir * 0.34f;
             Scene.PhotometricRadiators.push_back(MakeAimedPhotometricSpotLight(LampPos, HeroAimZUp, { 16.5f, 15.2f, 13.4f }, 22.0f, 2u));
             (void)Ctx.AppendLuminaireEntity(
@@ -156,7 +156,7 @@ void BuildLobby1CycloramaLevel(IStudioLobbySceneBuilderContext& Ctx, const Lobby
                 BuildLightFixtureSurface({ "Parabolic Umbrella", 1.48f, 1.48f, 0.48f, Aim.PitchDeg, 25.0f, 16u, 0.0f }, Palette, { 1.0f, Aim.YawDeg, 0.0f, 0.0f }),
                 FixPos, Palette.Resolve(StudioMaterialCode::UmbrellaSilver), TripodTok, false);
 
-            const Axis3D AimDir  = NormalizeVectorSafe(HeroAimZUp - FixPos);
+            const Axis3D AimDir  = NormalizeAxis(HeroAimZUp - FixPos, { 0.0f, 0.0f, -1.0f });
             const Axis3D LampPos = FixPos + Axis3D{ 0.0f, 0.0f, 0.24f } + AimDir * 0.28f;
             Scene.AreaLights.push_back(MakeAimedAreaQuadLight(LampPos, HeroAimZUp, 1.55f, 1.55f, { 1.45f, 1.55f, 1.72f }, false));
             (void)Ctx.AppendLuminaireEntity(
@@ -186,7 +186,7 @@ void BuildLobby1CycloramaLevel(IStudioLobbySceneBuilderContext& Ctx, const Lobby
                 BuildLightFixtureSurface({ "Studio LED Panel", 1.15f, 0.68f, 0.14f, Aim.PitchDeg, 24.0f, 12u, 0.0f }, Palette, { 1.0f, Aim.YawDeg, 0.0f, 0.0f }),
                 FixPos, Palette.Resolve(StudioMaterialCode::DarkMetal), TripodTok, false);
 
-            const Axis3D AimDir  = NormalizeVectorSafe(HeroAimZUp - FixPos);
+            const Axis3D AimDir  = NormalizeAxis(HeroAimZUp - FixPos, { 0.0f, 0.0f, -1.0f });
             const Axis3D LampPos = FixPos + Axis3D{ 0.0f, 0.0f, 0.34f } + AimDir * 0.22f;
             Scene.AreaLights.push_back(MakeAimedAreaQuadLight(LampPos, HeroAimZUp, 1.15f, 0.68f, { 2.50f, 2.85f, 3.45f }, false));
             (void)Ctx.AppendLuminaireEntity(
@@ -216,7 +216,7 @@ void BuildLobby1CycloramaLevel(IStudioLobbySceneBuilderContext& Ctx, const Lobby
                 BuildLightFixtureSurface({ "Octa Softbox", 0.96f, 0.96f, 0.42f, Aim.PitchDeg, 25.0f, 8u, 0.0f }, Palette, { 1.0f, Aim.YawDeg, 0.0f, 0.0f }),
                 FixPos, Palette.Resolve(StudioMaterialCode::DarkMetal), TripodTok, false);
 
-            const Axis3D AimDir  = NormalizeVectorSafe(HeroAimZUp - FixPos);
+            const Axis3D AimDir  = NormalizeAxis(HeroAimZUp - FixPos, { 0.0f, 0.0f, -1.0f });
             const Axis3D LampPos = FixPos + Axis3D{ 0.0f, 0.0f, 0.22f } + AimDir * 0.32f;
             Scene.PhotometricRadiators.push_back(MakeAimedPhotometricSpotLight(LampPos, HeroAimZUp, { 12.5f, 13.0f, 14.5f }, 22.0f, 2u));
             (void)Ctx.AppendLuminaireEntity(
@@ -310,7 +310,7 @@ void BuildLobby1CycloramaLevel(IStudioLobbySceneBuilderContext& Ctx, const Lobby
     Scene.Atmosphere.Medium.AtmosphereEnabled = false;
     Scene.Atmosphere.Solar.SolarEnabled       = false;
     Scene.Atmosphere.Clouds.CloudsEnabled     = false;
-    Scene.Sun.DirectionToSun                   = NormalizeVectorSafe({ 0.25f, -0.45f, 0.85f });
+    Scene.Sun.DirectionToSun                   = NormalizeAxis({ 0.25f, -0.45f, 0.85f }, { 0.0f, 0.0f, 1.0f });
     Scene.Sun.SolarIrradiance                  = { 0.0f, 0.0f, 0.0f };
     Scene.SkyRadiance                          = { 0.014f, 0.018f, 0.026f };
 

@@ -1627,6 +1627,20 @@ if(BUILD_TESTING)
         COMMAND Untitled --headless --ticks=12 --verify-policy
     )
 
+    add_executable(AutoSpaceStudioValidation Exhibits/AutoSpaceStudioValidation.cpp)
+    target_include_directories(AutoSpaceStudioValidation PRIVATE
+        "${CMAKE_SOURCE_DIR}"
+        "${CMAKE_SOURCE_DIR}/Projects/AutoSpace"
+        "${CMAKE_SOURCE_DIR}/ExternalPackages/stb")
+    target_compile_definitions(AutoSpaceStudioValidation PRIVATE "FRONTIER_REPO_ROOT_DIR=\"${CMAKE_SOURCE_DIR}\"")
+    target_link_libraries(AutoSpaceStudioValidation PRIVATE AutoSpaceProject)
+    add_test(NAME AutoSpaceStudioValidation COMMAND AutoSpaceStudioValidation)
+
+    add_test(
+        NAME AutoSpaceExecutableSmoke
+        COMMAND AutoSpace --headless --verify --ticks=12
+    )
+
     if(NOT ANDROID AND FRONTIER_PROFILE STREQUAL "Editor")
         add_test(
             NAME FrontierExecutableSmoke

@@ -16,7 +16,6 @@
 #include "Engine/GeometrySpace/Network/PolygonNetwork.h"
 #include "Engine/ParticleSpace/CarrierSolidRegistry.h"
 #include "Engine/ParticleSpace/ParticleCloudTypes.h"
-#include "Engine/ParticleSpace/ParticleGpuRenderer.h"
 #include "Engine/ParticleSpace/ParticleGpuSimulation.h"
 #include "Engine/ParticleSpace/ParticleTemplateRegistry.h"
 #include "Engine/SimulationSpace/EffectLayers/EffectLayerSpecification.h"
@@ -27,7 +26,6 @@
 #include "Source/Geometry/StudioProceduralSurface.h"
 #include "Source/Levels/StudioLobbyWorldBuilder.h"
 #include "Source/Policies/LobbyPolicy.h"
-#include "Source/Utility/StudioRenderUtility.h"
 
 #if FRONTIER_PROFILE_EDITOR
 #include "Engine/Components/Panes/OutlinerPanel.h"
@@ -97,24 +95,21 @@ public:
 
     void TickSimulation(double FixedDeltaSeconds) noexcept;
 
-    [[nodiscard]] bool RenderVisualProof(
-        const std::filesystem::path& OutputDirectory,
-        const std::filesystem::path& RepoRoot,
-        uint32_t                     WidthPx,
-        uint32_t                     HeightPx,
-        std::string&                 OutDiagnostic);
-
-    [[nodiscard]] LobbyLifecycleTelemetry                                 InspectTelemetry() const noexcept;
-    [[nodiscard]] const LobbyPolicy&                                      InspectPolicy() const noexcept { return ActivePolicy; }
-    [[nodiscard]] const Frontier::GeometricRaster::WorldSceneSpecification& InspectWorldScene() const noexcept { return WorldScene; }
-    [[nodiscard]] const Frontier::World::WorldInstanceRegister&         InspectWorldRegister() const noexcept { return WorldRegister; }
-    [[nodiscard]] const std::vector<StudioCameraPresetView>&            InspectCameraPresets() const noexcept { return CameraPresets; }
+    [[nodiscard]] LobbyLifecycleTelemetry                                       InspectTelemetry() const noexcept;
+    [[nodiscard]] const LobbyPolicy&                                            InspectPolicy() const noexcept { return ActivePolicy; }
+    [[nodiscard]] Frontier::GeometricRaster::WorldSceneSpecification&           AccessWorldScene() noexcept override { return WorldScene; }
+    [[nodiscard]] const Frontier::GeometricRaster::WorldSceneSpecification&     InspectWorldScene() const noexcept { return WorldScene; }
+    [[nodiscard]] const Frontier::World::WorldInstanceRegister&               InspectWorldRegister() const noexcept { return WorldRegister; }
+    [[nodiscard]] const std::vector<StudioCameraPresetView>&                  InspectCameraPresets() const noexcept { return CameraPresets; }
+    [[nodiscard]] const std::vector<Frontier::ParticleSpace::ParticleCloudNode>& InspectParticleClouds() const noexcept { return ParticleClouds; }
+    [[nodiscard]] const Frontier::ParticleSpace::ParticleGpuSimulation&         InspectParticleSimulation() const noexcept { return ParticleSimulation; }
+    [[nodiscard]] const Frontier::ParticleSpace::ParticleSimulationRegion&      InspectParticleRegion() const noexcept { return ParticleRegion; }
+    [[nodiscard]] double                                                        InspectSimulationClockSeconds() const noexcept { return SimulationClockSeconds; }
 
 private:
     // IStudioLobbySceneBuilderContext overrides
     [[nodiscard]] const Frontier::Codecs::AssembledControlVehicle& InspectControlVehicle() const noexcept override { return ControlVehicleTemplate; }
     [[nodiscard]] const StudioMaterialPalette&                   InspectMaterialPalette() const noexcept override { return MaterialPalette; }
-    [[nodiscard]] Frontier::GeometricRaster::WorldSceneSpecification& AccessWorldScene() noexcept override { return WorldScene; }
     [[nodiscard]] Frontier::World::WorldInstanceRegister&             AccessWorldRegister() noexcept override { return WorldRegister; }
 
     Frontier::World::InstanceToken CreateFolderEntry(
@@ -202,7 +197,6 @@ private:
 
     std::vector<Frontier::ParticleSpace::ParticleCloudNode>              ParticleClouds         {};
     Frontier::ParticleSpace::ParticleGpuSimulation                       ParticleSimulation     {};
-    Frontier::ParticleSpace::ParticleGpuRenderer                         ParticleRenderer       {};
     Frontier::ParticleSpace::ParticleSimulationRegion                    ParticleRegion         {};
     double                                                               SimulationClockSeconds = 0.0;
     uint32_t                                                             VehicleCount           = 0u;

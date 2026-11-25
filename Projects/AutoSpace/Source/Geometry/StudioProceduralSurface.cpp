@@ -9,7 +9,10 @@
 
 #include "Source/Geometry/StudioProceduralSurface.h"
 
+#include "Engine/ColourSpace/TransferFunction.h"
 #include "Engine/Constants/MathConstants.h"
+#include "Engine/GeometrySpace/Primitives/AnalyticPrimitives.h"
+#include "Engine/Mathematics/CoordinateSpace.h"
 
 #include <algorithm>
 #include <array>
@@ -25,11 +28,6 @@ namespace
 using Axis3D    = Frontier::Mathematics::Axis3D;
 using LinearRGB = Frontier::Mathematics::LinearRGB;
 using UVAxes    = Frontier::Mathematics::UVAxes;
-
-[[nodiscard]] constexpr float DegToRad(float Degrees) noexcept
-{
-    return Degrees * (Frontier::Constants::PiFloat / 180.0f);
-}
 
 [[nodiscard]] Axis3D RotateHtmlYUpVector(Axis3D Pt, float PitchRad, float YawRad, float RollRad) noexcept
 {
@@ -68,30 +66,6 @@ using UVAxes    = Frontier::Mathematics::UVAxes;
     return { X, Y, Z };
 }
 
-[[nodiscard]] Axis3D SafeCross(Axis3D A, Axis3D B) noexcept
-{
-    return Frontier::Mathematics::EvaluateCross(A, B);
-}
-
-[[nodiscard]] Axis3D SafeNormalize(Axis3D V, Axis3D Fallback = { 0.0f, 1.0f, 0.0f }) noexcept
-{
-    return Frontier::Mathematics::NormalizeAxis(V, Fallback);
-}
-
-[[maybe_unused]] [[nodiscard]] LinearRGB SrgbHexToLinear(uint32_t HexRgb) noexcept
-{
-    const auto Chan = [](uint32_t Byte) noexcept -> float
-    {
-        const float S = static_cast<float>(Byte & 0xFFu) / 255.0f;
-        return (S <= 0.04045f) ? (S / 12.92f) : std::pow((S + 0.055f) / 1.055f, 2.4f);
-    };
-    return {
-        Chan(HexRgb >> 16u),
-        Chan(HexRgb >> 8u),
-        Chan(HexRgb),
-    };
-}
-
 //------------------------------------------------------------------------------------------------------------------------
 //                                        HTML Y-UP TO FRONTIERWORLDZUP MESH BUILDER
 //------------------------------------------------------------------------------------------------------------------------
@@ -127,16 +101,16 @@ public:
 
         const Axis3D Edge1 = Wb - Wa;
         const Axis3D Edge2 = Wc - Wa;
-        const Axis3D AreaN = SafeCross(Edge1, Edge2);
+        const Axis3D AreaN = Frontier::Mathematics::EvaluateCross(Edge1, Edge2);
         if (Frontier::Mathematics::EvaluateLengthSquared(AreaN) <= 1.0e-14f)
         {
             return;
         }
-        const Axis3D UnitFaceN = SafeNormalize(AreaN, { 0.0f, 0.0f, 1.0f });
+        const Axis3D UnitFaceN = Frontier::Mathematics::NormalizeAxis(AreaN, { 0.0f, 0.0f, 1.0f });
 
-        const Axis3D Wna = SafeNormalize(ConvertHtmlYUpNormalToWorldZUp(HtmlNa, BakeTransform), UnitFaceN);
-        const Axis3D Wnb = SafeNormalize(ConvertHtmlYUpNormalToWorldZUp(HtmlNb, BakeTransform), UnitFaceN);
-        const Axis3D Wnc = SafeNormalize(ConvertHtmlYUpNormalToWorldZUp(HtmlNc, BakeTransform), UnitFaceN);
+        const Axis3D Wna = Frontier::Mathematics::NormalizeAxis(ConvertHtmlYUpNormalToWorldZUp(HtmlNa, BakeTransform), UnitFaceN);
+        const Axis3D Wnb = Frontier::Mathematics::NormalizeAxis(ConvertHtmlYUpNormalToWorldZUp(HtmlNb, BakeTransform), UnitFaceN);
+        const Axis3D Wnc = Frontier::Mathematics::NormalizeAxis(ConvertHtmlYUpNormalToWorldZUp(HtmlNc, BakeTransform), UnitFaceN);
 
         const uint32_t V0 = Built.Network.AppendVertex(Wa);
         const uint32_t V1 = Built.Network.AppendVertex(Wb);
@@ -169,7 +143,9 @@ public:
 
     [[nodiscard]] static Axis3D ComputeFlatNormal(Axis3D A, Axis3D B, Axis3D C) noexcept
     {
-        return SafeNormalize(SafeCross(B - A, C - A), { 0.0f, 1.0f, 0.0f });
+        return Frontier::Mathematics::NormalizeAxis(
+            Frontier::Mathematics::EvaluateCross(B - A, C - A),
+            { 0.0f, 1.0f, 0.0f });
     }
 
     void AddQuadFlat(Axis3D A, Axis3D B, Axis3D C, Axis3D D, StudioMaterialCode MatCode)
@@ -187,30 +163,42 @@ public:
         float              Ry = 0.0f,
         float              Rz = 0.0f)
     {
-        const float Cx = Center.X;
-        const float Cy = Center.Y;
-        const float Cz = Center.Z;
-        const float Hx = HalfExtents.X;
-        const float Hy = HalfExtents.Y;
-        const float Hz = HalfExtents.Z;
+        ResetScratchNetwork();
+        Frontier::GeometrySpace::AppendBoxPrimitive(
+            ScratchNet,
+            { 0.0f, 0.0f, 0.0f },
+            { HalfExtents.X, HalfExtents.Y, HalfExtents.Z },
+            {},
+            {},
+            0u,
+            Palette.Resolve(MatCode));
 
-        const auto Xf = [&](Axis3D L) noexcept -> Axis3D
+        const bool HasRotation = (std::fabs(Rx) > 1.0e-6f) || (std::fabs(Ry) > 1.0e-6f) || (std::fabs(Rz) > 1.0e-6f);
+        std::array<Axis3D, 4u> Pts {};
+        std::array<UVAxes, 4u> Uvs {};
+        for (const auto& Face : ScratchNet.Faces)
         {
-            const Axis3D R = RotateHtmlYUpVector(L, Rx, Ry, Rz);
-            return { Cx + R.X, Cy + R.Y, Cz + R.Z };
-        };
-
-        const std::array<Axis3D, 8u> V {{
-            Xf({ -Hx, -Hy, -Hz }), Xf({  Hx, -Hy, -Hz }), Xf({  Hx,  Hy, -Hz }), Xf({ -Hx,  Hy, -Hz }),
-            Xf({ -Hx, -Hy,  Hz }), Xf({  Hx, -Hy,  Hz }), Xf({  Hx,  Hy,  Hz }), Xf({ -Hx,  Hy,  Hz }),
-        }};
-
-        AddQuadFlat(V[4], V[5], V[6], V[7], MatCode); // +Z
-        AddQuadFlat(V[1], V[0], V[3], V[2], MatCode); // -Z
-        AddQuadFlat(V[5], V[1], V[2], V[6], MatCode); // +X
-        AddQuadFlat(V[0], V[4], V[7], V[3], MatCode); // -X
-        AddQuadFlat(V[3], V[7], V[6], V[2], MatCode); // +Y
-        AddQuadFlat(V[0], V[1], V[5], V[4], MatCode); // -Y
+            if (Face.CornerCount < 3u)
+            {
+                continue;
+            }
+            const uint32_t Count = std::min<uint32_t>(4u, Face.CornerCount);
+            uint32_t EdgeIdx = Face.BoundaryLoopEdgeIndex;
+            for (uint32_t K = 0u; K < Count && EdgeIdx < ScratchNet.Edges.size(); ++K)
+            {
+                const auto& E = ScratchNet.Edges[EdgeIdx];
+                const Axis3D Local = ScratchNet.Vertices[E.OriginVertexIndex].Axes;
+                Pts[K] = (HasRotation ? RotateHtmlYUpVector(Local, Rx, Ry, Rz) : Local) + Center;
+                Uvs[K] = E.ParameterUV;
+                EdgeIdx = E.NextEdgeIndex;
+            }
+            const Axis3D N = ComputeFlatNormal(Pts[0], Pts[1], Pts[2]);
+            PushTri(Pts[0], Pts[1], Pts[2], N, N, N, MatCode, Uvs[0], Uvs[1], Uvs[2]);
+            if (Count == 4u)
+            {
+                PushTri(Pts[0], Pts[2], Pts[3], N, N, N, MatCode, Uvs[0], Uvs[2], Uvs[3]);
+            }
+        }
     }
 
     void AddTube(
@@ -228,34 +216,63 @@ public:
         {
             return;
         }
-        const Axis3D Axis = AxisVec * (1.0f / Len);
-        const Axis3D Ref  = (std::fabs(Axis.Y) < 0.9f) ? Axis3D{ 0.0f, 1.0f, 0.0f } : Axis3D{ 1.0f, 0.0f, 0.0f };
-        const Axis3D U    = SafeNormalize(SafeCross(Ref, Axis));
-        const Axis3D V    = SafeNormalize(SafeCross(Axis, U));
+        const Axis3D   AxisUnit   = AxisVec * (1.0f / Len);
+        const uint32_t ActualSegs = std::max(6u, Segs);
 
-        const uint32_t SCount = std::max(4u, Segs);
-        std::vector<Axis3D> Ring0(SCount), Ring1(SCount), Normals(SCount);
-        for (uint32_t I = 0u; I < SCount; ++I)
-        {
-            const float Ang = (static_cast<float>(I) / static_cast<float>(SCount)) * Frontier::Constants::TauFloat;
-            const float C   = std::cos(Ang);
-            const float S   = std::sin(Ang);
-            const Axis3D Radial = U * C + V * S;
-            Normals[I] = Radial;
-            Ring0[I]   = P0 + Radial * R0;
-            Ring1[I]   = P1 + Radial * R1;
-        }
+        ResetScratchNetwork();
+        Frontier::GeometrySpace::AppendCylinderFrustumPrimitive(
+            ScratchNet,
+            P0,
+            P1,
+            R0,
+            R1,
+            ActualSegs,
+            {},
+            {},
+            0u,
+            Palette.Resolve(MatCode));
 
-        for (uint32_t I = 0u; I < SCount; ++I)
+        const std::size_t FaceLimit = CapEnds
+            ? ScratchNet.Faces.size()
+            : std::min<std::size_t>(ActualSegs, ScratchNet.Faces.size());
+
+        std::array<Axis3D, 4u> Pts {};
+        std::array<Axis3D, 4u> Norms {};
+        std::array<UVAxes, 4u> Uvs {};
+        for (std::size_t FaceIdx = 0u; FaceIdx < FaceLimit; ++FaceIdx)
         {
-            const uint32_t Next = (I + 1u) % SCount;
-            PushTri(Ring0[I], Ring0[Next], Ring1[Next], Normals[I], Normals[Next], Normals[Next], MatCode);
-            PushTri(Ring0[I], Ring1[Next], Ring1[I],    Normals[I], Normals[Next], Normals[I],    MatCode);
-            if (CapEnds)
+            const auto& Face = ScratchNet.Faces[FaceIdx];
+            if (Face.CornerCount < 3u)
             {
-                const Axis3D NegAxis = Axis * -1.0f;
-                PushTri(P0, Ring0[Next], Ring0[I], NegAxis, NegAxis, NegAxis, MatCode);
-                PushTri(P1, Ring1[I],    Ring1[Next], Axis, Axis,    Axis,    MatCode);
+                continue;
+            }
+            const uint32_t Count = std::min<uint32_t>(4u, Face.CornerCount);
+            uint32_t EdgeIdx = Face.BoundaryLoopEdgeIndex;
+            for (uint32_t K = 0u; K < Count && EdgeIdx < ScratchNet.Edges.size(); ++K)
+            {
+                const auto& E = ScratchNet.Edges[EdgeIdx];
+                Pts[K] = ScratchNet.Vertices[E.OriginVertexIndex].Axes;
+                Uvs[K] = E.ParameterUV;
+                EdgeIdx = E.NextEdgeIndex;
+            }
+            const Axis3D FlatN = ComputeFlatNormal(Pts[0], Pts[1], Pts[2]);
+            if (FaceIdx < ActualSegs)
+            {
+                for (uint32_t K = 0u; K < Count; ++K)
+                {
+                    const Axis3D Delta  = Pts[K] - P0;
+                    const Axis3D Radial = Delta - AxisUnit * Frontier::Mathematics::EvaluateDot(Delta, AxisUnit);
+                    Norms[K] = Frontier::Mathematics::NormalizeAxis(Radial, FlatN);
+                }
+                PushTri(Pts[0], Pts[1], Pts[2], Norms[0], Norms[1], Norms[2], MatCode, Uvs[0], Uvs[1], Uvs[2]);
+                if (Count == 4u)
+                {
+                    PushTri(Pts[0], Pts[2], Pts[3], Norms[0], Norms[2], Norms[3], MatCode, Uvs[0], Uvs[2], Uvs[3]);
+                }
+            }
+            else
+            {
+                PushTri(Pts[0], Pts[1], Pts[2], FlatN, FlatN, FlatN, MatCode, Uvs[0], Uvs[1], Uvs[2]);
             }
         }
     }
@@ -267,37 +284,42 @@ public:
         uint32_t           Rings,
         StudioMaterialCode MatCode)
     {
-        const uint32_t RCount = std::max(4u, Rings);
-        const uint32_t SCount = std::max(6u, Segs);
-        for (uint32_t R = 0u; R < RCount; ++R)
+        ResetScratchNetwork();
+        Frontier::GeometrySpace::AppendSpherePrimitive(
+            ScratchNet,
+            { 0.0f, 0.0f, 0.0f },
+            Radius,
+            std::max(8u, Segs),
+            std::max(4u, Rings),
+            {},
+            {},
+            0u,
+            Palette.Resolve(MatCode));
+
+        std::array<Axis3D, 4u> Pts {};
+        std::array<Axis3D, 4u> Norms {};
+        std::array<UVAxes, 4u> Uvs {};
+        for (const auto& Face : ScratchNet.Faces)
         {
-            const float Phi0 = (static_cast<float>(R) / static_cast<float>(RCount)) * Frontier::Constants::PiFloat;
-            const float Phi1 = (static_cast<float>(R + 1u) / static_cast<float>(RCount)) * Frontier::Constants::PiFloat;
-            for (uint32_t S = 0u; S < SCount; ++S)
+            if (Face.CornerCount < 3u)
             {
-                const float Th0 = (static_cast<float>(S) / static_cast<float>(SCount)) * Frontier::Constants::TauFloat;
-                const float Th1 = (static_cast<float>(S + 1u) / static_cast<float>(SCount)) * Frontier::Constants::TauFloat;
-                const auto Pt = [&](float Phi, float Th) noexcept -> std::pair<Axis3D, Axis3D>
-                {
-                    const Axis3D N {
-                        std::sin(Phi) * std::cos(Th),
-                        std::cos(Phi),
-                        std::sin(Phi) * std::sin(Th),
-                    };
-                    return { Center + N * Radius, N };
-                };
-                const auto [P00, N00] = Pt(Phi0, Th0);
-                const auto [P10, N10] = Pt(Phi1, Th0);
-                const auto [P11, N11] = Pt(Phi1, Th1);
-                const auto [P01, N01] = Pt(Phi0, Th1);
-                if (R > 0u)
-                {
-                    PushTri(P00, P01, P11, N00, N01, N11, MatCode);
-                }
-                if (R + 1u < RCount)
-                {
-                    PushTri(P00, P11, P10, N00, N11, N10, MatCode);
-                }
+                continue;
+            }
+            const uint32_t Count = std::min<uint32_t>(4u, Face.CornerCount);
+            uint32_t EdgeIdx = Face.BoundaryLoopEdgeIndex;
+            for (uint32_t K = 0u; K < Count && EdgeIdx < ScratchNet.Edges.size(); ++K)
+            {
+                const auto& E = ScratchNet.Edges[EdgeIdx];
+                const Axis3D Local = ScratchNet.Vertices[E.OriginVertexIndex].Axes;
+                Pts[K]   = Center + Local;
+                Norms[K] = Frontier::Mathematics::NormalizeAxis(Local, { 0.0f, 1.0f, 0.0f });
+                Uvs[K]   = E.ParameterUV;
+                EdgeIdx  = E.NextEdgeIndex;
+            }
+            PushTri(Pts[0], Pts[1], Pts[2], Norms[0], Norms[1], Norms[2], MatCode, Uvs[0], Uvs[1], Uvs[2]);
+            if (Count == 4u)
+            {
+                PushTri(Pts[0], Pts[2], Pts[3], Norms[0], Norms[2], Norms[3], MatCode, Uvs[0], Uvs[2], Uvs[3]);
             }
         }
     }
@@ -309,9 +331,17 @@ public:
     }
 
 private:
-    const StudioMaterialPalette& Palette;
-    StudioMeshBakeTransform      BakeTransform;
-    StudioBuiltMesh              Built {};
+    void ResetScratchNetwork() noexcept
+    {
+        ScratchNet.Vertices.clear();
+        ScratchNet.Edges.clear();
+        ScratchNet.Faces.clear();
+    }
+
+    const StudioMaterialPalette&            Palette;
+    StudioMeshBakeTransform                 BakeTransform;
+    StudioBuiltMesh                         Built {};
+    Frontier::GeometrySpace::PolygonNetwork ScratchNet {};
 };
 
 } // namespace
@@ -319,6 +349,14 @@ private:
 //------------------------------------------------------------------------------------------------------------------------
 //                                           COORDINATE & MATERIAL HELPERS
 //------------------------------------------------------------------------------------------------------------------------
+
+Axis3D ConvertHtmlPositionToWorldZUp(float Hx, float Hy, float Hz) noexcept
+{
+    return Frontier::Mathematics::ConvertVectorBetweenBases(
+        { Hx, Hy, Hz },
+        Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp,
+        Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp);
+}
 
 Axis3D ConvertHtmlYUpToWorldZUp(
     Axis3D                         HtmlPt,
@@ -331,11 +369,13 @@ Axis3D ConvertHtmlYUpToWorldZUp(
     };
     const Axis3D Rotated = RotateHtmlYUpVector(
         Scaled,
-        DegToRad(Transform.PitchDegrees),
-        DegToRad(Transform.YawDegrees),
-        DegToRad(Transform.RollDegrees));
-    // Proper +90 deg rotation around +X (det = +1): WorldZUp = (HtmlX, -HtmlZ, HtmlY)
-    return { Rotated.X, -Rotated.Z, Rotated.Y };
+        Transform.PitchDegrees * Frontier::Constants::DegToRadFloat,
+        Transform.YawDegrees * Frontier::Constants::DegToRadFloat,
+        Transform.RollDegrees * Frontier::Constants::DegToRadFloat);
+    return Frontier::Mathematics::ConvertVectorBetweenBases(
+        Rotated,
+        Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp,
+        Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp);
 }
 
 Axis3D ConvertHtmlYUpNormalToWorldZUp(
@@ -344,10 +384,34 @@ Axis3D ConvertHtmlYUpNormalToWorldZUp(
 {
     const Axis3D Rotated = RotateHtmlYUpVector(
         HtmlNormal,
-        DegToRad(Transform.PitchDegrees),
-        DegToRad(Transform.YawDegrees),
-        DegToRad(Transform.RollDegrees));
-    return SafeNormalize({ Rotated.X, -Rotated.Z, Rotated.Y }, { 0.0f, 0.0f, 1.0f });
+        Transform.PitchDegrees * Frontier::Constants::DegToRadFloat,
+        Transform.YawDegrees * Frontier::Constants::DegToRadFloat,
+        Transform.RollDegrees * Frontier::Constants::DegToRadFloat);
+    return Frontier::Mathematics::NormalizeAxis(
+        Frontier::Mathematics::ConvertVectorBetweenBases(
+            Rotated,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp),
+        { 0.0f, 0.0f, 1.0f });
+}
+
+LinearRGB SrgbHexToLinearRgb(uint32_t HexRgb) noexcept
+{
+    const Frontier::ColourSpace::SrgbRgba8 Srgb {
+        static_cast<uint8_t>((HexRgb >> 16u) & 0xFFu),
+        static_cast<uint8_t>((HexRgb >> 8u) & 0xFFu),
+        static_cast<uint8_t>(HexRgb & 0xFFu),
+        255u,
+    };
+    const Frontier::ColourSpace::LinearRgba Lin = Frontier::ColourSpace::ConvertSrgb8ToLinear(
+        Srgb,
+        Frontier::ColourSpace::TransferCurveCategory::PiecewiseSrgb);
+    return Lin.ToLinearRgb();
+}
+
+float ComputeTripodMountHeight(const TripodParams& Params) noexcept
+{
+    return Params.StandHeight + Params.ColumnLift + (Params.Casters ? 0.08f : 0.0f) + (Params.FloorMat ? 0.032f : 0.0f);
 }
 
 void RegisterStudioBaseMaterials(
@@ -372,7 +436,7 @@ void RegisterStudioBaseMaterials(
     // Cyclorama cove: balanced neutral 40% photographic studio plaster cove
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor      = SrgbHexToLinear(0xaab0ba);
+        M.Diffuse.BaseColor      = SrgbHexToLinearRgb(0xaab0ba);
         M.Specular.Roughness     = 0.48f;
         M.Specular.DielectricIOR = 1.44f;
         M.Specular.SpecularWeight = 0.36f;
@@ -382,7 +446,7 @@ void RegisterStudioBaseMaterials(
     // Glossy studio slate tiles (alternating subtle charcoal slate pair)
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor            = SrgbHexToLinear(0x1b1f26);
+        M.Diffuse.BaseColor            = SrgbHexToLinearRgb(0x1b1f26);
         M.Specular.Roughness           = 0.14f;
         M.Specular.DielectricIOR       = 1.54f;
         M.Specular.SpecularWeight      = 0.72f;
@@ -391,7 +455,7 @@ void RegisterStudioBaseMaterials(
         Reg(StudioMaterialCode::TiledFloor, "StudioTiledFloor", M);
 
         SurfaceMaterial Alt = M;
-        Alt.Diffuse.BaseColor  = SrgbHexToLinear(0x171b21);
+        Alt.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x171b21);
         Alt.Specular.Roughness = 0.17f;
         Reg(StudioMaterialCode::TiledFloorAlt, "StudioTiledFloorAlt", Alt);
     }
@@ -399,7 +463,7 @@ void RegisterStudioBaseMaterials(
     // Dark industrial ceiling ribs
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor      = SrgbHexToLinear(0x181b20);
+        M.Diffuse.BaseColor      = SrgbHexToLinearRgb(0x181b20);
         M.Specular.Roughness     = 0.62f;
         M.Specular.Metalness     = 0.28f;
         M.Specular.DielectricIOR = 1.45f;
@@ -409,7 +473,7 @@ void RegisterStudioBaseMaterials(
     // Matte dark anodized aluminum / stand tubes
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0x21252b);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x21252b);
         M.Specular.Roughness = 0.34f;
         M.Specular.Metalness = 0.78f;
         Reg(StudioMaterialCode::DarkMetal, "StudioDarkMetal", M);
@@ -418,7 +482,7 @@ void RegisterStudioBaseMaterials(
     // Brushed chrome steel (camera mounts, risers, hydraulic rods)
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0xd8dde5);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0xd8dde5);
         M.Specular.Roughness = 0.16f;
         M.Specular.Metalness = 0.96f;
         Reg(StudioMaterialCode::ChromeMetal, "StudioChromeMetal", M);
@@ -427,7 +491,7 @@ void RegisterStudioBaseMaterials(
     // Matte vulcanized rubber (floor mats, cables, grip rings)
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor      = SrgbHexToLinear(0x121417);
+        M.Diffuse.BaseColor      = SrgbHexToLinearRgb(0x121417);
         M.Specular.Roughness     = 0.82f;
         M.Specular.DielectricIOR = 1.42f;
         M.Specular.SpecularWeight = 0.25f;
@@ -447,7 +511,7 @@ void RegisterStudioBaseMaterials(
     // Parabolic umbrella reflective silver fabric
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0xcdd4de);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0xcdd4de);
         M.Specular.Roughness = 0.18f;
         M.Specular.Metalness = 0.92f;
         Reg(StudioMaterialCode::UmbrellaSilver, "StudioUmbrellaSilver", M);
@@ -456,7 +520,7 @@ void RegisterStudioBaseMaterials(
     // Calibrated tether laptop & telemetry monitor LCD
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor                        = SrgbHexToLinear(0x224c78);
+        M.Diffuse.BaseColor                        = SrgbHexToLinearRgb(0x224c78);
         M.Specular.Roughness                       = 0.12f;
         M.PorosityLight.EmissionLuminanceNits      = 0.95f;
         M.PorosityLight.BlackbodyTemperatureKelvin = 6500.0f;
@@ -466,7 +530,7 @@ void RegisterStudioBaseMaterials(
     // Rugged Pelican flight case polymer
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor      = SrgbHexToLinear(0x272b33);
+        M.Diffuse.BaseColor      = SrgbHexToLinearRgb(0x272b33);
         M.Specular.Roughness     = 0.56f;
         M.Specular.DielectricIOR = 1.48f;
         Reg(StudioMaterialCode::PelicanCase, "StudioPelicanCase", M);
@@ -475,9 +539,9 @@ void RegisterStudioBaseMaterials(
     // Lobby 2 Forest LED volume screen
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor                        = SrgbHexToLinear(0x2d4c36);
+        M.Diffuse.BaseColor                        = SrgbHexToLinearRgb(0x2d4c36);
         M.Specular.Roughness                       = 0.35f;
-        M.PorosityLight.EmissionLuminanceNits      = 1.65f;
+        M.PorosityLight.EmissionLuminanceNits      = 4.50f;
         M.PorosityLight.BlackbodyTemperatureKelvin = 5300.0f;
         Reg(StudioMaterialCode::ForestBackdrop, "StudioForestBackdrop", M);
     }
@@ -485,7 +549,7 @@ void RegisterStudioBaseMaterials(
     // Duvetyne matte black studio V-flag & proscenium
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x0c0d10);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x0c0d10);
         M.Specular.Roughness      = 0.92f;
         M.Specular.SpecularWeight = 0.08f;
         Reg(StudioMaterialCode::BlackFlag, "StudioBlackFlag", M);
@@ -494,7 +558,7 @@ void RegisterStudioBaseMaterials(
     // Industrial steel fan housing & structural columns
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0x3a404a);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x3a404a);
         M.Specular.Roughness = 0.42f;
         M.Specular.Metalness = 0.72f;
         Reg(StudioMaterialCode::FanHousing, "StudioFanHousing", M);
@@ -503,7 +567,7 @@ void RegisterStudioBaseMaterials(
     // Spinning aluminum wind fan blade
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0xaab3bf);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0xaab3bf);
         M.Specular.Roughness = 0.24f;
         M.Specular.Metalness = 0.90f;
         Reg(StudioMaterialCode::FanBlade, "StudioFanBlade", M);
@@ -512,7 +576,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Cherry-Red mechanic's tool cabinets & kerbs
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0xc81e24);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0xc81e24);
         M.Specular.Roughness      = 0.22f;
         M.Clearcoat.CoatWeight    = 0.68f;
         M.Clearcoat.CoatRoughness = 0.08f;
@@ -522,7 +586,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Safety Yellow lift posts, handrails & air hoses
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor    = SrgbHexToLinear(0xe6a814);
+        M.Diffuse.BaseColor    = SrgbHexToLinearRgb(0xe6a814);
         M.Specular.Roughness   = 0.32f;
         M.Clearcoat.CoatWeight = 0.45f;
         Reg(StudioMaterialCode::SafetyYellow, "StudioSafetyYellow", M);
@@ -531,7 +595,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Sealed concrete pit floor & grandstand masonry
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x5d626a);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x5d626a);
         M.Specular.Roughness      = 0.48f;
         M.Specular.SpecularWeight = 0.46f;
         Reg(StudioMaterialCode::ConcreteGarage, "StudioConcreteGarage", M);
@@ -540,7 +604,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 FIA track asphalt
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x23262b);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x23262b);
         M.Specular.Roughness      = 0.72f;
         M.Specular.SpecularWeight = 0.32f;
         Reg(StudioMaterialCode::TrackAsphalt, "StudioTrackAsphalt", M);
@@ -549,7 +613,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Crisp white FIA track markings & kerbs
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0xe8ecf0);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0xe8ecf0);
         M.Specular.Roughness = 0.52f;
         Reg(StudioMaterialCode::TrackPaintWhite, "StudioTrackPaintWhite", M);
     }
@@ -557,7 +621,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Mowed trackside grass runoff
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x3a642e);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x3a642e);
         M.Specular.Roughness      = 0.84f;
         M.Specular.SpecularWeight = 0.18f;
         Reg(StudioMaterialCode::TrackGrass, "StudioTrackGrass", M);
@@ -566,7 +630,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Stadium canopy blue & gas cylinders
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0x25578f);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x25578f);
         M.Specular.Roughness = 0.34f;
         M.Specular.Metalness = 0.42f;
         Reg(StudioMaterialCode::StadiumSkyBlue, "StudioStadiumSkyBlue", M);
@@ -575,7 +639,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Stadium afternoon sky dome
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor                        = SrgbHexToLinear(0x88b8ea);
+        M.Diffuse.BaseColor                        = SrgbHexToLinearRgb(0x88b8ea);
         M.Specular.Roughness                       = 0.90f;
         M.PorosityLight.EmissionLuminanceNits      = 0.90f;
         M.PorosityLight.BlackbodyTemperatureKelvin = 6200.0f;
@@ -585,7 +649,7 @@ void RegisterStudioBaseMaterials(
     // Lobby 3 Butcher-block oak workbench top
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x6e4a2b);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x6e4a2b);
         M.Specular.Roughness      = 0.56f;
         M.Specular.SpecularWeight = 0.36f;
         Reg(StudioMaterialCode::TimberBench, "StudioTimberBench", M);
@@ -594,14 +658,14 @@ void RegisterStudioBaseMaterials(
     // Shared automotive component materials
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0xbec6d1);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0xbec6d1);
         M.Specular.Roughness = 0.18f;
         M.Specular.Metalness = 0.95f;
         Reg(StudioMaterialCode::VehicleRimAlloy, "VehicleRimAlloy", M);
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x0b0d10);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x0b0d10);
         M.Specular.Roughness      = 0.08f;
         M.Clearcoat.CoatWeight    = 0.92f;
         M.Clearcoat.CoatRoughness = 0.04f;
@@ -609,7 +673,7 @@ void RegisterStudioBaseMaterials(
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor               = SrgbHexToLinear(0x0c141d);
+        M.Diffuse.BaseColor               = SrgbHexToLinearRgb(0x0c141d);
         M.Specular.Roughness              = 0.04f;
         M.Specular.DielectricIOR          = 1.52f;
         M.Specular.SpecularWeight         = 0.95f;
@@ -620,27 +684,27 @@ void RegisterStudioBaseMaterials(
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0x16181c);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x16181c);
         M.Specular.Roughness = 0.58f;
         Reg(StudioMaterialCode::VehicleIntakePolymer, "VehicleIntakePolymer", M);
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor       = SrgbHexToLinear(0x101114);
+        M.Diffuse.BaseColor       = SrgbHexToLinearRgb(0x101114);
         M.Specular.Roughness      = 0.84f;
         M.Specular.SpecularWeight = 0.22f;
         Reg(StudioMaterialCode::VehicleTireRubber, "VehicleTireRubber", M);
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor  = SrgbHexToLinear(0x7c838d);
+        M.Diffuse.BaseColor  = SrgbHexToLinearRgb(0x7c838d);
         M.Specular.Roughness = 0.22f;
         M.Specular.Metalness = 0.90f;
         Reg(StudioMaterialCode::VehicleTrimMetal, "VehicleTrimMetal", M);
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor                        = SrgbHexToLinear(0x1f2630);
+        M.Diffuse.BaseColor                        = SrgbHexToLinearRgb(0x1f2630);
         M.Specular.Roughness                       = 0.05f;
         M.Specular.DielectricIOR                   = 1.54f;
         M.Specular.SpecularWeight                  = 0.96f;
@@ -653,7 +717,7 @@ void RegisterStudioBaseMaterials(
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor                        = SrgbHexToLinear(0xa81012);
+        M.Diffuse.BaseColor                        = SrgbHexToLinearRgb(0xa81012);
         M.Specular.Roughness                       = 0.08f;
         M.PorosityLight.EmissionLuminanceNits      = 0.42f;
         M.PorosityLight.BlackbodyTemperatureKelvin = 2200.0f;
@@ -661,7 +725,7 @@ void RegisterStudioBaseMaterials(
     }
     {
         SurfaceMaterial M {};
-        M.Diffuse.BaseColor    = SrgbHexToLinear(0xc42026);
+        M.Diffuse.BaseColor    = SrgbHexToLinearRgb(0xc42026);
         M.Specular.Roughness   = 0.20f;
         M.Specular.Metalness   = 0.35f;
         M.Clearcoat.CoatWeight = 0.85f;
@@ -910,10 +974,10 @@ StudioBuiltMesh BuildTripodSurface(
     HtmlStudioMeshBuilder B("StudioTripod", Palette, Transform);
     const float StandH    = Params.StandHeight;
     const float Lift      = Params.ColumnLift;
-    const float SpreadRad = DegToRad(Params.LegSpreadDeg);
+    const float SpreadRad = Params.LegSpreadDeg * Frontier::Constants::DegToRadFloat;
     const float TubeR     = Params.TubeRadius;
     const int   LegSegs   = static_cast<int>(std::clamp(Params.LegSegments, 2u, 4u));
-    const float HeadTilt  = DegToRad(Params.HeadTiltDeg);
+    const float HeadTilt  = Params.HeadTiltDeg * Frontier::Constants::DegToRadFloat;
 
     const float BaseY    = (Params.FloorMat ? 0.032f : 0.0f) + (Params.Casters ? 0.08f : 0.0f);
     const float ApexY    = BaseY + StandH * 0.72f;
@@ -1010,7 +1074,7 @@ StudioBuiltMesh BuildCinemaCameraSurface(
     const StudioMeshBakeTransform& Transform)
 {
     HtmlStudioMeshBuilder B("StudioCinemaCamera", Palette, Transform);
-    const float Tilt   = DegToRad(Params.PitchDeg);
+    const float Tilt   = Params.PitchDeg * Frontier::Constants::DegToRadFloat;
     const float CosT   = std::cos(Tilt);
     const float SinT   = std::sin(Tilt);
     constexpr float PivotY = 0.12f;
@@ -1074,7 +1138,7 @@ StudioBuiltMesh BuildLightFixtureSurface(
     const float Aw    = Params.ApertureWidth;
     const float Ah    = Params.ApertureHeight;
     const float Depth = Params.HousingDepth;
-    const float Tilt  = DegToRad(Params.YokeTiltDeg);
+    const float Tilt  = Params.YokeTiltDeg * Frontier::Constants::DegToRadFloat;
 
     if (Params.FixtureStyle == "Overhead Softbox")
     {
@@ -1155,7 +1219,7 @@ StudioBuiltMesh BuildLightFixtureSurface(
     if (Params.FixtureStyle == "Barn-Door Fresnel")
     {
         const float Radius = std::max(0.14f, Aw * 0.45f);
-        const float Flare  = DegToRad(Params.BarnDoorFlare);
+        const float Flare  = Params.BarnDoorFlare * Frontier::Constants::DegToRadFloat;
         B.AddTube({ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.10f, 0.0f }, 0.018f, 0.018f, 8u, StudioMaterialCode::DarkMetal);
         B.AddBox({ 0.0f, 0.09f, 0.0f }, { Radius + 0.06f, 0.014f, 0.02f }, StudioMaterialCode::DarkMetal);
         B.AddBox({ -(Radius + 0.05f), 0.24f, 0.0f }, { 0.014f, 0.16f, 0.022f }, StudioMaterialCode::DarkMetal);
@@ -1446,7 +1510,7 @@ StudioBuiltMesh BuildStudioFanSurface(
     HtmlStudioMeshBuilder B("StudioWindFan", Palette, Transform);
     const float HubY  = Params.StandHeight;
     const float CageR = Params.FanRadius;
-    const float Tilt  = DegToRad(Params.TiltDeg);
+    const float Tilt  = Params.TiltDeg * Frontier::Constants::DegToRadFloat;
     const float CosT  = std::cos(Tilt);
     const float SinT  = std::sin(Tilt);
 
@@ -2029,7 +2093,7 @@ StudioBuiltMesh BuildRaceTrackSurface(
             const Axis3D D  { std::cos(Th0) * Rad1, Y1, std::sin(Th0) * Rad1 - 15.0f };
             const auto InN = [](Axis3D P) noexcept -> Axis3D
             {
-                return SafeNormalize({ -P.X, -P.Y, -(P.Z + 15.0f) }, { 0.0f, -1.0f, 0.0f });
+                return Frontier::Mathematics::NormalizeAxis({ -P.X, -P.Y, -(P.Z + 15.0f) }, { 0.0f, -1.0f, 0.0f });
             };
             B.PushTri(A, C, Bb, InN(A), InN(C), InN(Bb), StudioMaterialCode::StadiumSkyDome);
             B.PushTri(A, D, C,  InN(A), InN(D), InN(C),  StudioMaterialCode::StadiumSkyDome);
@@ -2226,22 +2290,36 @@ StudioBuiltMesh BuildAssembledControlVehicleSurface(
     Out.AuthoredCornerNormals.reserve(static_cast<std::size_t>(TriCount) * 9u);
 
     // Vehicle.Triangles are in FrontierWorldZUp (+X forward, +Y left, +Z up, resting at Z = 0).
-    // Map WorldZUp (X, Y, Z) -> HTML Y-up (X, Z, -Y) -> apply Transform -> WorldZUp (X', -Z', Y')!
-    const float PitchRad = DegToRad(Transform.PitchDegrees);
-    const float YawRad   = DegToRad(Transform.YawDegrees);
-    const float RollRad  = DegToRad(Transform.RollDegrees);
+    // Convert via Engine CoordinateSpace (ZUp <-> YUp) around the Y-up bake rotation!
+    const float PitchRad = Transform.PitchDegrees * Frontier::Constants::DegToRadFloat;
+    const float YawRad   = Transform.YawDegrees * Frontier::Constants::DegToRadFloat;
+    const float RollRad  = Transform.RollDegrees * Frontier::Constants::DegToRadFloat;
 
     const auto XformPos = [&](Axis3D ZupPt) noexcept -> Axis3D
     {
-        const Axis3D Html { ZupPt.X * Transform.UniformScale, ZupPt.Z * Transform.UniformScale, -ZupPt.Y * Transform.UniformScale };
-        const Axis3D Rot  = RotateHtmlYUpVector(Html, PitchRad, YawRad, RollRad);
-        return { Rot.X, -Rot.Z, Rot.Y };
+        const Axis3D Html = Frontier::Mathematics::ConvertVectorBetweenBases(
+            ZupPt * Transform.UniformScale,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp);
+        const Axis3D Rot = RotateHtmlYUpVector(Html, PitchRad, YawRad, RollRad);
+        return Frontier::Mathematics::ConvertVectorBetweenBases(
+            Rot,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp);
     };
     const auto XformNorm = [&](Axis3D ZupN) noexcept -> Axis3D
     {
-        const Axis3D Html { ZupN.X, ZupN.Z, -ZupN.Y };
-        const Axis3D Rot  = RotateHtmlYUpVector(Html, PitchRad, YawRad, RollRad);
-        return SafeNormalize({ Rot.X, -Rot.Z, Rot.Y }, { 0.0f, 0.0f, 1.0f });
+        const Axis3D Html = Frontier::Mathematics::ConvertVectorBetweenBases(
+            ZupN,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp,
+            Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp);
+        const Axis3D Rot = RotateHtmlYUpVector(Html, PitchRad, YawRad, RollRad);
+        return Frontier::Mathematics::NormalizeAxis(
+            Frontier::Mathematics::ConvertVectorBetweenBases(
+                Rot,
+                Frontier::Mathematics::WorldCoordinateBasis::RightHandedYUp,
+                Frontier::Mathematics::WorldCoordinateBasis::RightHandedZUp),
+            { 0.0f, 0.0f, 1.0f });
     };
 
     const auto ResolvePartSlot = [&](VehicleSurfaceSlot Slot) noexcept -> uint16_t

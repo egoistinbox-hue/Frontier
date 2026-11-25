@@ -6031,7 +6031,7 @@ bool VulkanWorldRenderSequence::ExecuteWorldRenderDispatch(
                 SceneLights,
                 Scene.StaticLightGeneration,
                 Scene.DynamicLightGeneration,
-                { Camera.OriginWorld.X, Camera.OriginWorld.Y, Camera.OriginWorld.Z },
+                { Camera.CameraOrigin.X, Camera.CameraOrigin.Y, Camera.CameraOrigin.Z },
                 LightSyncOpts);
 
             const StaticClipmapTelemetry& ClipTel = UnifiedLights.InspectStaticClipmap().QueryTelemetry();

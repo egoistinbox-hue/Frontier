@@ -126,9 +126,11 @@ enum class TirePresetCategory : uint8_t
 
 enum class WheelContactQueryMode : uint8_t
 {
-    SingleRay         = 0u, // Single vertical raycast from suspension hardpoint (fastest baseline)
-    MultiRayArc       = 1u, // 5-ray circumferential lower tire arc (-28..+28 deg): smooth curb climb & ~2-3x faster than 3D sweep
-    CylinderShapeCast = 2u, // Full Jolt 3D CylinderShape sweep via NarrowPhaseQuery::CastShape
+    SingleRay           = 0u, // Single vertical raycast from suspension hardpoint (fastest baseline)
+    MultiRayArc         = 1u, // 5-ray 1-lane +-40 deg fan/arc along steered wheel plane (AI/traffic cars)
+    HeroThreeLaneFanArc = 2u, // Hero vehicle: 3 lateral lanes (Left -0.40W, Center 0, Right +0.40W) x 5-ray +-40 deg fan/arc (15 rays/wheel)
+    SphereShapeCast     = 3u, // Jolt 3D SphereShape sweep along suspension travel
+    CylinderShapeCast   = 4u, // Full Jolt 3D CylinderShape sweep via NarrowPhaseQuery::CastShape
 };
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -584,11 +586,13 @@ struct AerodynamicPackageSpecification
     float BodySideForceCoeff        = 0.65f;  // [-]
 
     // Rear wing (adaptive + brake deploy; detaches cleanly if RearWing Dock breaks)
-    bool  RearWingAttached          = true;
-    float WingAreaM2                = 0.92f;  // [m^2]
-    float WingBaseDownforceCoeff    = 0.95f;  // [-]
-    float WingBaseDragCoeff         = 0.14f;  // [-]
-    float WingBrakeDeployBoost      = 0.35f;  // [-] - Additional downforce/drag fraction under heavy braking
+    bool                RearWingAttached          = true;
+    float               WingAreaM2                = 0.92f;  // [m^2]
+    float               WingBaseDownforceCoeff    = 0.95f;  // [-]
+    float               WingBaseDragCoeff         = 0.14f;  // [-]
+    float               WingBrakeDeployBoost      = 0.35f;  // [-] - Additional downforce/drag fraction under heavy braking
+    float               RearWingBreakForceN       = 1200.0f;// [N] - BreakForceN of RearWing Dock constraint
+    Mathematics::Axis3D RearWingLocalMountMeters  { -2.9822f, 0.8367f, 0.0f }; // [m] - Chassis-local RearWing Dock anchor
 
     // Front splitter & underbody diffuser (true floor clearance ground effect)
     float SplitterAreaM2            = 0.55f;  // [m^2]
@@ -639,11 +643,12 @@ struct VehicleRigSpecification
     float                                        TrackWidthFrontM     = 2.095f;  // [m]
     float                                        TrackWidthRearM      = 2.095f;  // [m]
 
-    DrivetrainLayoutCategory                     DrivetrainLayout     = DrivetrainLayoutCategory::AllWheelDrive;
-    ForcedInductionCategory                      ForcedInduction      = ForcedInductionCategory::Turbocharged;
-    WheelContactQueryMode                        WheelContactMode     = WheelContactQueryMode::MultiRayArc; // [-] - Default 5-ray tire arc
-    uint16_t                                     ChassisMaterialId    = 0u;                                 // [id] - PhysicsMaterial for hull contacts
-    bool                                         EnableDebugLogging   = true;                               // [-] - Emit structured events to PhysicsDebugLog
+    DrivetrainLayoutCategory                     DrivetrainLayout          = DrivetrainLayoutCategory::AllWheelDrive;
+    ForcedInductionCategory                      ForcedInduction           = ForcedInductionCategory::Turbocharged;
+    WheelContactQueryMode                        WheelContactMode          = WheelContactQueryMode::HeroThreeLaneFanArc; // [-] - Default Hero 3-lane (L/C/R) x +-40 deg fan/arc
+    uint16_t                                     ChassisMaterialId         = 0u;   // [id] - PhysicsMaterial for hull contacts
+    bool                                         BindAttachmentConstraints = true; // [-]  - Bind Frontier ConstraintSolver joints (Spring/Hinge/Dock) replacing legacy sockets
+    bool                                         EnableDebugLogging        = true; // [-]  - Emit structured events to PhysicsDebugLog
 
     EngineSpecification                          Engine               {};
     EngineOilSpecification                       EngineOil            {};

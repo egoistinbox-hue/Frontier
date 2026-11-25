@@ -845,20 +845,26 @@ bool ValidateControlVehicleFullSuite(const ControlVehicleBuildResult& Built)
 
         const auto Single = RunCurbBenchmark(WheelContactQueryMode::SingleRay);
         const auto Arc    = RunCurbBenchmark(WheelContactQueryMode::MultiRayArc);
+        const auto Hero3  = RunCurbBenchmark(WheelContactQueryMode::HeroThreeLaneFanArc);
+        const auto Sphere = RunCurbBenchmark(WheelContactQueryMode::SphereShapeCast);
         const auto Cyl    = RunCurbBenchmark(WheelContactQueryMode::CylinderShapeCast);
 
         std::printf("[INFO] Wheel Contact Curb Benchmark (5.5 cm sharp step):\n");
-        std::printf("       SingleRay         : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
+        std::printf("       SingleRay                : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
             Single.AvgStepUs, Single.PeakSuspVelMps, Single.PeakLoadN, Single.ExitSpeedKph);
-        std::printf("       MultiRayArc (5)   : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
+        std::printf("       MultiRayArc (1x5 +-40d)  : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
             Arc.AvgStepUs, Arc.PeakSuspVelMps, Arc.PeakLoadN, Arc.ExitSpeedKph);
-        std::printf("       CylinderShapeCast : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
+        std::printf("       HeroThreeLaneFan (3x5)   : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
+            Hero3.AvgStepUs, Hero3.PeakSuspVelMps, Hero3.PeakLoadN, Hero3.ExitSpeedKph);
+        std::printf("       SphereShapeCast          : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
+            Sphere.AvgStepUs, Sphere.PeakSuspVelMps, Sphere.PeakLoadN, Sphere.ExitSpeedKph);
+        std::printf("       CylinderShapeCast        : %.1f us/step | PeakSuspVel=%.2f m/s | PeakLoad=%.0f N | Exit=%.1f km/h\n",
             Cyl.AvgStepUs, Cyl.PeakSuspVelMps, Cyl.PeakLoadN, Cyl.ExitSpeedKph);
 
-        if (!CheckCondition(Single.Valid && Arc.Valid && Cyl.Valid,
-                "All 3 wheel contact modes (SingleRay, MultiRayArc, CylinderShapeCast) traverse 5.5 cm curb stably")) return false;
-        if (!CheckCondition(Arc.PeakSuspVelMps < Single.PeakSuspVelMps && Cyl.PeakSuspVelMps < Single.PeakSuspVelMps,
-                "MultiRayArc & CylinderShapeCast smooth out single-ray vertical curb impulse spike")) return false;
+        if (!CheckCondition(Single.Valid && Arc.Valid && Hero3.Valid && Sphere.Valid && Cyl.Valid,
+                "All 5 wheel contact modes (SingleRay, MultiRayArc, HeroThreeLaneFanArc, SphereShapeCast, CylinderShapeCast) traverse 5.5 cm curb stably")) return false;
+        if (!CheckCondition(Arc.PeakSuspVelMps < Single.PeakSuspVelMps && Hero3.PeakSuspVelMps < Single.PeakSuspVelMps && Cyl.PeakSuspVelMps < Single.PeakSuspVelMps,
+                "MultiRayArc, HeroThreeLaneFanArc & CylinderShapeCast smooth out single-ray vertical curb impulse spike")) return false;
     }
 
     //------------------------------------------------------------------------------------------------------------------

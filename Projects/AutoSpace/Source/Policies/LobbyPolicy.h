@@ -39,6 +39,7 @@ struct LobbyPolicy
     bool          EnableCameraRigs           = true;  // [-] - Mount procedural cinema tripods, bodies & scene cameras
     bool          EnableCrewProps            = true;  // [-] - Mount tether workstation, Pelican cases, garage props & cables
     bool          EnableConfiguratorOrbit    = true;  // [-] - Advance configurator camera orbit when ticking
+    bool          EnableHeroVehiclePhysics   = false; // [-] - Bind live Jolt VehiclePhysicsRig (3-lane fan trace + Constraints) to Hero Vehicle
     uint32_t      ActiveCameraPresetIndex    = 0u;    // [idx] - Active configurator camera preset [0..5]
 };
 

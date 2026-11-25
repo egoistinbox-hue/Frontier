@@ -11,6 +11,7 @@
 
 #include "Engine/Codecs/ControlVehicleSurfaceDecoder.h"
 #include "Engine/Codecs/PhotometricProfile.h"
+#include "Engine/ComponentClass/ControlVehicleClassBuilder.h"
 #include "Engine/Configuration/BuildConfiguration.h"
 #include "Engine/GeometricRaster/GlobalIllumination/TieredWorldRenderSequence.h"
 #include "Engine/GeometrySpace/Network/PolygonNetwork.h"
@@ -19,6 +20,8 @@
 #include "Engine/ParticleSpace/ParticleGpuSimulation.h"
 #include "Engine/ParticleSpace/ParticleTemplateRegistry.h"
 #include "Engine/SimulationSpace/EffectLayers/EffectLayerSpecification.h"
+#include "Engine/SimulationSpace/PhysicsSpace/PhysicsExtension.h"
+#include "Engine/SimulationSpace/PhysicsSpace/VehicleDynamicsSolver.h"
 #include "Engine/SpatialAcceleration/ClusterPyramid.h"
 #include "Engine/World/CategoryInstances.h"
 #include "Engine/World/WorldInstanceRegister.h"
@@ -94,6 +97,12 @@ public:
 #endif
 
     void TickSimulation(double FixedDeltaSeconds) noexcept;
+
+    [[nodiscard]] bool SubmitHeroVehicleDirective(
+        const Frontier::SimulationSpace::PhysicsSpace::VehicleControlDirective& Directive) noexcept;
+    [[nodiscard]] Frontier::SimulationSpace::PhysicsSpace::VehiclePhysicsRig::VehicleReadingLease
+        AcquireHeroVehicleReading() const noexcept;
+    [[nodiscard]] bool QueryHeroVehiclePhysicsActive() const noexcept { return HeroVehiclePhysicsActive; }
 
     [[nodiscard]] LobbyLifecycleTelemetry                                       InspectTelemetry() const noexcept;
     [[nodiscard]] const LobbyPolicy&                                            InspectPolicy() const noexcept { return ActivePolicy; }
@@ -198,6 +207,16 @@ private:
     std::vector<Frontier::ParticleSpace::ParticleCloudNode>              ParticleClouds         {};
     Frontier::ParticleSpace::ParticleGpuSimulation                       ParticleSimulation     {};
     Frontier::ParticleSpace::ParticleSimulationRegion                    ParticleRegion         {};
+
+    // Optional live Jolt VehiclePhysicsRig (3-lane fan trace + socket-free ConstraintSolver rig) bound to Hero Vehicle
+    bool                                                                 ControlVehicleClassReady = false;
+    Frontier::ComponentClass::ControlVehicleBuildResult                  ControlVehicleClass      {};
+    bool                                                                 HeroVehiclePhysicsActive = false;
+    Frontier::World::InstanceToken                                       HeroVehicleEntityToken   {};
+    Frontier::Mathematics::Axis3D                                        HeroVehicleSpawnZUp      {};
+    std::unique_ptr<Frontier::SimulationSpace::PhysicsSpace::PhysicsExtension>  HeroPhysics       {};
+    std::unique_ptr<Frontier::SimulationSpace::PhysicsSpace::VehiclePhysicsRig> HeroVehicleRig    {};
+
     double                                                               SimulationClockSeconds = 0.0;
     uint32_t                                                             VehicleCount           = 0u;
     uint32_t                                                             TotalMeshTriangles     = 0u;

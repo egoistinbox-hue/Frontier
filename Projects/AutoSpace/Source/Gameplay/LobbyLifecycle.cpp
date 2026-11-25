@@ -46,6 +46,20 @@ void LobbyLifecycle::Shutdown() noexcept
 
 void LobbyLifecycle::ClearLobbyObjects() noexcept
 {
+    if (HeroVehicleRig && HeroPhysics)
+    {
+        HeroVehicleRig->Finalize(*HeroPhysics);
+    }
+    HeroVehicleRig.reset();
+    if (HeroPhysics)
+    {
+        HeroPhysics->Finalize();
+    }
+    HeroPhysics.reset();
+    HeroVehiclePhysicsActive = false;
+    HeroVehicleEntityToken   = {};
+    HeroVehicleSpawnZUp      = {};
+
     // Destroy RAII CategoryInstanceHandles before clearing WorldRegister or unbinding Outliner
     ManagedCategoryHandles.clear();
     FolderTokens.clear();
@@ -132,6 +146,11 @@ bool LobbyLifecycle::EnsureSharedAssetsLoaded(
     }
 
     SharedAssetsReady = true;
+    std::string ClassDiag {};
+    ControlVehicleClassReady = Frontier::ComponentClass::ControlVehicleClassBuilder::ConstructControlVehicle(
+        RepoRoot,
+        ControlVehicleClass,
+        ClassDiag);
     return true;
 }
 
@@ -181,6 +200,41 @@ bool LobbyLifecycle::InitializeAndBuild(
 
     (void)SceneSyncBridge.FlushRebuiltTransformsToScene(WorldRegister, WorldScene);
     FinalizeWorldSceneAcceleration();
+
+    if (ActivePolicy.EnableHeroVehiclePhysics && ControlVehicleClassReady && HeroVehicleEntityToken.QueryValid())
+    {
+        using namespace Frontier::SimulationSpace::PhysicsSpace;
+        PhysicsSimulationParameters PhysParams {};
+        PhysParams.GravityMps2 = { 0.0f, -9.80665f, 0.0f };
+        PhysParams.FixedStepHz = 120.0f;
+        HeroPhysics = std::make_unique<PhysicsExtension>(PhysParams);
+        if (HeroPhysics->Initialize())
+        {
+            RigidBodyDescriptor FloorDesc {};
+            FloorDesc.Shape.ShapeCategory     = CollisionShapeCategory::Box;
+            FloorDesc.Shape.HalfExtentsMeters = { 500.0f, 0.5f, 500.0f };
+            FloorDesc.MotionCategory          = RigidMotionCategory::Static;
+            FloorDesc.PositionMeters          = { 0.0f, -0.5f, 0.0f };
+            FloorDesc.CollisionChannel        = static_cast<uint16_t>(CollisionLayerChannel::StaticEnvironment);
+            (void)HeroPhysics->IssueRigidBody(FloorDesc);
+
+            VehicleRigSpecification Spec =
+                VehiclePhysicsRig::ConstructSpecificationFromControlVehicle(ControlVehicleClass.ClassDefinition);
+            Spec.WheelContactMode          = WheelContactQueryMode::HeroThreeLaneFanArc;
+            Spec.BindAttachmentConstraints = true;
+
+            HeroVehicleRig = std::make_unique<VehiclePhysicsRig>();
+            const Axis3D SpawnYUp = ConvertVectorBetweenBases(
+                HeroVehicleSpawnZUp,
+                WorldCoordinateBasis::RightHandedZUp,
+                WorldCoordinateBasis::RightHandedYUp);
+            constexpr float ChassisGroundOffsetY = 0.41715f;
+            HeroVehiclePhysicsActive = HeroVehicleRig->Initialize(
+                *HeroPhysics,
+                Spec,
+                { SpawnYUp.X, SpawnYUp.Y + ChassisGroundOffsetY, SpawnYUp.Z });
+        }
+    }
 
     if (ActivePolicy.EnableEngineParticles && !ParticleClouds.empty())
     {
@@ -324,6 +378,11 @@ InstanceToken LobbyLifecycle::AppendSurfaceEntity(
     (void)WorldRegister.AssignWorldTransform(Tok, WorldTranslation.X, WorldTranslation.Y, WorldTranslation.Z);
     SceneSyncBridge.BindSurfaceToClusterInstance(Tok, ClusterIdx);
     SyncOutlinerEntryMetadata(Tok, Subtitle, "geom:studio", WorldTranslation);
+    if (StableId == "vehicle-hero")
+    {
+        HeroVehicleEntityToken = Tok;
+        HeroVehicleSpawnZUp    = WorldTranslation;
+    }
     ManagedCategoryHandles.push_back(std::move(Handle));
     return Tok;
 }
@@ -501,6 +560,29 @@ void LobbyLifecycle::TickSimulation(double FixedDeltaSeconds) noexcept
     SimulationClockSeconds += FixedDeltaSeconds;
     const float Dt = static_cast<float>(std::clamp(FixedDeltaSeconds, 0.001, 0.05));
 
+    if (HeroVehiclePhysicsActive && HeroPhysics && HeroVehicleRig && HeroVehicleEntityToken.QueryValid())
+    {
+        constexpr double SubDt = 1.0 / 120.0;
+        const uint32_t SubSteps = std::max(1u, static_cast<uint32_t>(std::lround(static_cast<double>(Dt) / SubDt)));
+        for (uint32_t S = 0u; S < std::min(SubSteps, 6u); ++S)
+        {
+            HeroVehicleRig->StepOnPhysicsThread(*HeroPhysics, SubDt);
+            HeroPhysics->Tick(SubDt);
+        }
+        const auto Reading = HeroVehicleRig->AcquireVehicleReading();
+        if (Reading.Valid())
+        {
+            constexpr float ChassisGroundOffsetY = 0.41715f;
+            const Axis3D WorldZUp = ConvertVectorBetweenBases(
+                { Reading->WorldPositionMeters.X,
+                  Reading->WorldPositionMeters.Y - ChassisGroundOffsetY,
+                  Reading->WorldPositionMeters.Z },
+                WorldCoordinateBasis::RightHandedYUp,
+                WorldCoordinateBasis::RightHandedZUp);
+            (void)WorldRegister.AssignWorldTransform(HeroVehicleEntityToken, WorldZUp.X, WorldZUp.Y, WorldZUp.Z);
+        }
+    }
+
     (void)World::ExecuteWorldSimulationSequence(WorldRegister, Dt, true);
     (void)SceneSyncBridge.FlushRebuiltTransformsToScene(WorldRegister, WorldScene);
 
@@ -513,6 +595,26 @@ void LobbyLifecycle::TickSimulation(double FixedDeltaSeconds) noexcept
             static_cast<float>(SimulationClockSeconds),
             Dt);
     }
+}
+
+bool LobbyLifecycle::SubmitHeroVehicleDirective(
+    const Frontier::SimulationSpace::PhysicsSpace::VehicleControlDirective& Directive) noexcept
+{
+    if (!HeroVehiclePhysicsActive || !HeroVehicleRig)
+    {
+        return false;
+    }
+    return HeroVehicleRig->SubmitControlDirective(Directive);
+}
+
+Frontier::SimulationSpace::PhysicsSpace::VehiclePhysicsRig::VehicleReadingLease
+LobbyLifecycle::AcquireHeroVehicleReading() const noexcept
+{
+    if (!HeroVehicleRig)
+    {
+        return {};
+    }
+    return HeroVehicleRig->AcquireVehicleReading();
 }
 
 LobbyLifecycleTelemetry LobbyLifecycle::InspectTelemetry() const noexcept

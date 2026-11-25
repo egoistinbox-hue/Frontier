@@ -626,7 +626,9 @@ VehicleRigSpecification VehiclePhysicsRig::ConstructSpecificationFromControlVehi
                 }
                 else if (Header.Title == "RearWingConstraint")
                 {
-                    Spec.Aerodynamics.RearWingAttached = C->DockConnected;
+                    Spec.Aerodynamics.RearWingAttached         = C->DockConnected;
+                    Spec.Aerodynamics.RearWingBreakForceN      = std::max(C->BreakForceNewtons, 200.0f);
+                    Spec.Aerodynamics.RearWingLocalMountMeters = Header.LocalTransform.LocationMeters;
                 }
             }
         }
@@ -855,6 +857,11 @@ bool VehiclePhysicsRig::Initialize(
         return false;
     }
 
+    if (Specification.BindAttachmentConstraints)
+    {
+        BindAttachmentConstraintRig(Physics, SpawnPositionMeters, SpawnOrientation);
+    }
+
     CalibrateSuspensionSprings();
     Initialized = true;
 
@@ -864,27 +871,306 @@ bool VehiclePhysicsRig::Initialize(
     if (Specification.EnableDebugLogging)
     {
         const char* ContactLabel =
-            (Specification.WheelContactMode == WheelContactQueryMode::SingleRay)        ? "SingleRay" :
-            (Specification.WheelContactMode == WheelContactQueryMode::MultiRayArc)      ? "MultiRayArc(5)" :
-                                                                                          "CylinderShapeCast";
+            (Specification.WheelContactMode == WheelContactQueryMode::SingleRay)           ? "SingleRay" :
+            (Specification.WheelContactMode == WheelContactQueryMode::MultiRayArc)         ? "MultiRayArc(5)" :
+            (Specification.WheelContactMode == WheelContactQueryMode::HeroThreeLaneFanArc) ? "HeroThreeLaneFanArc(3x5)" :
+            (Specification.WheelContactMode == WheelContactQueryMode::SphereShapeCast)     ? "SphereShapeCast" :
+                                                                                             "CylinderShapeCast";
         PhysicsDebugLog::AccessSharedJournal().AppendFormatted(
             0.0,
             PhysicsLogDomain::Vehicle,
             PhysicsLogSeverity::Event,
-            "Vehicle init: mass=%.1fkg hull=%s contact=%s fuel=%.1fL",
+            "Vehicle init: mass=%.1fkg hull=%s contact=%s constraints=%u fuel=%.1fL",
             LiveTotalMassKg,
             HullModeLabel,
             ContactLabel,
+            ActiveConstraintCount,
             FuelLiters);
     }
     return true;
 }
 
+void VehiclePhysicsRig::BindAttachmentConstraintRig(
+    PhysicsExtension&                 Physics,
+    const Mathematics::Axis3D&        SpawnPositionMeters,
+    const RigidOrientationQuaternion& SpawnOrientation) noexcept
+{
+    ReleaseAttachmentConstraintRig(Physics);
+    if (!ChassisBody.Valid())
+    {
+        return;
+    }
+
+    const Mathematics::Axis3D AxisUp = Mathematics::NormalizeAxis(
+        RotateByQuaternion(SpawnOrientation, { 0.0f, 1.0f, 0.0f }),
+        { 0.0f, 1.0f, 0.0f });
+
+    auto SpawnAttachmentProxy = [&](const Mathematics::Axis3D& LocalOffset, float MassKg) -> RigidBodyToken
+    {
+        RigidBodyDescriptor Desc {};
+        Desc.Shape.ShapeCategory  = CollisionShapeCategory::Sphere;
+        Desc.Shape.RadiusMeters   = 0.02f;
+        Desc.MotionCategory       = RigidMotionCategory::Dynamic;
+        Desc.ExplicitMassKg       = MassKg;
+        Desc.LinearDamping        = 0.15f;
+        Desc.AngularDamping       = 0.15f;
+        Desc.AllowSleep           = false;
+        Desc.IsTriggerSensor      = true;
+        Desc.ColliderProxyEnabled = false;
+        Desc.CollisionChannel     = static_cast<uint16_t>(CollisionLayerChannel::SensorTrigger);
+        Desc.CollideWithMask      = 0u;
+        Desc.PositionMeters       = AddAxis(SpawnPositionMeters, RotateByQuaternion(SpawnOrientation, LocalOffset));
+        Desc.Orientation          = SpawnOrientation;
+        return Physics.IssueRigidBody(Desc);
+    };
+
+    uint32_t BoundCount = 0u;
+    for (uint32_t I = 0u; I < MaxVehicleWheelCorners; ++I)
+    {
+        const auto& Corner = Specification.Corners[I];
+        auto&       W      = Wheels[I];
+
+        W.CarrierBody = SpawnAttachmentProxy(Corner.LocalMountMeters, 1.0f);
+        if (W.CarrierBody.Valid())
+        {
+            const Mathematics::Axis3D AnchorWorld =
+                AddAxis(SpawnPositionMeters, RotateByQuaternion(SpawnOrientation, Corner.LocalMountMeters));
+            ConstraintDescriptor SpringDesc {};
+            SpringDesc.Category              = ConstraintCategory::Spring;
+            SpringDesc.FirstBody             = ChassisBody;
+            SpringDesc.SecondBody            = W.CarrierBody;
+            SpringDesc.AnchorWorldMeters     = AnchorWorld;
+            SpringDesc.AxisUnit              = AxisUp;
+            SpringDesc.MinLimit              = -std::max(Corner.Suspension.MaxDroopMeters, 0.05f);
+            SpringDesc.MaxLimit              =  std::max(Corner.Suspension.MaxBumpMeters, 0.05f);
+            SpringDesc.SpringFrequencyHz     = 8.0f;
+            SpringDesc.SpringDampingRatio    = 0.90f;
+            SpringDesc.MotorDriveEnabled     = true;
+            SpringDesc.MotorVelocityMode     = false;
+            SpringDesc.MaxMotorTorqueOrForce = 2500.0f;
+            SpringDesc.DisableSelfCollide    = true;
+            SpringDesc.DriveCategory         = ConstraintDriveCategory::Hold;
+            SpringDesc.NormalizedPose        = 0.50f;
+            SpringDesc.ComponentInstanceTag  = 0x100ull + I;
+            W.SuspensionSpring = Physics.IssueConstraint(SpringDesc);
+            if (W.SuspensionSpring.Valid())
+            {
+                ++BoundCount;
+                W.ConstraintAnchorW   = AnchorWorld;
+                W.ConstraintAttachedW = AnchorWorld;
+                W.ConstraintIntact    = true;
+            }
+        }
+
+        if (Corner.Steerable)
+        {
+            const Mathematics::Axis3D KnuckleOffset {
+                Corner.LocalMountMeters.X,
+                Corner.LocalMountMeters.Y,
+                Corner.LocalMountMeters.Z,
+            };
+            W.SteerKnuckleBody = SpawnAttachmentProxy(KnuckleOffset, 1.0f);
+            if (W.SteerKnuckleBody.Valid())
+            {
+                const Mathematics::Axis3D AnchorWorld =
+                    AddAxis(SpawnPositionMeters, RotateByQuaternion(SpawnOrientation, KnuckleOffset));
+                ConstraintDescriptor SteerDesc {};
+                SteerDesc.Category              = ConstraintCategory::Hinge;
+                SteerDesc.FirstBody             = ChassisBody;
+                SteerDesc.SecondBody            = W.SteerKnuckleBody;
+                SteerDesc.AnchorWorldMeters     = AnchorWorld;
+                SteerDesc.AxisUnit              = AxisUp;
+                SteerDesc.MinLimit              = -std::max(Specification.SteeringRack.MaxSteerAngleRad, 0.35f);
+                SteerDesc.MaxLimit              =  std::max(Specification.SteeringRack.MaxSteerAngleRad, 0.35f);
+                SteerDesc.MotorDriveEnabled     = true;
+                SteerDesc.MotorVelocityMode     = false;
+                SteerDesc.MaxMotorTorqueOrForce = 240.0f;
+                SteerDesc.TargetMotorCoordinate = 0.0f;
+                SteerDesc.DisableSelfCollide    = true;
+                SteerDesc.DriveCategory         = ConstraintDriveCategory::Steer;
+                SteerDesc.ComponentInstanceTag  = 0x200ull + I;
+                W.SteerHinge = Physics.IssueConstraint(SteerDesc);
+                if (W.SteerHinge.Valid())
+                {
+                    ++BoundCount;
+                }
+            }
+        }
+    }
+
+    // RearWing breakable Dock constraint (replaces socket attachment and couples rupture into AeroRearDownforceN)
+    RearWingBody = SpawnAttachmentProxy(Specification.Aerodynamics.RearWingLocalMountMeters, 1.0f);
+    if (RearWingBody.Valid())
+    {
+        const Mathematics::Axis3D WingAnchorW =
+            AddAxis(SpawnPositionMeters, RotateByQuaternion(SpawnOrientation, Specification.Aerodynamics.RearWingLocalMountMeters));
+        ConstraintDescriptor DockDesc {};
+        DockDesc.Category               = ConstraintCategory::Dock;
+        DockDesc.FirstBody              = ChassisBody;
+        DockDesc.SecondBody             = RearWingBody;
+        DockDesc.AnchorWorldMeters      = WingAnchorW;
+        DockDesc.AxisUnit               = AxisUp;
+        DockDesc.BreakForceN            = std::max(Specification.Aerodynamics.RearWingBreakForceN, 200.0f);
+        DockDesc.SnapRadiusMeters       = 0.30f;
+        DockDesc.DockKeyHash            = ConstraintSolver::ComputeDockKeyHash("wing");
+        DockDesc.DockKeyMatched         = true;
+        DockDesc.DockInitiallyConnected = Specification.Aerodynamics.RearWingAttached;
+        DockDesc.DisableSelfCollide     = true;
+        DockDesc.DriveCategory          = ConstraintDriveCategory::AeroLoad;
+        DockDesc.ComponentInstanceTag   = 0x400ull;
+        RearWingDock = Physics.IssueConstraint(DockDesc);
+        if (RearWingDock.Valid())
+        {
+            ++BoundCount;
+            RearWingWorldPosM   = WingAnchorW;
+            RearWingWorldOrient = SpawnOrientation;
+        }
+    }
+
+    ActiveConstraintCount = BoundCount;
+}
+
+void VehiclePhysicsRig::StepAttachmentConstraintRig(
+    PhysicsExtension&          Physics,
+    const RigidBodyReading&    Body,
+    const Mathematics::Axis3D& /*AxisForward*/,
+    const Mathematics::Axis3D& /*AxisUp*/,
+    const Mathematics::Axis3D& /*AxisRight*/) noexcept
+{
+    if (!Specification.BindAttachmentConstraints)
+    {
+        ActiveConstraintCount = 0u;
+        return;
+    }
+
+    uint32_t IntactCount = 0u;
+    for (uint32_t I = 0u; I < MaxVehicleWheelCorners; ++I)
+    {
+        auto&       W      = Wheels[I];
+        const auto& Corner = Specification.Corners[I];
+
+        if (W.SuspensionSpring.Valid())
+        {
+            const float TravelMin = -std::max(Corner.Suspension.MaxDroopMeters, 0.05f);
+            const float TravelMax =  std::max(Corner.Suspension.MaxBumpMeters, 0.05f);
+            const float HubDeltaY = std::clamp(W.HubLocalMeters.Y - Corner.LocalMountMeters.Y, TravelMin, TravelMax);
+            (void)Physics.AssignConstraintMotorTarget(W.SuspensionSpring, HubDeltaY);
+
+            const ConstraintReading SpringRead = Physics.InspectConstraintReading(W.SuspensionSpring);
+            if (SpringRead.Resident)
+            {
+                W.ConstraintAnchorW   = SpringRead.AnchorWorldMeters;
+                W.ConstraintAttachedW = SpringRead.AttachedWorldMeters;
+                W.ConstraintIntact    = SpringRead.Intact;
+                if (SpringRead.Intact)
+                {
+                    ++IntactCount;
+                }
+            }
+        }
+
+        if (W.SteerHinge.Valid())
+        {
+            (void)Physics.AssignConstraintMotorTarget(W.SteerHinge, W.SteerAngleRad);
+            const ConstraintReading SteerRead = Physics.InspectConstraintReading(W.SteerHinge);
+            if (SteerRead.Resident && SteerRead.Intact)
+            {
+                ++IntactCount;
+            }
+        }
+    }
+
+    if (RearWingDock.Valid())
+    {
+        const ConstraintReading WingRead = Physics.InspectConstraintReading(RearWingDock);
+        if (WingRead.Resident)
+        {
+            RearWingWorldPosM   = WingRead.AttachedWorldMeters;
+            RearWingWorldOrient = WingRead.JointWorldOrientation;
+            RearWingDockStrain  = WingRead.StrainRatio;
+            if (WingRead.Intact)
+            {
+                ++IntactCount;
+            }
+            // Synchronize RearWing Dock release/re-latch directives with aerodynamic package
+            if (!Specification.Aerodynamics.RearWingAttached && WingRead.Intact)
+            {
+                ConstraintDirective ReleaseDir {};
+                ReleaseDir.Category    = ConstraintDirectiveCategory::ReleaseDock;
+                ReleaseDir.TargetToken = RearWingDock;
+                (void)Physics.SubmitConstraintDirective(ReleaseDir);
+            }
+            else if (Specification.Aerodynamics.RearWingAttached && !WingRead.Intact)
+            {
+                ConstraintDirective LatchDir {};
+                LatchDir.Category      = ConstraintDirectiveCategory::EngageDock;
+                LatchDir.TargetToken   = RearWingDock;
+                LatchDir.ToggleEnabled = true;
+                (void)Physics.SubmitConstraintDirective(LatchDir);
+            }
+        }
+    }
+    else
+    {
+        RearWingWorldPosM   = AddAxis(Body.PositionMeters, RotateByQuaternion(Body.Orientation, Specification.Aerodynamics.RearWingLocalMountMeters));
+        RearWingWorldOrient = Body.Orientation;
+        RearWingDockStrain  = 0.0f;
+    }
+
+    ActiveConstraintCount = IntactCount;
+}
+
+void VehiclePhysicsRig::ReleaseAttachmentConstraintRig(PhysicsExtension& Physics) noexcept
+{
+    for (uint32_t I = 0u; I < MaxVehicleWheelCorners; ++I)
+    {
+        auto& W = Wheels[I];
+        if (W.SteerHinge.Valid())
+        {
+            (void)Physics.ReclaimConstraint(W.SteerHinge);
+            W.SteerHinge = ConstraintToken{};
+        }
+        if (W.SuspensionSpring.Valid())
+        {
+            (void)Physics.ReclaimConstraint(W.SuspensionSpring);
+            W.SuspensionSpring = ConstraintToken{};
+        }
+        if (W.SteerKnuckleBody.Valid())
+        {
+            (void)Physics.ReclaimRigidBody(W.SteerKnuckleBody);
+            W.SteerKnuckleBody = RigidBodyToken{};
+        }
+        if (W.CarrierBody.Valid())
+        {
+            (void)Physics.ReclaimRigidBody(W.CarrierBody);
+            W.CarrierBody = RigidBodyToken{};
+        }
+        W.ConstraintIntact = false;
+    }
+
+    if (RearWingDock.Valid())
+    {
+        (void)Physics.ReclaimConstraint(RearWingDock);
+        RearWingDock = ConstraintToken{};
+    }
+    if (RearWingBody.Valid())
+    {
+        (void)Physics.ReclaimRigidBody(RearWingBody);
+        RearWingBody = RigidBodyToken{};
+    }
+    ActiveConstraintCount = 0u;
+    RearWingDockStrain    = 0.0f;
+}
+
 void VehiclePhysicsRig::Finalize(PhysicsExtension& Physics) noexcept
 {
-    if (Initialized && ChassisBody.Valid())
+    if (Initialized)
     {
-        (void)Physics.ReclaimRigidBody(ChassisBody);
+        ReleaseAttachmentConstraintRig(Physics);
+        if (ChassisBody.Valid())
+        {
+            (void)Physics.ReclaimRigidBody(ChassisBody);
+        }
     }
     ChassisBody = RigidBodyToken{};
     Initialized = false;
@@ -1032,8 +1318,10 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
         float               GroundDistM    = FullDroopReach;
         uint16_t            HitMatId       = 0u;
         uint8_t             HitCount       = 0u;
+        uint8_t             LaneHitMask    = 0u;
         Mathematics::Axis3D ContactPoint   { 0.0f, 0.0f, 0.0f };
         Mathematics::Axis3D ContactNormal  = AxisUp;
+        const uint32_t      TraceChanMask  = ~BroadphaseSolver::ChannelBit(CollisionLayerChannel::SensorTrigger);
 
         if (Specification.WheelContactMode == WheelContactQueryMode::SingleRay)
         {
@@ -1041,13 +1329,14 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
             Ray.OriginMeters      = StrutTopWorld;
             Ray.DirectionUnit     = DownDir;
             Ray.MaxDistanceMeters = FullDroopReach;
-            Ray.ChannelMask       = 0xFFFFFFFFu;
+            Ray.ChannelMask       = TraceChanMask;
 
             const RayCastHitReading Hit = Physics.ExecuteRayCastIgnoringBody(Ray, ChassisBody);
             if (Hit.HitDetected)
             {
                 HasContact     = true;
                 HitCount       = 1u;
+                LaneHitMask    = 0x02u; // Center lane
                 GroundDistM    = Hit.DistanceMeters;
                 RawCompression = FullDroopReach - Hit.DistanceMeters;
                 ContactPoint   = Hit.WorldPoint;
@@ -1055,54 +1344,73 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
                 HitMatId       = Hit.HitMaterialId;
             }
         }
-        else if (Specification.WheelContactMode == WheelContactQueryMode::MultiRayArc)
+        else if (Specification.WheelContactMode == WheelContactQueryMode::MultiRayArc
+              || Specification.WheelContactMode == WheelContactQueryMode::HeroThreeLaneFanArc)
         {
-            // 5-ray circumferential lower tire arc (-28, -14, 0, +14, +28 deg) along steered forward plane.
-            // Leading rays climb curbs ahead of the axle, eliminating single-ray step discontinuities while
-            // staying strictly faster than 3D convex cylinder sweeping.
-            static constexpr float ArcSin[5] = { -0.46947156f, -0.24192190f, 0.0f, 0.24192190f, 0.46947156f };
-            static constexpr float ArcCos[5] = {  0.88294759f,  0.97029573f, 1.0f, 0.97029573f, 0.88294759f };
+            // 5-ray +-40 deg circumferential lower tire fan/arc (-40, -20, 0, +20, +40 deg).
+            // - MultiRayArc         : 1 center lane (5 rays/wheel) for traffic/AI vehicles.
+            // - HeroThreeLaneFanArc : 3 lateral lanes across tire width (Left -0.40W, Center 0, Right +0.40W)
+            //                         x 5 rays = 15 rays/wheel (3x 1-lane), catching shoulder curbs, ruts,
+            //                         camber crests & slopes without expensive Jolt 3D convex cylinder sweeps.
+            static constexpr float ArcSin[5] = { -0.64278761f, -0.34202014f, 0.0f, 0.34202014f, 0.64278761f };
+            static constexpr float ArcCos[5] = {  0.76604444f,  0.93969262f, 1.0f, 0.93969262f, 0.76604444f };
 
             const float Cs = VehicleFastMath::FastCos(W.SteerAngleRad);
             const float Sn = VehicleFastMath::FastSin(W.SteerAngleRad);
-            const Mathematics::Axis3D SteeredFwd = AddAxis(ScaleAxis(AxisForward, Cs), ScaleAxis(AxisRight, Sn));
+            const Mathematics::Axis3D SteeredFwd   = AddAxis(ScaleAxis(AxisForward, Cs), ScaleAxis(AxisRight, Sn));
+            const Mathematics::Axis3D SteeredRight = AddAxis(ScaleAxis(AxisForward, -Sn), ScaleAxis(AxisRight, Cs));
+
+            const bool  IsThreeLane  = (Specification.WheelContactMode == WheelContactQueryMode::HeroThreeLaneFanArc);
+            const float HalfShoulder = std::max(0.04f, 0.40f * TireSpec.WidthMeters);
+            const int   LaneStart    = IsThreeLane ? 0 : 1;
+            const int   LaneEnd      = IsThreeLane ? 3 : 2;
+            const float LaneZ[3]     = { -HalfShoulder, 0.0f, HalfShoulder };
 
             float               BestComp   = -1.0e6f;
             float               BestDist   = FullDroopReach;
             Mathematics::Axis3D BestPoint  { 0.0f, 0.0f, 0.0f };
             uint16_t            BestMatId  = 0u;
-            float               RayComp[5] { -1.0e6f, -1.0e6f, -1.0e6f, -1.0e6f, -1.0e6f };
-            Mathematics::Axis3D RayNrm[5]  {};
-            bool                RayHit[5]  { false, false, false, false, false };
+            float               RayComp[15] {};
+            Mathematics::Axis3D RayNrm[15]  {};
+            bool                RayHit[15]  {};
+            int                 SampleCount = 0;
 
             const float TireR = TireSpec.OuterRadiusMeters;
-            for (int K = 0; K < 5; ++K)
+            for (int Lane = LaneStart; Lane < LaneEnd; ++Lane)
             {
-                const float OffsetX  = TireR * ArcSin[K];
-                const float RayReach = SuspSpec.RestLengthMeters + StaticSagM + TireR * ArcCos[K];
-
-                RayCastQuery Ray {};
-                Ray.OriginMeters      = AddAxis(StrutTopWorld, ScaleAxis(SteeredFwd, OffsetX));
-                Ray.DirectionUnit     = DownDir;
-                Ray.MaxDistanceMeters = RayReach;
-                Ray.ChannelMask       = 0xFFFFFFFFu;
-
-                const RayCastHitReading Hit = Physics.ExecuteRayCastIgnoringBody(Ray, ChassisBody);
-                if (!Hit.HitDetected)
+                const Mathematics::Axis3D LaneOrigin = AddAxis(StrutTopWorld, ScaleAxis(SteeredRight, LaneZ[Lane]));
+                for (int K = 0; K < 5; ++K)
                 {
-                    continue;
-                }
-                ++HitCount;
-                RayHit[K]  = true;
-                RayComp[K] = RayReach - Hit.DistanceMeters;
-                RayNrm[K]  = Mathematics::NormalizeAxis(Hit.SurfaceNormal, AxisUp);
+                    const int   Idx      = SampleCount++;
+                    const float OffsetX  = TireR * ArcSin[K];
+                    const float RayReach = SuspSpec.RestLengthMeters + StaticSagM + TireR * ArcCos[K];
 
-                if (RayComp[K] > BestComp)
-                {
-                    BestComp  = RayComp[K];
-                    BestDist  = Hit.DistanceMeters + TireR * (1.0f - ArcCos[K]);
-                    BestPoint = Hit.WorldPoint;
-                    BestMatId = Hit.HitMaterialId;
+                    RayCastQuery Ray {};
+                    Ray.OriginMeters      = AddAxis(LaneOrigin, ScaleAxis(SteeredFwd, OffsetX));
+                    Ray.DirectionUnit     = DownDir;
+                    Ray.MaxDistanceMeters = RayReach;
+                    Ray.ChannelMask       = TraceChanMask;
+
+                    const RayCastHitReading Hit = Physics.ExecuteRayCastIgnoringBody(Ray, ChassisBody);
+                    if (!Hit.HitDetected)
+                    {
+                        RayHit[Idx]  = false;
+                        RayComp[Idx] = -1.0e6f;
+                        continue;
+                    }
+                    ++HitCount;
+                    LaneHitMask |= static_cast<uint8_t>(1u << Lane);
+                    RayHit[Idx]  = true;
+                    RayComp[Idx] = RayReach - Hit.DistanceMeters;
+                    RayNrm[Idx]  = Mathematics::NormalizeAxis(Hit.SurfaceNormal, AxisUp);
+
+                    if (RayComp[Idx] > BestComp)
+                    {
+                        BestComp  = RayComp[Idx];
+                        BestDist  = Hit.DistanceMeters + TireR * (1.0f - ArcCos[K]);
+                        BestPoint = Hit.WorldPoint;
+                        BestMatId = Hit.HitMaterialId;
+                    }
                 }
             }
 
@@ -1114,17 +1422,48 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
                 ContactPoint   = BestPoint;
                 HitMatId       = BestMatId;
 
-                // Blend normals of rays within 1.5 cm of peak compression for smooth curb climb transition
+                // Blend normals of rays within 1.5 cm of peak compression for smooth curb & shoulder transition
                 Mathematics::Axis3D BlendedNrm { 0.0f, 0.0f, 0.0f };
-                for (int K = 0; K < 5; ++K)
+                for (int Idx = 0; Idx < SampleCount; ++Idx)
                 {
-                    if (RayHit[K] && (BestComp - RayComp[K]) <= 0.015f)
+                    if (RayHit[Idx] && (BestComp - RayComp[Idx]) <= 0.015f)
                     {
-                        const float Weight = 1.0f / (1.0f + 40.0f * std::max(0.0f, BestComp - RayComp[K]));
-                        BlendedNrm = AddAxis(BlendedNrm, ScaleAxis(RayNrm[K], Weight));
+                        const float Weight = 1.0f / (1.0f + 40.0f * std::max(0.0f, BestComp - RayComp[Idx]));
+                        BlendedNrm = AddAxis(BlendedNrm, ScaleAxis(RayNrm[Idx], Weight));
                     }
                 }
                 ContactNormal = Mathematics::NormalizeAxis(BlendedNrm, AxisUp);
+            }
+        }
+        else if (Specification.WheelContactMode == WheelContactQueryMode::SphereShapeCast)
+        {
+            // Native Jolt 3D wheel sphere sweep along suspension travel axis
+            const Mathematics::Axis3D SweepStartLocal {
+                CornerSpec.LocalMountMeters.X,
+                CornerSpec.LocalMountMeters.Y + SuspSpec.MaxBumpMeters,
+                CornerSpec.LocalMountMeters.Z,
+            };
+            const Mathematics::Axis3D SweepStartWorld = AddAxis(Body.PositionMeters, RotateByQuaternion(Body.Orientation, SweepStartLocal));
+
+            ShapeCastQuery Query {};
+            Query.ShapeCategory      = CollisionShapeCategory::Sphere;
+            Query.StartMeters        = SweepStartWorld;
+            Query.Orientation        = Body.Orientation;
+            Query.DisplacementMeters = ScaleAxis(DownDir, TotalStrokeM);
+            Query.RadiusMeters       = TireSpec.OuterRadiusMeters;
+            Query.ChannelMask        = TraceChanMask;
+
+            const ShapeCastHitReading Hit = Physics.ExecuteShapeCastIgnoringBody(Query, ChassisBody);
+            if (Hit.HitDetected)
+            {
+                HasContact     = true;
+                HitCount       = 1u;
+                LaneHitMask    = 0x02u;
+                RawCompression = TotalStrokeM * (1.0f - Hit.Fraction);
+                GroundDistM    = FullDroopReach - RawCompression;
+                ContactPoint   = Hit.WorldPoint;
+                ContactNormal  = Mathematics::NormalizeAxis(Hit.SurfaceNormal, AxisUp);
+                HitMatId       = Hit.HitMaterialId;
             }
         }
         else // WheelContactQueryMode::CylinderShapeCast
@@ -1149,13 +1488,14 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
             Query.DisplacementMeters = ScaleAxis(DownDir, TotalStrokeM);
             Query.RadiusMeters       = TireSpec.OuterRadiusMeters;
             Query.HalfHeightMeters   = std::max(0.04f, 0.5f * TireSpec.WidthMeters);
-            Query.ChannelMask        = 0xFFFFFFFFu;
+            Query.ChannelMask        = TraceChanMask;
 
             const ShapeCastHitReading Hit = Physics.ExecuteShapeCastIgnoringBody(Query, ChassisBody);
             if (Hit.HitDetected)
             {
                 HasContact     = true;
                 HitCount       = 1u;
+                LaneHitMask    = 0x07u;
                 RawCompression = TotalStrokeM * (1.0f - Hit.Fraction);
                 GroundDistM    = FullDroopReach - RawCompression;
                 ContactPoint   = Hit.WorldPoint;
@@ -1168,6 +1508,7 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
         {
             W.InContact          = false;
             W.ContactRayHits     = 0u;
+            W.ContactLaneMask    = 0u;
             W.CompressionM       = 0.0f;
             W.CompressionVelMps  = 0.0f;
             W.SpringForceN       = 0.0f;
@@ -1184,6 +1525,7 @@ void VehiclePhysicsRig::SolveSuspensionKinematics(
 
         W.InContact          = true;
         W.ContactRayHits     = HitCount;
+        W.ContactLaneMask    = LaneHitMask;
         W.ContactPointWorldM = ContactPoint;
         W.ContactNormalWorld = ContactNormal;
         W.SurfaceMaterialId  = HitMatId;
@@ -2470,11 +2812,22 @@ void VehiclePhysicsRig::SolveTireTraction(
         float Kappa = W.LongSlipKappa;
         float Alpha = W.SlipAngleAlphaRad;
 
-        // Effective wheel torque: brake opposes current wheel spin without flipping sign past zero
-        const float BrakeOpposingNm = (std::fabs(W.AngularVelocityRadS) > 0.05f)
-                                    ? (W.BrakeTorqueNm * ((W.AngularVelocityRadS > 0.0f) ? 1.0f : -1.0f))
-                                    : std::clamp(W.DriveTorqueNm, -W.BrakeTorqueNm, W.BrakeTorqueNm);
-        const float NetTorqueNm = W.DriveTorqueNm - BrakeOpposingNm;
+        // Implicit wheel angular-speed predictor matching Step 7's exact caliper-lock zero-crossing clamp
+        // (prevents locked brakes from erroneously releasing torque at low speed on steep slopes).
+        const float MaxBrakeDelta = (W.BrakeTorqueNm > 1.0f) ? (W.BrakeTorqueNm * InvI * DeltaSeconds) : 0.0f;
+        auto PredictWheelOmega = [&](float FxCandidate) noexcept -> float
+        {
+            const float DriveOnly = W.AngularVelocityRadS + (W.DriveTorqueNm - FxCandidate * R) * InvI * DeltaSeconds;
+            if (MaxBrakeDelta > 0.0f)
+            {
+                if (std::fabs(DriveOnly) <= MaxBrakeDelta)
+                {
+                    return 0.0f;
+                }
+                return DriveOnly - ((DriveOnly > 0.0f) ? MaxBrakeDelta : -MaxBrakeDelta);
+            }
+            return DriveOnly;
+        };
 
         constexpr float Eps           = 1.0e-4f;
         constexpr uint32_t MaxIter    = 8u;
@@ -2496,7 +2849,7 @@ void VehiclePhysicsRig::SolveTireTraction(
             float MzEval = 0.0f;
             EvaluatePacejkaCombined(I, KSafe, ASafe, W.DynamicCamberRad, GripScale, FxEval, FyEval, MzEval);
 
-            const float OmegaPred   = W.AngularVelocityRadS + (NetTorqueNm - FxEval * R) * InvI * DeltaSeconds;
+            const float OmegaPred   = PredictWheelOmega(FxEval);
             const float WheelSpdPred= OmegaPred * R;
             const float Denom       = std::max({ std::fabs(VxBase), std::fabs(WheelSpdPred), MinSpeedGuard });
             const float KappaTarget = (WheelSpdPred - VxBase) / Denom;
@@ -2515,7 +2868,7 @@ void VehiclePhysicsRig::SolveTireTraction(
             float MzPert = 0.0f;
             EvaluatePacejkaCombined(I, KPlus, ASafe, W.DynamicCamberRad, GripScale, FxPert, FyPert, MzPert);
 
-            const float OmegaPert   = W.AngularVelocityRadS + (NetTorqueNm - FxPert * R) * InvI * DeltaSeconds;
+            const float OmegaPert   = PredictWheelOmega(FxPert);
             const float SpdPert     = OmegaPert * R;
             const float DenomPert   = std::max({ std::fabs(VxBase), std::fabs(SpdPert), MinSpeedGuard });
             const float KTargetPert = (SpdPert - VxBase) / DenomPert;
@@ -2760,46 +3113,57 @@ void VehiclePhysicsRig::PublishReading(
             Out.GroundEffectMultiplier   = GroundEffectMult;
             Out.RearWingAttached         = Specification.Aerodynamics.RearWingAttached;
 
-            Out.FrontArchitecture        = Specification.Corners[0u].Suspension.Architecture;
-            Out.RearArchitecture         = Specification.Corners[2u].Suspension.Architecture;
-            Out.WheelContactMode         = Specification.WheelContactMode;
-            Out.AbsIntervening           = AbsIntervening;
-            Out.TcsIntervening           = TcsIntervening;
-            Out.EscIntervening           = EscIntervening;
+            Out.FrontArchitecture           = Specification.Corners[0u].Suspension.Architecture;
+            Out.RearArchitecture            = Specification.Corners[2u].Suspension.Architecture;
+            Out.WheelContactMode            = Specification.WheelContactMode;
+            Out.RearWingDockToken           = RearWingDock;
+            Out.RearWingWorldPositionM      = RearWingWorldPosM;
+            Out.RearWingWorldOrientation    = RearWingWorldOrient;
+            Out.RearWingDockStrainRatio     = RearWingDockStrain;
+            Out.ActiveAttachmentConstraints = ActiveConstraintCount;
+            Out.AbsIntervening              = AbsIntervening;
+            Out.TcsIntervening              = TcsIntervening;
+            Out.EscIntervening              = EscIntervening;
 
             for (uint32_t I = 0u; I < MaxVehicleWheelCorners; ++I)
             {
                 const auto& W = Wheels[I];
                 auto&       R = Out.Corners[I];
-                R.InContact              = W.InContact;
-                R.SuspensionCompressionM = W.CompressionM;
-                R.SuspensionVelocityMps  = W.CompressionVelMps;
-                R.SpringForceNewtons     = W.SpringForceN;
-                R.DamperForceNewtons     = W.DamperForceN;
-                R.AntiRollForceNewtons   = W.AntiRollForceN;
-                R.VerticalLoadNewtons    = W.VerticalLoadN;
-                R.DynamicCamberRad       = W.DynamicCamberRad;
-                R.DynamicBumpToeRad      = W.DynamicBumpToeRad;
-                R.SteerAngleRad          = W.SteerAngleRad;
-                R.AngularVelocityRadS    = W.AngularVelocityRadS;
-                R.SpinAngleRad           = W.SpinAngleRad;
-                R.LongitudinalSlip       = W.LongSlipKappa;
-                R.SlipAngleRad           = W.SlipAngleAlphaRad;
-                R.LongitudinalForceN     = W.AppliedFxN;
-                R.LateralForceN          = W.AppliedFyN;
-                R.SelfAligningTorqueNm   = W.AppliedMzNm;
-                R.DriveTorqueNm          = W.DriveTorqueNm;
-                R.BrakeTorqueNm          = W.BrakeTorqueNm;
-                R.BrakeTempKelvin        = W.BrakeTempK;
-                R.TreadTempKelvin        = W.TreadTempK;
-                R.CarcassTempKelvin      = W.CarcassTempK;
-                R.TreadDepthMm           = W.TreadDepthMm;
-                R.FrictionRegime         = W.FrictionRegime;
-                R.SurfaceMaterialId      = W.SurfaceMaterialId;
-                R.SurfaceGripScale       = W.SurfaceGripScale;
-                R.ContactRayHits         = W.ContactRayHits;
-                R.ContactPointWorldM     = W.ContactPointWorldM;
-                R.WheelHubLocalMeters    = W.HubLocalMeters;
+                R.InContact                 = W.InContact;
+                R.SuspensionCompressionM    = W.CompressionM;
+                R.SuspensionVelocityMps     = W.CompressionVelMps;
+                R.SpringForceNewtons        = W.SpringForceN;
+                R.DamperForceNewtons        = W.DamperForceN;
+                R.AntiRollForceNewtons      = W.AntiRollForceN;
+                R.VerticalLoadNewtons       = W.VerticalLoadN;
+                R.DynamicCamberRad          = W.DynamicCamberRad;
+                R.DynamicBumpToeRad         = W.DynamicBumpToeRad;
+                R.SteerAngleRad             = W.SteerAngleRad;
+                R.AngularVelocityRadS       = W.AngularVelocityRadS;
+                R.SpinAngleRad              = W.SpinAngleRad;
+                R.LongitudinalSlip          = W.LongSlipKappa;
+                R.SlipAngleRad              = W.SlipAngleAlphaRad;
+                R.LongitudinalForceN        = W.AppliedFxN;
+                R.LateralForceN             = W.AppliedFyN;
+                R.SelfAligningTorqueNm      = W.AppliedMzNm;
+                R.DriveTorqueNm             = W.DriveTorqueNm;
+                R.BrakeTorqueNm             = W.BrakeTorqueNm;
+                R.BrakeTempKelvin           = W.BrakeTempK;
+                R.TreadTempKelvin           = W.TreadTempK;
+                R.CarcassTempKelvin         = W.CarcassTempK;
+                R.TreadDepthMm              = W.TreadDepthMm;
+                R.FrictionRegime            = W.FrictionRegime;
+                R.SurfaceMaterialId         = W.SurfaceMaterialId;
+                R.SurfaceGripScale          = W.SurfaceGripScale;
+                R.ContactRayHits            = W.ContactRayHits;
+                R.ContactLaneMask           = W.ContactLaneMask;
+                R.ContactPointWorldM        = W.ContactPointWorldM;
+                R.WheelHubLocalMeters       = W.HubLocalMeters;
+                R.SuspensionConstraintToken = W.SuspensionSpring;
+                R.SteerConstraintToken      = W.SteerHinge;
+                R.ConstraintWorldAnchorM    = W.ConstraintAnchorW;
+                R.ConstraintAttachedWorldM  = W.ConstraintAttachedW;
+                R.ConstraintIntact          = W.ConstraintIntact;
             }
 
             Out.CompletedSteps          = CompletedSteps;
@@ -2938,6 +3302,7 @@ void VehiclePhysicsRig::StepOnPhysicsThread(PhysicsExtension& Physics, double Fi
     SolveSuspensionKinematics(Physics, Body, AxisForward, AxisUp, AxisRight, Dt);
     ComputeAntiRollForces();
     ComputeBodyAxisAerodynamics(ForwardSpeedMps, LateralSpeedMps, VerticalSpeedMps, InputBrake, AxisForward, AxisUp, AxisRight, Physics, Body);
+    StepAttachmentConstraintRig(Physics, Body, AxisForward, AxisUp, AxisRight);
     ComputeForcedInduction(EngineRpm, InputThrottle, Dt);
     SolveBrakeHydraulics(ForwardSpeedMps, YawRateRadPerSec, Dt);
     SolveDrivetrainTorque(ForwardSpeedMps, SmoothedLatG, Dt);

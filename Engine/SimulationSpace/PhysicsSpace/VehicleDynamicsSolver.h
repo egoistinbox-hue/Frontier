@@ -114,9 +114,17 @@ struct WheelCornerReading
     FrictionRegimeCategory FrictionRegime         = FrictionRegimeCategory::Kinetic;
     uint16_t               SurfaceMaterialId      = 0u;     // [id]    - Hit PhysicsMaterial identifier
     float                  SurfaceGripScale       = 1.0f;   // [-]     - Active tire grip multiplier from PhysicsMaterial
-    uint8_t                ContactRayHits         = 0u;     // [cnt]   - Active ray/sweep hits contributing to contact
+    uint8_t                ContactRayHits         = 0u;     // [cnt]   - Active ray/sweep hits contributing to contact (up to 15 in HeroThreeLaneFanArc)
+    uint8_t                ContactLaneMask        = 0u;     // [mask]  - Bit 0=Left shoulder, Bit 1=Center, Bit 2=Right shoulder
     Mathematics::Axis3D    ContactPointWorldM     { 0.0f, 0.0f, 0.0f }; // [m]
     Mathematics::Axis3D    WheelHubLocalMeters    { 0.0f, 0.0f, 0.0f }; // [m] - Visual wheel center offset in chassis frame
+
+    // Socket-free Frontier ConstraintSolver attachment pose (Spring suspension + front Steer Hinge)
+    ConstraintToken        SuspensionConstraintToken {};
+    ConstraintToken        SteerConstraintToken      {};
+    Mathematics::Axis3D    ConstraintWorldAnchorM    { 0.0f, 0.0f, 0.0f }; // [m] - Solved chassis-side constraint anchor
+    Mathematics::Axis3D    ConstraintAttachedWorldM  { 0.0f, 0.0f, 0.0f }; // [m] - Solved wheel-side constraint attachment pose
+    bool                   ConstraintIntact          = false;
 };
 
 struct VehicleReading
@@ -193,13 +201,18 @@ struct VehicleReading
     float                      GroundEffectMultiplier  = 1.0f;   // [-]
     bool                       RearWingAttached        = true;
 
-    // Driver assists & suspension architecture
-    SuspensionArchitectureCategory FrontArchitecture   = SuspensionArchitectureCategory::DoubleWishbone;
-    SuspensionArchitectureCategory RearArchitecture    = SuspensionArchitectureCategory::MultiLink;
-    WheelContactQueryMode          WheelContactMode    = WheelContactQueryMode::MultiRayArc;
-    bool                           AbsIntervening      = false;
-    bool                           TcsIntervening      = false;
-    bool                           EscIntervening      = false;
+    // Driver assists, suspension architecture & socket-free constraint rig telemetry
+    SuspensionArchitectureCategory FrontArchitecture           = SuspensionArchitectureCategory::DoubleWishbone;
+    SuspensionArchitectureCategory RearArchitecture            = SuspensionArchitectureCategory::MultiLink;
+    WheelContactQueryMode          WheelContactMode            = WheelContactQueryMode::HeroThreeLaneFanArc;
+    ConstraintToken                RearWingDockToken           {};
+    Mathematics::Axis3D            RearWingWorldPositionM      { 0.0f, 0.0f, 0.0f };
+    RigidOrientationQuaternion     RearWingWorldOrientation    {};
+    float                          RearWingDockStrainRatio     = 0.0f;
+    uint32_t                       ActiveAttachmentConstraints = 0u;
+    bool                           AbsIntervening              = false;
+    bool                           TcsIntervening              = false;
+    bool                           EscIntervening              = false;
 
     // Per-corner telemetry (0=FL, 1=FR, 2=RL, 3=RR)
     std::array<WheelCornerReading, MaxVehicleWheelCorners> Corners {};
@@ -307,10 +320,34 @@ private:
         float                  SurfaceGripScale    = 1.0f;
         float                  SurfaceRollingScale = 1.0f;
         uint8_t                ContactRayHits      = 0u;
+        uint8_t                ContactLaneMask     = 0u;
         Mathematics::Axis3D    ContactPointWorldM  { 0.0f, 0.0f, 0.0f };
         Mathematics::Axis3D    ContactNormalWorld  { 0.0f, 1.0f, 0.0f };
         Mathematics::Axis3D    HubLocalMeters      { 0.0f, 0.0f, 0.0f };
+
+        // Socket-free Frontier ConstraintSolver attachment bodies & joints
+        RigidBodyToken         CarrierBody         {};
+        RigidBodyToken         SteerKnuckleBody    {};
+        ConstraintToken        SuspensionSpring    {};
+        ConstraintToken        SteerHinge          {};
+        Mathematics::Axis3D    ConstraintAnchorW   { 0.0f, 0.0f, 0.0f };
+        Mathematics::Axis3D    ConstraintAttachedW { 0.0f, 0.0f, 0.0f };
+        bool                   ConstraintIntact    = false;
     };
+
+    void BindAttachmentConstraintRig(
+        PhysicsExtension&                 Physics,
+        const Mathematics::Axis3D&        SpawnPositionMeters,
+        const RigidOrientationQuaternion& SpawnOrientation) noexcept;
+
+    void StepAttachmentConstraintRig(
+        PhysicsExtension&          Physics,
+        const RigidBodyReading&    Body,
+        const Mathematics::Axis3D& AxisForward,
+        const Mathematics::Axis3D& AxisUp,
+        const Mathematics::Axis3D& AxisRight) noexcept;
+
+    void ReleaseAttachmentConstraintRig(PhysicsExtension& Physics) noexcept;
 
     void CalibrateSuspensionSprings() noexcept;
     void ApplyDirective(const VehicleControlDirective& Directive) noexcept;
@@ -390,6 +427,12 @@ private:
 
     VehicleRigSpecification Specification {};
     RigidBodyToken          ChassisBody   {};
+    RigidBodyToken          RearWingBody  {};
+    ConstraintToken         RearWingDock  {};
+    Mathematics::Axis3D     RearWingWorldPosM { 0.0f, 0.0f, 0.0f };
+    RigidOrientationQuaternion RearWingWorldOrient {};
+    float                   RearWingDockStrain = 0.0f;
+    uint32_t                ActiveConstraintCount = 0u;
     bool                    Initialized   = false;
 
     // Live driver control inputs (PhysicsThread-owned, updated from drained directives)

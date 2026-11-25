@@ -222,9 +222,9 @@
           <div class="pz-status-card">
             <div class="sc-left">
               <span class="sc-dot amber">&#9673;</span>
-              <span>SDF Proxy</span>
+              <span>1-Leaf SDF</span>
             </div>
-            <b>1.76<small>KB</small></b>
+            <b>32<small>KB</small></b>
           </div>
         </div>
 
@@ -323,8 +323,8 @@
 
           <button class="subcomponent" data-jump-page="5">
             <span class="sc-txt">
-              <b>Analytical SDF &amp; 64³ GDF Clipmap</b>
-              <small id="SubSdfSummary">11 Capsules + 16 Canopy Lobes · 1.76 KB</small>
+              <b>Instanced 1-Leaf SDF &amp; Wood Capsules</b>
+              <small id="SubSdfSummary">1 Baked Leaf (32 KB) &times; N · ContactPCSS Shadows</small>
             </span>
             <span class="sc-chev">&#8250;</span>
           </button>
@@ -547,26 +547,58 @@
         </div>
 
         <!-- ============================================================
-             PAGE 6: ANALYTICAL SDF & LIVE 64³ GDF SECTION
+             PAGE 6: 1-LEAF BAKED SDF (INSTANCED) + WOOD CAPSULES + EMISSIVE
              ============================================================ -->
         <div class="pc-page" data-page="5">
           <div class="property-card">
-            <h3>Wind-Synced GDF Section <small>64³ Clipmap</small></h3>
-            <canvas class="gdf-card-canvas" id="GdfSectionCanvas" width="280" height="176"></canvas>
+            <h3>1-Leaf Analytical SDF Baker <small>32 KB · 1× Mem</small></h3>
+            <canvas class="gdf-card-canvas" id="LeafSdfProtoCanvas" width="280" height="126" style="height:126px;"></canvas>
             <label class="field">
-              <span>Canopy Smooth-Union k</span>
+              <span>Baked Leaf Blade Thickness</span>
               <div class="slider-pill">
-                <input id="RangeSmoothK" type="range" min="0.1" max="1.6" step="0.05" value="0.65" />
-                <span class="split-value"><output id="OutSmoothK">0.65</output><small>m</small></span>
+                <input id="RangeLeafThickness" type="range" min="0.015" max="0.14" step="0.005" value="0.048" />
+                <span class="split-value"><output id="OutLeafThickness">4.8</output><small>mm</small></span>
               </div>
             </label>
-            <div class="switch-row" id="RowToggleSdfGizmos">
-              <span>3D Viewport Capsules &amp; Lobes</span>
-              <button class="toggle" id="BtnToggleSdfGizmos" type="button"><i></i></button>
+            <div class="pz-metric-grid" style="margin-top:8px; margin-bottom:0;">
+              <div class="pz-metric-tile"><b id="MetricLeafSdfMem">32<small>KB</small></b><span>1 BAKED SDF BRICK</span></div>
+              <div class="pz-metric-tile"><b id="MetricLeafSdfInst">0</b><span>INSTANCED IN WORLD</span></div>
             </div>
             <p class="card-foot">
-              Analytical wood capsules + soft-union canopy spheres displaced by the exact same WindField — guaranteed Lipschitz |&nabla;d| &le; 1 in 1.76 KB/tree (avoids 48 MB voxel bricks).
+              1 analytical leaf SDF (with real thickness) is baked once into a 32&times;16&times;32 R16F brick (32 KB) and instanced across every canopy leaf via inverse wind transforms — zero blobby spheres.
             </p>
+          </div>
+
+          <div class="property-card">
+            <h3>Emissive Foliage &amp; ContactPCSS <small>Radiosity GI</small></h3>
+            <label class="field">
+              <span>Emissive Leaf Radiance</span>
+              <div class="slider-pill">
+                <input id="RangeEmissive" type="range" min="0" max="5.0" step="0.1" value="0.0" />
+                <span class="split-value"><output id="OutEmissive">0.0</output><small>nit</small></span>
+              </div>
+            </label>
+            <div class="pz-choices" id="EmissiveTintChoices">
+              <button class="on" data-emissive="emerald"><b>01</b><span>Emerald</span></button>
+              <button data-emissive="amber"><b>02</b><span>Amber</span></button>
+              <button data-emissive="cyan"><b>03</b><span>Cyan</span></button>
+            </div>
+            <div class="switch-row" id="RowToggleSdfGizmos">
+              <span>3D Wood Capsules + Instanced Leaf SDF</span>
+              <button class="toggle" id="BtnToggleSdfGizmos" type="button"><i></i></button>
+            </div>
+            <div class="switch-row" id="RowToggleLeafSdfOnly">
+              <span>Include Instanced 1-Leaf SDF Shells</span>
+              <button class="toggle on" id="BtnToggleLeafSdfOnly" type="button"><i></i></button>
+            </div>
+            <p class="card-foot">
+              Direct sun shadows use Frontier ContactPCSS for crisp dappled leaves; Wood Capsules + Instanced 1-Leaf SDF inject diffuse bounce &amp; EmissiveRadiancePad into RadiosityMip0Tex3D.
+            </p>
+          </div>
+
+          <div class="property-card">
+            <h3>Wind-Synced GDF Section <small>64³ Clipmap</small></h3>
+            <canvas class="gdf-card-canvas" id="GdfSectionCanvas" width="280" height="176"></canvas>
           </div>
         </div>
       </div>

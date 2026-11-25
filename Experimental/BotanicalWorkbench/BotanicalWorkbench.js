@@ -20,12 +20,20 @@ import {
   ConstructBarkTextureCanvas,
   ConstructUvCheckerCanvas,
   ConstructLeafTextureCanvas,
+  BakeCanonicalLeafSdf3D,
+  BuildCanonicalLeafSdfMeshData,
+  RenderCanonicalLeafSdfPreview,
   EvaluateWindDeformedSdfPrimitives,
   RenderGdfCrossSection,
 } from './Engine/ClusterFractureSdf.js';
 
 const CORE_SPECIES = ['English Oak', 'Scots Pine', 'Quaking Aspen'];
 const PAGE_COUNT = 6;
+const EMISSIVE_TINTS = {
+  emerald: [0.24, 0.96, 0.56],
+  amber:   [1.00, 0.68, 0.22],
+  cyan:    [0.24, 0.84, 1.00],
+};
 
 const workbench = {
   presetName: 'English Oak',
@@ -43,8 +51,11 @@ const workbench = {
   windEnabled: true,
   showClusterSpheres: false,
   showSdfGizmos: false,
+  includeLeafSdf: true,
+  leafThicknessNorm: 0.048,
+  emissiveStrength: 0.0,
+  emissiveTint: 'emerald',
   showWindArrows: false,
-  sdfSmoothK: 0.65,
   cutHeightNorm: 0.28,
   snapImpulse: 1.0,
   wind: CreateDefaultWindParameters(),
@@ -65,6 +76,7 @@ const workbench = {
 
 const runtime = {
   specimen: null,
+  bakedLeafSdf: null,
   clusteredBark: null,
   clusteredFoliage: null,
   barkTex: null,
@@ -77,7 +89,8 @@ const runtime = {
   clusterSphereGroup: null,
   sdfGizmoGroup: null,
   sdfCapsuleMeshes: [],
-  sdfLobeMeshes: [],
+  sdfLeafInstMesh: null,
+  sdfLeafInstMat: null,
   windArrowGroup: null,
   windArrows: [],
   fractureActive: false,
@@ -115,6 +128,8 @@ const runtime = {
     uLeafShuffleMode: { value: 1.0 },
     uRenderMode: { value: 0.0 },
     uSunDir: { value: new THREE.Vector3(0.55, 0.72, 0.42).normalize() },
+    uEmissiveColor: { value: new THREE.Vector3(0.24, 0.96, 0.56) },
+    uEmissiveStrength: { value: 0.0 },
   },
 };
 
@@ -196,6 +211,11 @@ sunLight.shadow.camera.bottom = -sc;
 scene.add(sunLight);
 scene.add(new THREE.HemisphereLight('#7fa4d4', '#2a241d', 0.85));
 
+// Dynamic Radiosity Emissive Bounce Light (demonstrates EmissiveRadiancePad lighting ground & surroundings!)
+const canopyGlowLight = new THREE.PointLight('#3df58f', 0.0, 42.0, 1.4);
+canopyGlowLight.position.set(0, 9.0, 0);
+scene.add(canopyGlowLight);
+
 runtime.uvCheckerTex = new THREE.CanvasTexture(ConstructUvCheckerCanvas());
 runtime.uvCheckerTex.wrapS = THREE.RepeatWrapping;
 runtime.uvCheckerTex.wrapT = THREE.RepeatWrapping;
@@ -243,6 +263,8 @@ function CreateBarkMaterial(barkTex) {
       uniform sampler2D uUvCheckerMap;
       uniform float uRenderMode;
       uniform vec3 uSunDir;
+      uniform vec3 uEmissiveColor;
+      uniform float uEmissiveStrength;
       varying vec2 vUv;
       varying vec3 vNormalW;
       varying vec3 vClusterColor;
@@ -252,6 +274,9 @@ function CreateBarkMaterial(barkTex) {
         vec3 L = normalize(uSunDir);
         float ndl = max(dot(N, L), 0.0);
         vec3 lit = vec3(0.24, 0.28, 0.34) * (0.5 + 0.5 * N.y) + vec3(1.12, 1.04, 0.92) * ndl;
+        // Indirect radiosity bounce onto bark from emissive canopy leaves above
+        float canopyBounce = (0.35 + 0.65 * max(N.y, 0.0)) * (0.25 + 0.75 * vHeightNorm);
+        lit += uEmissiveColor * uEmissiveStrength * 0.42 * canopyBounce;
         vec3 baseCol = uRenderMode > 0.5 && uRenderMode < 1.5
           ? vClusterColor
           : (uRenderMode >= 1.5 ? texture2D(uUvCheckerMap, vUv).rgb : texture2D(uBarkMap, vUv).rgb * (0.72 + 0.28 * vHeightNorm));
@@ -303,6 +328,8 @@ function CreateFoliageMaterial(leafTex) {
       uniform sampler2D uUvCheckerMap;
       uniform float uRenderMode;
       uniform vec3 uSunDir;
+      uniform vec3 uEmissiveColor;
+      uniform float uEmissiveStrength;
       varying vec2 vUv;
       varying vec3 vNormalW;
       varying vec3 vClusterColor;
@@ -319,7 +346,8 @@ function CreateFoliageMaterial(leafTex) {
         vec3 baseCol = uRenderMode > 0.5 && uRenderMode < 1.5
           ? vClusterColor
           : (uRenderMode >= 1.5 ? texture2D(uUvCheckerMap, vUv).rgb : tex.rgb * (0.86 + 0.28 * vTintVar) * (0.68 + 0.38 * vHeightNorm));
-        gl_FragColor = vec4(baseCol * lit, 1.0);
+        vec3 emissiveTerm = uRenderMode < 0.5 ? (uEmissiveColor * uEmissiveStrength * (0.45 + 0.55 * vTintVar)) : vec3(0.0);
+        gl_FragColor = vec4(baseCol * lit + emissiveTerm, 1.0);
       }
     `,
   });
@@ -395,29 +423,60 @@ function RebuildWindVectorGrid() {
   scene.add(runtime.windArrowGroup);
 }
 
+function RebakeCanonicalLeafSdfAndPreview() {
+  if (!runtime.specimen) return;
+  runtime.bakedLeafSdf = BakeCanonicalLeafSdf3D(runtime.specimen.leafShape, workbench.leafThicknessNorm);
+  const tint = EMISSIVE_TINTS[workbench.emissiveTint] || EMISSIVE_TINTS.emerald;
+  const protoCanvas = document.getElementById('LeafSdfProtoCanvas');
+  if (protoCanvas) {
+    RenderCanonicalLeafSdfPreview(protoCanvas, runtime.bakedLeafSdf, tint, workbench.emissiveStrength);
+  }
+  const memEl = document.getElementById('MetricLeafSdfMem');
+  if (memEl) memEl.innerHTML = `${Math.round(runtime.bakedLeafSdf.bytesR16F / 1024)}<small>KB</small>`;
+  const instEl = document.getElementById('MetricLeafSdfInst');
+  if (instEl) instEl.textContent = (runtime.specimen.leafCount || 0).toLocaleString();
+}
+
 function RebuildSdfGizmos() {
   if (runtime.sdfGizmoGroup) {
     scene.remove(runtime.sdfGizmoGroup);
     DisposeObject3D(runtime.sdfGizmoGroup);
   }
+  RebakeCanonicalLeafSdfAndPreview();
+
   runtime.sdfGizmoGroup = new THREE.Group();
   runtime.sdfCapsuleMeshes = [];
-  runtime.sdfLobeMeshes = [];
+  runtime.sdfLeafInstMesh = null;
 
+  // 1) Proper Tapered Capsules for Trunk + Primary/Secondary Branches
   const capGeo = new THREE.CylinderGeometry(1, 1, 1, 10, 1, false);
-  const capMat = new THREE.MeshBasicMaterial({ color: '#38bdf8', wireframe: true, transparent: true, opacity: 0.75 });
+  const capMat = new THREE.MeshBasicMaterial({ color: '#38bdf8', wireframe: true, transparent: true, opacity: 0.78 });
   for (let i = 0; i < runtime.specimen.sdfCapsules.length; i++) {
     const m = new THREE.Mesh(capGeo, capMat);
     runtime.sdfGizmoGroup.add(m);
     runtime.sdfCapsuleMeshes.push(m);
   }
 
-  const sphGeo = new THREE.IcosahedronGeometry(1, 1);
-  const sphMat = new THREE.MeshBasicMaterial({ color: '#ffb454', wireframe: true, transparent: true, opacity: 0.44 });
-  for (let i = 0; i < runtime.specimen.sdfCanopyLobes.length; i++) {
-    const m = new THREE.Mesh(sphGeo, sphMat);
-    runtime.sdfGizmoGroup.add(m);
-    runtime.sdfLobeMeshes.push(m);
+  // 2) ONE Single Thick Canonical Leaf SDF Geometry Instanced Across Canopy (ZERO Blobby Spheres!)
+  const maxInst = Math.min(640, (runtime.specimen.leafSdfInstances || []).length);
+  if (maxInst > 0) {
+    const meshData = BuildCanonicalLeafSdfMeshData(runtime.specimen.leafShape, workbench.leafThicknessNorm);
+    const leafProtoGeo = new THREE.BufferGeometry();
+    leafProtoGeo.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+    leafProtoGeo.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+    const tint = EMISSIVE_TINTS[workbench.emissiveTint] || EMISSIVE_TINTS.emerald;
+    runtime.sdfLeafInstMat = new THREE.MeshStandardMaterial({
+      color: '#4ade80',
+      emissive: new THREE.Color(tint[0], tint[1], tint[2]),
+      emissiveIntensity: workbench.emissiveStrength * 0.55,
+      roughness: 0.45,
+      metalness: 0.05,
+      transparent: true,
+      opacity: 0.84,
+    });
+    runtime.sdfLeafInstMesh = new THREE.InstancedMesh(leafProtoGeo, runtime.sdfLeafInstMat, maxInst);
+    runtime.sdfLeafInstMesh.visible = workbench.includeLeafSdf;
+    runtime.sdfGizmoGroup.add(runtime.sdfLeafInstMesh);
   }
 
   runtime.sdfGizmoGroup.visible = workbench.showSdfGizmos || workbench.renderMode === 'sdf';
@@ -690,7 +749,7 @@ function GetOutlinerModel() {
     ]},
     { group: 'Simulation & World', count: '4 items', items: [
       { id: 'wind',     depth: 0, icon: 'wind', name: 'Global WindField',        sub: `${workbench.wind.speedMps.toFixed(1)} m/s · ${Math.round(workbench.wind.directionDeg)}° ${AzimuthCompass(workbench.wind.directionDeg)}`, page: 2, visKey: 'wind' },
-      { id: 'sdf',      depth: 0, icon: 'sdf',  name: 'Analytical SDF · GDF',    sub: `${sdfN} prims · 1.76 KB proxy`, page: 5, visKey: 'sdf' },
+      { id: 'sdf',      depth: 0, icon: 'sdf',  name: '1-Leaf SDF · Capsules',   sub: `${sp?.sdfCapsules.length || 0} caps + 1 leaf (32 KB) × ${(sp?.leafCount || 0).toLocaleString()}`, page: 5, visKey: 'sdf' },
       { id: 'forest',   depth: 0, icon: 'tree', name: 'Instanced Forest Field',  sub: `${workbench.forestCount.toLocaleString()} inst · Tier ${workbench.forestCount > 500 ? 2 : workbench.forestCount > 1 ? 1 : 0}`, page: 0, visKey: 'forest' },
       { id: 'sky',      depth: 0, icon: 'sun',  name: 'Sun & Atmosphere',        sub: 'Directional light · 3-LUT Sky', page: 0, visKey: 'sky' },
     ]},
@@ -809,9 +868,27 @@ function SyncQuickTiles() {
   document.getElementById('BtnVpWind').classList.toggle('active', workbench.showWindArrows || workbench.renderMode === 'wind');
 
   document.getElementById('BtnToggleSdfGizmos').classList.toggle('on', workbench.showSdfGizmos);
+  document.getElementById('BtnToggleLeafSdfOnly').classList.toggle('on', workbench.includeLeafSdf);
   document.getElementById('BtnToggleWindArrows').classList.toggle('on', workbench.showWindArrows);
   document.getElementById('BtnToggleVortex').classList.toggle('on', workbench.wind.vortexEnabled);
   document.getElementById('BtnToggleClusterSpheres').classList.toggle('on', workbench.showClusterSpheres);
+}
+
+function SyncEmissiveUniforms() {
+  const tint = EMISSIVE_TINTS[workbench.emissiveTint] || EMISSIVE_TINTS.emerald;
+  runtime.sharedUniforms.uEmissiveColor.value.set(tint[0], tint[1], tint[2]);
+  runtime.sharedUniforms.uEmissiveStrength.value = workbench.emissiveStrength;
+  canopyGlowLight.color.setRGB(tint[0], tint[1], tint[2]);
+  canopyGlowLight.intensity = workbench.emissiveStrength * 32.0;
+  canopyGlowLight.position.set(0, (runtime.specimen?.height || 14) * 0.62, 0);
+  if (runtime.sdfLeafInstMat) {
+    runtime.sdfLeafInstMat.emissive.setRGB(tint[0], tint[1], tint[2]);
+    runtime.sdfLeafInstMat.emissiveIntensity = workbench.emissiveStrength * 0.55;
+  }
+  document.querySelectorAll('#EmissiveTintChoices button').forEach((b) => {
+    b.classList.toggle('on', b.dataset.emissive === workbench.emissiveTint);
+  });
+  RebakeCanonicalLeafSdfAndPreview();
 }
 
 function SyncAllUI() {
@@ -821,7 +898,7 @@ function SyncAllUI() {
   const leafC = runtime.clusteredFoliage?.clusterCount || 0;
   const totalC = barkC + leafC;
   const totalT = (runtime.clusteredBark?.triangleCount || 0) + (runtime.clusteredFoliage?.triangleCount || 0);
-  const sdfN = (sp?.sdfCapsules.length || 0) + (sp?.sdfCanopyLobes.length || 0);
+  const capN = sp?.sdfCapsules.length || 0;
   const comp = AzimuthCompass(workbench.wind.directionDeg);
 
   document.getElementById('HeroTitle').textContent = workbench.presetName;
@@ -833,11 +910,11 @@ function SyncAllUI() {
   document.getElementById('TileClusters').innerHTML = `${totalC}<small>×128t</small>`;
   document.getElementById('TileWind').innerHTML = `${workbench.wind.speedMps.toFixed(1)}<small>m/s</small>`;
   document.getElementById('TileWindSub').textContent = `WIND · ${Math.round(workbench.wind.directionDeg)}° ${comp}`;
-  document.getElementById('TileSdf').innerHTML = `${sdfN}<small>prims</small>`;
+  document.getElementById('TileSdf').innerHTML = `${capN}<small>+1 leaf</small>`;
 
   document.getElementById('SubSpecSummary').textContent = `${workbench.presetName} · 2-LUT VAT (Direction + Rustle)`;
   document.getElementById('SubWindSummary').textContent = `${workbench.wind.speedMps.toFixed(1)} m/s · ${Math.round(workbench.wind.directionDeg)}° · Wave ${workbench.wind.wavelengthMeters}m`;
-  document.getElementById('SubSdfSummary').textContent = `${sp?.sdfCapsules.length || 0} Capsules + ${sp?.sdfCanopyLobes.length || 0} Lobes · 1.76 KB`;
+  document.getElementById('SubSdfSummary').textContent = `${capN} Capsules + 1 Leaf SDF (32 KB) × ${(sp?.leafCount || 0).toLocaleString()} · ContactPCSS`;
 
   document.getElementById('MetricBarkClusters').textContent = String(barkC);
   document.getElementById('MetricLeafClusters').textContent = String(leafC);
@@ -1142,7 +1219,21 @@ function InitControls() {
   bindRange('RangeUvScale', 'OutUvScale', (v) => v.toFixed(1), (v) => { workbench.uvScale = v; RebuildHeroSpecimen(); });
   bindRange('RangeCutHeight', 'OutCutHeight', (v) => String(Math.round(v * 100)), (v) => { workbench.cutHeightNorm = v; RenderOutliner(); });
   bindRange('RangeSnapImpulse', 'OutSnapImpulse', (v) => v.toFixed(1), (v) => { workbench.snapImpulse = v; });
-  bindRange('RangeSmoothK', 'OutSmoothK', (v) => v.toFixed(2), (v) => { workbench.sdfSmoothK = v; });
+  bindRange('RangeLeafThickness', 'OutLeafThickness', (v) => (v * 100).toFixed(1), (v) => {
+    workbench.leafThicknessNorm = v;
+    RebuildSdfGizmos();
+  });
+  bindRange('RangeEmissive', 'OutEmissive', (v) => v.toFixed(1), (v) => {
+    workbench.emissiveStrength = v;
+    SyncEmissiveUniforms();
+  });
+
+  document.querySelectorAll('#EmissiveTintChoices button').forEach((b) => {
+    b.addEventListener('click', () => {
+      workbench.emissiveTint = b.dataset.emissive;
+      SyncEmissiveUniforms();
+    });
+  });
 
   // Toggle switches
   document.getElementById('RowToggleVortex').addEventListener('click', () => {
@@ -1166,6 +1257,11 @@ function InitControls() {
     SyncQuickTiles();
     RenderOutliner();
   });
+  document.getElementById('RowToggleLeafSdfOnly').addEventListener('click', () => {
+    workbench.includeLeafSdf = !workbench.includeLeafSdf;
+    if (runtime.sdfLeafInstMesh) runtime.sdfLeafInstMesh.visible = workbench.includeLeafSdf;
+    SyncQuickTiles();
+  });
 
   document.getElementById('BtnToggleUvMode').addEventListener('click', () => SetRenderMode(workbench.renderMode === 'uv' ? 'pbr' : 'uv'));
   document.getElementById('BtnTriggerFracture').addEventListener('click', TriggerFracture);
@@ -1185,6 +1281,7 @@ const _vB = new THREE.Vector3();
 const _dirAB = new THREE.Vector3();
 const _midAB = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
+const _instMat = new THREE.Matrix4();
 
 function ResizeViewport() {
   const wrap = canvas.parentElement;
@@ -1208,12 +1305,12 @@ function TickAnimation(nowMs) {
     document.getElementById('FooterFps').textContent = `${Math.round(runtime.fpsSmooth)} fps`;
   }
 
-  // Update wind-deformed Analytical SDF primitives (3D gizmos + Hero Banner + Page 6 GDF Section)
+  // Update wind-deformed Wood Capsules + Instanced 1-Leaf SDF (3D shells + Hero Banner + Page 6 GDF Section)
   if (runtime.specimen) {
     const activeWind = workbench.windEnabled ? workbench.wind : { ...workbench.wind, speedMps: 0.0 };
     const needSdf = runtime.sdfGizmoGroup?.visible || (runtime.frameTick % 4 === 0);
     if (needSdf) {
-      const deformed = EvaluateWindDeformedSdfPrimitives(runtime.specimen, runtime.timeSec, activeWind);
+      const deformed = EvaluateWindDeformedSdfPrimitives(runtime.specimen, runtime.timeSec, activeWind, 640);
       if (runtime.sdfGizmoGroup?.visible) {
         for (let i = 0; i < deformed.capsules.length && i < runtime.sdfCapsuleMeshes.length; i++) {
           const c = deformed.capsules[i];
@@ -1229,18 +1326,32 @@ function TickAnimation(nowMs) {
           const avgR = (c.rA + c.rB) * 0.5;
           m.scale.set(avgR, len, avgR);
         }
-        for (let i = 0; i < deformed.lobes.length && i < runtime.sdfLobeMeshes.length; i++) {
-          const l = deformed.lobes[i];
-          const m = runtime.sdfLobeMeshes[i];
-          m.position.set(l.cx, l.cy, l.cz);
-          m.scale.setScalar(l.r);
+        if (runtime.sdfLeafInstMesh && runtime.sdfLeafInstMesh.visible) {
+          const count = Math.min(deformed.leafInstances.length, runtime.sdfLeafInstMesh.count);
+          for (let i = 0; i < count; i++) {
+            const lf = deformed.leafInstances[i];
+            const sx = lf.scaleX, sy = lf.scaleY;
+            // Column-major 4x4 basis: X = side*sx, Y = dir*sy, Z = normal*sy, T = pos
+            _instMat.set(
+              lf.side[0] * sx, lf.dir[0] * sy, lf.normal[0] * sy, lf.px,
+              lf.side[1] * sx, lf.dir[1] * sy, lf.normal[1] * sy, lf.py,
+              lf.side[2] * sx, lf.dir[2] * sy, lf.normal[2] * sy, lf.pz,
+              0, 0, 0, 1
+            );
+            runtime.sdfLeafInstMesh.setMatrixAt(i, _instMat);
+          }
+          runtime.sdfLeafInstMesh.instanceMatrix.needsUpdate = true;
         }
       }
       if (runtime.frameTick % 4 === 0) {
-        // Render live GDF directly into the Project Zero Hero Banner AND Page 6 GDF Card
-        RenderGdfCrossSection(document.getElementById('HeroBannerCanvas'), deformed, runtime.specimen.height, workbench.sdfSmoothK);
+        const gdfOpts = {
+          emissiveStrength: workbench.emissiveStrength,
+          emissiveRgb: EMISSIVE_TINTS[workbench.emissiveTint] || EMISSIVE_TINTS.emerald,
+          leafSdfEnabled: workbench.includeLeafSdf,
+        };
+        RenderGdfCrossSection(document.getElementById('HeroBannerCanvas'), deformed, runtime.specimen.height, runtime.bakedLeafSdf, gdfOpts);
         if (workbench.activePage === 5) {
-          RenderGdfCrossSection(document.getElementById('GdfSectionCanvas'), deformed, runtime.specimen.height, workbench.sdfSmoothK);
+          RenderGdfCrossSection(document.getElementById('GdfSectionCanvas'), deformed, runtime.specimen.height, runtime.bakedLeafSdf, gdfOpts);
         }
       }
     }

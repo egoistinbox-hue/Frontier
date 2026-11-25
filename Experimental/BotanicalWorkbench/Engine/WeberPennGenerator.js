@@ -508,11 +508,15 @@ export function GenerateBotanicalSpecimen(preset, options = {}) {
   }
 
   // Extract Analytical SDF Primitives directly from skeleton (ZERO voxelization pass!)
-  // 1) Tapered capsules for Trunk (level 0) + Major Boughs (level 1)
+  // 1) Proper Tapered Capsules for Trunk (level 0), Major Boughs (level 1), and Secondary Branches (level 2)
   const sdfCapsules = [];
   for (const st of stems) {
-    if (st.role !== 'shoot' || st.level > 1) continue;
-    const stride = st.level === 0 ? Math.max(1, Math.floor(st.stations.length / 5)) : Math.max(1, Math.floor(st.stations.length / 2));
+    if (st.role !== 'shoot' || st.level > 2) continue;
+    const stride = st.level === 0
+      ? Math.max(1, Math.floor(st.stations.length / 6))
+      : st.level === 1
+        ? Math.max(1, Math.floor(st.stations.length / 3))
+        : Math.max(1, st.stations.length - 1);
     for (let i = 0; i < st.stations.length - 1; i += stride) {
       const a = st.stations[i];
       const b = st.stations[Math.min(st.stations.length - 1, i + stride)];
@@ -523,19 +527,36 @@ export function GenerateBotanicalSpecimen(preset, options = {}) {
       sdfCapsules.push({
         a: [...a.pos],
         b: [...b.pos],
-        rA: Math.max(0.05, a.radius * 1.08),
-        rB: Math.max(0.04, b.radius * 1.08),
+        rA: Math.max(0.025, a.radius * 1.05),
+        rB: Math.max(0.02, b.radius * 1.05),
         windA: [hA, lA, st.phase, 0.0],
         windB: [hB, lB, st.phase, 0.0],
         pivot: [...st.pivot],
         level: st.level,
       });
-      if (sdfCapsules.length >= 28) break;
+      if (sdfCapsules.length >= 64) break;
     }
-    if (sdfCapsules.length >= 28) break;
+    if (sdfCapsules.length >= 64) break;
   }
 
-  // 2) Soft-union Canopy Lobe Spheres clustered across terminal branch clusters
+  // 2) Instanced 1-Leaf Analytical SDF Transforms (1 baked 32x16x32 R16F leaf SDF in memory, instanced N times!)
+  const leafSdfInstances = [];
+  for (let i = 0; i < leafList.length; i++) {
+    const lf = leafList[i];
+    const hNorm = Math.max(0.0, Math.min(1.0, lf.pos[1] / maxY));
+    leafSdfInstances.push({
+      pos: [...lf.pos],
+      dir: [...lf.dir],
+      side: [...lf.side],
+      normal: [...lf.normal],
+      scaleX: lf.scaleX,
+      scaleY: lf.scaleY,
+      windAttr: [hNorm, lf.limbW, lf.phase, 0.65],
+      pivot: [...lf.pivot],
+    });
+  }
+
+  // 3) Legacy Coarse Canopy Bounds (kept for optional comparison vs Instanced 1-Leaf SDF)
   const sdfCanopyLobes = [];
   if (leafList.length > 0) {
     const targetLobes = Math.min(16, Math.max(4, Math.round(leafList.length / 220)));
@@ -573,8 +594,20 @@ export function GenerateBotanicalSpecimen(preset, options = {}) {
     }
   }
 
+  const resolveCanonicalLeafShape = () => {
+    const style = (preset.visual?.leafStyle || '').toLowerCase();
+    const nm = (preset.name || '').toLowerCase();
+    if (style === 'conifer' || /pine|spruce|fir|cedar|cypress|juniper|sequoia|redwood|larch|hemlock/.test(nm)) return 'needle';
+    if (style === 'palm' || /palm|banana|bamboo/.test(nm)) return 'palm';
+    if (style === 'willow' || /willow|olive|eucalyptus/.test(nm)) return 'willow';
+    if (/oak|maple|sycamore|sweetgum|plane/.test(nm)) return 'lobed';
+    if (/locust|walnut|ash|rowan|acacia|mimosa/.test(nm)) return 'compound';
+    return 'broadleaf';
+  };
+
   return {
     presetName: preset.name,
+    leafShape: resolveCanonicalLeafShape(),
     seed,
     lodTier,
     height: maxY,
@@ -606,6 +639,7 @@ export function GenerateBotanicalSpecimen(preset, options = {}) {
       triangleCount: leafIndices.length / 3,
     },
     sdfCapsules,
+    leafSdfInstances,
     sdfCanopyLobes,
     generationMs: performance.now() - tStart,
   };

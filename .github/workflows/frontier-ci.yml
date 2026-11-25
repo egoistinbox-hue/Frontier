@@ -9,10 +9,12 @@ on:
       - '.github/workflows/frontier-ci.yml'
       - 'CMakeLists.txt'
       - 'Automation/**'
+      - 'Content/**'
       - 'Engine/**'
       - 'EngineContent/**'
       - 'Exhibits/**'
       - 'ExternalPackages/**'
+      - 'Projects/**'
   workflow_dispatch:
 
 permissions:
@@ -84,23 +86,28 @@ jobs:
             -DFRONTIER_PROFILE=Editor \
             -DBUILD_TESTING=OFF
           cmake --build Build/CI/Editor --parallel 4 --target \
-            Frontier FrontierSketcher \
+            Frontier FrontierSketcher AutoSpace \
             FrontierEngineRuntimeDll FrontierWorkspaceUiDll
           cmake -S . -B Build/CI/Shipping -G Ninja \
             -DFRONTIER_PROFILE=Shipping \
             -DBUILD_TESTING=OFF
           cmake --build Build/CI/Shipping --parallel 4 --target \
-            FrontierEngine FrontierEngineRuntimeDll
+            FrontierEngine FrontierEngineRuntimeDll AutoSpace
 
       - name: Assemble portable Linux x64 Frontier and SolidArc package
         run: |
           payload="${RUNNER_TEMP}/Frontier-Workspaces-Linux-x64"
-          mkdir -p "$payload/CompiledShaders" "$payload/EngineContent" "$payload/Binaries/Win64"
+          rm -rf "$payload"
+          mkdir -p "$payload/CompiledShaders" "$payload/EngineContent" "$payload/Content" "$payload/Projects/AutoSpace" "$payload/Binaries/Win64"
           cp "Build/CI/Editor/Frontier" "$payload/Frontier"
           cp "Build/CI/Editor/FrontierSketcher" "$payload/SolidArc"
+          cp "Build/CI/Editor/Projects/AutoSpace/AutoSpace" "$payload/AutoSpace"
           cp -r Build/CI/Editor/Binaries/Win64/* "$payload/Binaries/Win64/"
           cp -r Build/CI/Editor/CompiledShaders/* "$payload/CompiledShaders/"
           cp -r EngineContent/* "$payload/EngineContent/"
+          cp -r Content/* "$payload/Content/"
+          cp -r Projects/AutoSpace/* "$payload/Projects/AutoSpace/"
+          (cd "$payload" && ./AutoSpace --headless --verify)
           tar -czf Build/Frontier-Workspaces-Linux-x64.tar.gz -C "$payload" .
 
       - name: Upload Linux x64 standalone workspaces package

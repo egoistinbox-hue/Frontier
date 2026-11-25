@@ -82,6 +82,7 @@ bool AutoSpaceLifecycle::Initialize(
     Frontier::SimulationSpace::Policies::GameplayRulePolicyEngine::ClampToSafeBounds(Policies.GameplayPolicy);
 
     // Load single-level MainWorld.WorldSpace (blank scene: Sun & Sky only, zero geometry placements)
+    (void)WorldHost.Initialize();
     const std::filesystem::path StartupWorldPath = EffectiveProjectRoot / "Content" / "Worlds" / "MainWorld.WorldSpace";
     std::string WorldDiag {};
     if (!WorldHost.LoadWorldSpaceFile(StartupWorldPath, WorldDiag))

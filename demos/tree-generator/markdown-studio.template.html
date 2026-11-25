@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frontier — Markdown Studio</title>
+<style>
+:root{
+  --gap:#262626;--tabbar:#0a0a0a;--dock:#121212;--canvas:#0e0f12;--footer:#151515;
+  --well:#191919;--border:#2c2c2c;--recess:#090909;--input:#111;--section:#202020;
+  --hair:rgba(255,255,255,.065);--blue:#3b82f6;--blue-light:#60a5fa;--green:#34d399;--amber:#ffb454;
+  --ink:#ebebeb;--ink2:#b0b0b0;--muted:#8a8a8a;--faint:#5c5c5c;
+  --mono:"JetBrains Mono",Cascadia Code,Consolas,monospace;--sans:"DM Sans",Inter,"Segoe UI",system-ui,sans-serif;
+  --scale:1;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--recess);color:var(--ink);font:13px/1.6 var(--sans);overflow:hidden}
+#app{height:100%;display:flex;flex-direction:column;gap:4px;padding:4px}
+.tabbar{flex:0 0 38px;display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--tabbar);border-radius:10px 10px 0 0;border:1px solid var(--hair)}
+.tab{height:28px;display:inline-flex;align-items:center;gap:8px;padding:0 13px;border-radius:8px;background:var(--section);color:var(--ink);font-size:11.5px}
+.tab .x{color:var(--muted);font-size:12px}
+.tabbar small{color:var(--muted);font-size:10.5px}
+.spacer{flex:1}
+.tool{height:26px;padding:0 10px;border-radius:8px;background:var(--section);border:1px solid var(--hair);color:var(--ink2);font-size:10.5px;cursor:pointer}
+.tool:hover{color:var(--ink);border-color:#444}
+input[type=range]{width:100px;accent-color:var(--blue)}
+.workspace{flex:1;min-height:0;display:grid;grid-template-columns:252px minmax(360px,1fr) 240px;gap:4px}
+.pane{background:var(--dock);border:1px solid var(--hair);border-radius:10px;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.pane.right{border-radius:0 10px 10px 0}
+.head{flex:0 0 40px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--hair);background:rgba(255,255,255,.02);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.head .count{margin-left:auto;letter-spacing:0;text-transform:none;color:var(--faint)}
+.search{margin:10px;height:30px;border-radius:8px;background:var(--input);border:1px solid var(--border);color:var(--ink);padding:0 10px;font:11.5px var(--sans);outline:none}
+.search:focus{border-color:var(--blue)}
+.docs{flex:1;min-height:0;overflow:auto;padding:0 8px 12px}
+.doc{padding:9px 10px;border-radius:9px;cursor:pointer;margin-bottom:4px;border:1px solid transparent}
+.doc:hover{background:#1c1c1c}
+.doc.active{background:var(--section);border-color:#3d4f6b}
+.doc .n{font-size:12px;color:var(--ink)}
+.doc .m{font-size:9.5px;color:var(--faint);margin-top:2px}
+.footer{flex:0 0 30px;border-top:1px solid var(--hair);display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--faint);font-size:9.5px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.stage{flex:1;min-width:0;overflow:auto;background:var(--canvas);padding:26px 34px 80px;font-size:calc(13.5px * var(--scale))}
+.mk{max-width:940px;margin:0 auto}
+.mk h1{font-size:2em;font-weight:400;letter-spacing:-.02em;margin-bottom:14px;color:#f7f8fa}
+.mk h2{font-size:1.42em;font-weight:400;margin:34px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--hair)}
+.mk h3{font-size:1.13em;font-weight:500;margin:24px 0 8px;color:var(--blue-light)}
+.mk h4{font-size:1em;font-weight:500;margin:16px 0 6px;color:var(--ink2)}
+.mk p{color:var(--ink2);margin:10px 0}
+.mk a{color:var(--blue-light);text-decoration:none}
+.mk a:hover{text-decoration:underline}
+.mk code{font:0.88em var(--mono);color:var(--blue-light);background:rgba(59,130,246,.09);border-radius:4px;padding:1px 4px}
+.mk pre{background:var(--recess);border:1px solid var(--hair);border-radius:10px;padding:13px 15px;overflow:auto;margin:12px 0;font:0.86em/1.6 var(--mono);color:#cbd5e1}
+.mk pre code{background:none;padding:0;color:inherit}
+.mk ul,.mk ol{margin:8px 0 12px 22px;color:var(--ink2)}
+.mk li{margin:4px 0}
+.mk blockquote{border-left:3px solid var(--green);padding:6px 14px;margin:12px 0;background:rgba(52,211,153,.045);color:var(--ink2)}
+.mk table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.92em}
+.mk th,.mk td{border:1px solid var(--hair);padding:7px 10px;text-align:left;vertical-align:top;color:var(--ink2)}
+.mk th{background:var(--well);color:var(--ink);font-weight:500;white-space:nowrap}
+.mk tr:nth-child(even) td{background:rgba(255,255,255,.014)}
+.mk hr{border:0;border-top:1px solid var(--hair);margin:24px 0}
+.mk mark{background:rgba(255,180,84,.35);color:inherit;border-radius:2px}
+.outline{flex:1;overflow:auto;padding:8px 10px}
+.outline a{display:block;padding:5px 8px;border-radius:7px;color:var(--muted);font-size:11px;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.outline a:hover{background:#1e1e1e;color:var(--ink)}
+.outline a.lvl2{padding-left:16px;color:var(--ink2)}
+.outline a.lvl3{padding-left:26px;font-size:10px}
+.stats{padding:10px 12px;border-top:1px solid var(--hair);font-size:10px;color:var(--muted)}
+.stats b{color:var(--ink);font-weight:500}
+@media(max-width:980px){.workspace{grid-template-columns:200px minmax(300px,1fr)}.pane.right{display:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="tabbar">
+    <div class="tab">▤ Markdown Studio <span class="x">×</span></div>
+    <small id="crumb">Documentation / Untitled vegetation port</small>
+    <span class="spacer"></span>
+    <small>Scale</small><input type="range" id="scale" min="80" max="140" value="100">
+    <button class="tool" id="back">← Demo</button>
+  </div>
+  <div class="workspace">
+    <aside class="pane">
+      <div class="head">Documents <span class="count" id="docCount"></span></div>
+      <input class="search" id="search" placeholder="Filter documents…" spellcheck="false">
+      <div class="docs" id="docs"></div>
+      <div class="footer"><span class="dot"></span><span>Local autosave · read-only reference</span></div>
+    </aside>
+    <main class="stage"><article class="mk" id="content"></article></main>
+    <aside class="pane right">
+      <div class="head">Outline</div>
+      <div class="outline" id="outline"></div>
+      <div class="stats" id="stats"></div>
+    </aside>
+  </div>
+</div>
+<script type="application/json" id="docData">__DOC_DATA__</script>
+<script>
+"use strict";
+const docs = JSON.parse(document.getElementById("docData").textContent);
+let active = 0;
+const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function inline(text){
+  let s = esc(text);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  return s;
+}
+function slug(text, index){ return "s" + index + "-" + text.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,48); }
+function renderMarkdown(source){
+  const lines = source.split("\n"), out = [], outline = [];
+  let i = 0, paragraph = [], list = null, listItems = [], code = null, quote = [];
+  const flushParagraph = () => { if(paragraph.length){ out.push("<p>"+inline(paragraph.join(" "))+"</p>"); paragraph=[]; } };
+  const flushList = () => { if(list){ out.push(`<${list}>`+listItems.map(x=>"<li>"+inline(x)+"</li>").join("")+`</${list}>`); list=null; listItems=[]; } };
+  const flushQuote = () => { if(quote.length){ out.push("<blockquote>"+inline(quote.join(" "))+"</blockquote>"); quote=[]; } };
+  while(i < lines.length){
+    const line = lines[i];
+    if(code){ if(line.trim().startsWith("```")){ out.push("<pre><code>"+esc(code.join("\n"))+"</code></pre>"); code=null; } else code.push(line); i++; continue; }
+    if(line.trim().startsWith("```")){ flushParagraph(); flushList(); flushQuote(); code=[]; i++; continue; }
+    if(!line.trim()){ flushParagraph(); flushList(); flushQuote(); i++; continue; }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if(heading){ flushParagraph(); flushList(); flushQuote(); const level=heading[1].length, text=heading[2], id=slug(text,i);
+      outline.push({level,text,id}); out.push(`<h${level} id="${id}">${inline(text)}</h${level}>`); i++; continue; }
+    if(/^\|.*\|$/.test(line.trim()) && i+1<lines.length && /^\|[\s:|-]+\|$/.test(lines[i+1].trim())){
+      flushParagraph(); flushList(); flushQuote();
+      const cells = row => row.trim().slice(1,-1).split("|").map(c=>c.trim());
+      const header = cells(line); i+=2; const rows=[];
+      while(i<lines.length && /^\|.*\|$/.test(lines[i].trim())){ rows.push(cells(lines[i])); i++; }
+      out.push("<table><thead><tr>"+header.map(c=>`<th>${inline(c)}</th>`).join("")+"</tr></thead><tbody>"+
+        rows.map(r=>"<tr>"+r.map(c=>`<td>${inline(c)}</td>`).join("")+"</tr>").join("")+"</tbody></table>");
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*]\s+(.*)$/), ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if(unordered || ordered){ flushParagraph(); flushQuote(); const kind = unordered?"ul":"ol";
+      if(list && list!==kind) flushList(); list=kind; listItems.push((unordered||ordered)[1]); i++; continue; }
+    if(line.trim().startsWith(">")){ flushParagraph(); flushList(); quote.push(line.trim().slice(1).trim()); i++; continue; }
+    flushList(); flushQuote(); paragraph.push(line.trim()); i++;
+  }
+  flushParagraph(); flushList(); flushQuote();
+  if(code) out.push("<pre><code>"+esc(code.join("\n"))+"</code></pre>");
+  return {html:out.join("\n"), outline};
+}
+function renderDocs(){
+  const query = $("search").value.trim().toLowerCase();
+  const host = $("docs"); host.innerHTML = "";
+  docs.forEach((d,idx)=>{
+    if(d.name.toLowerCase().includes(query) || d.path.toLowerCase().includes(query)){
+      const el = document.createElement("div"); el.className = "doc"+(idx===active?" active":"");
+      el.innerHTML = `<div class="n">${esc(d.name)}</div><div class="m">${esc(d.group)} · ${(d.content.length/1024).toFixed(1)} kB</div>`;
+      el.onclick = ()=>{active=idx; renderDocs(); renderDoc();};
+      host.appendChild(el);
+    }
+  });
+  $("docCount").textContent = `${docs.length} files`;
+}
+function renderDoc(){
+  const d = docs[active], result = renderMarkdown(d.content);
+  $("content").innerHTML = result.html;
+  $("crumb").textContent = d.path;
+  const outline = $("outline"); outline.innerHTML = "";
+  for(const h of result.outline){
+    const a = document.createElement("a"); a.href = "#"+h.id; a.className = "lvl"+h.level;
+    a.textContent = h.text; outline.appendChild(a);
+  }
+  const words = d.content.split(/\s+/).length;
+  $("stats").innerHTML = `<b>${words.toLocaleString()}</b> words · <b>${result.outline.length}</b> headings · <b>${(d.content.match(/^\|/gm)||[]).length}</b> table rows`;
+  $("content").scrollIntoView({block:"start"});
+}
+function $(id){return document.getElementById(id);}
+$("search").oninput = renderDocs;
+$("scale").oninput = e => document.documentElement.style.setProperty("--scale", (+e.target.value/100).toString());
+$("back").onclick = () => { location.href = "index.html"; };
+renderDocs(); renderDoc();
+</script>
+</body>
+</html>

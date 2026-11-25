@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frontier — Markdown Studio</title>
+<style>
+:root{
+  --gap:#262626;--tabbar:#0a0a0a;--dock:#121212;--canvas:#0e0f12;--footer:#151515;
+  --well:#191919;--border:#2c2c2c;--recess:#090909;--input:#111;--section:#202020;
+  --hair:rgba(255,255,255,.065);--blue:#3b82f6;--blue-light:#60a5fa;--green:#34d399;--amber:#ffb454;
+  --ink:#ebebeb;--ink2:#b0b0b0;--muted:#8a8a8a;--faint:#5c5c5c;
+  --mono:"JetBrains Mono",Cascadia Code,Consolas,monospace;--sans:"DM Sans",Inter,"Segoe UI",system-ui,sans-serif;
+  --scale:1;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--recess);color:var(--ink);font:13px/1.6 var(--sans);overflow:hidden}
+#app{height:100%;display:flex;flex-direction:column;gap:4px;padding:4px}
+.tabbar{flex:0 0 38px;display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--tabbar);border-radius:10px 10px 0 0;border:1px solid var(--hair)}
+.tab{height:28px;display:inline-flex;align-items:center;gap:8px;padding:0 13px;border-radius:8px;background:var(--section);color:var(--ink);font-size:11.5px}
+.tab .x{color:var(--muted);font-size:12px}
+.tabbar small{color:var(--muted);font-size:10.5px}
+.spacer{flex:1}
+.tool{height:26px;padding:0 10px;border-radius:8px;background:var(--section);border:1px solid var(--hair);color:var(--ink2);font-size:10.5px;cursor:pointer}
+.tool:hover{color:var(--ink);border-color:#444}
+input[type=range]{width:100px;accent-color:var(--blue)}
+.workspace{flex:1;min-height:0;display:grid;grid-template-columns:252px minmax(360px,1fr) 240px;gap:4px}
+.pane{background:var(--dock);border:1px solid var(--hair);border-radius:10px;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.pane.right{border-radius:0 10px 10px 0}
+.head{flex:0 0 40px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--hair);background:rgba(255,255,255,.02);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.head .count{margin-left:auto;letter-spacing:0;text-transform:none;color:var(--faint)}
+.search{margin:10px;height:30px;border-radius:8px;background:var(--input);border:1px solid var(--border);color:var(--ink);padding:0 10px;font:11.5px var(--sans);outline:none}
+.search:focus{border-color:var(--blue)}
+.docs{flex:1;min-height:0;overflow:auto;padding:0 8px 12px}
+.doc{padding:9px 10px;border-radius:9px;cursor:pointer;margin-bottom:4px;border:1px solid transparent}
+.doc:hover{background:#1c1c1c}
+.doc.active{background:var(--section);border-color:#3d4f6b}
+.doc .n{font-size:12px;color:var(--ink)}
+.doc .m{font-size:9.5px;color:var(--faint);margin-top:2px}
+.footer{flex:0 0 30px;border-top:1px solid var(--hair);display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--faint);font-size:9.5px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green)}
+.stage{flex:1;min-width:0;overflow:auto;background:var(--canvas);padding:26px 34px 80px;font-size:calc(13.5px * var(--scale))}
+.mk{max-width:940px;margin:0 auto}
+.mk h1{font-size:2em;font-weight:400;letter-spacing:-.02em;margin-bottom:14px;color:#f7f8fa}
+.mk h2{font-size:1.42em;font-weight:400;margin:34px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--hair)}
+.mk h3{font-size:1.13em;font-weight:500;margin:24px 0 8px;color:var(--blue-light)}
+.mk h4{font-size:1em;font-weight:500;margin:16px 0 6px;color:var(--ink2)}
+.mk p{color:var(--ink2);margin:10px 0}
+.mk a{color:var(--blue-light);text-decoration:none}
+.mk a:hover{text-decoration:underline}
+.mk code{font:0.88em var(--mono);color:var(--blue-light);background:rgba(59,130,246,.09);border-radius:4px;padding:1px 4px}
+.mk pre{background:var(--recess);border:1px solid var(--hair);border-radius:10px;padding:13px 15px;overflow:auto;margin:12px 0;font:0.86em/1.6 var(--mono);color:#cbd5e1}
+.mk pre code{background:none;padding:0;color:inherit}
+.mk ul,.mk ol{margin:8px 0 12px 22px;color:var(--ink2)}
+.mk li{margin:4px 0}
+.mk blockquote{border-left:3px solid var(--green);padding:6px 14px;margin:12px 0;background:rgba(52,211,153,.045);color:var(--ink2)}
+.mk table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.92em}
+.mk th,.mk td{border:1px solid var(--hair);padding:7px 10px;text-align:left;vertical-align:top;color:var(--ink2)}
+.mk th{background:var(--well);color:var(--ink);font-weight:500;white-space:nowrap}
+.mk tr:nth-child(even) td{background:rgba(255,255,255,.014)}
+.mk hr{border:0;border-top:1px solid var(--hair);margin:24px 0}
+.mk mark{background:rgba(255,180,84,.35);color:inherit;border-radius:2px}
+.outline{flex:1;overflow:auto;padding:8px 10px}
+.outline a{display:block;padding:5px 8px;border-radius:7px;color:var(--muted);font-size:11px;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.outline a:hover{background:#1e1e1e;color:var(--ink)}
+.outline a.lvl2{padding-left:16px;color:var(--ink2)}
+.outline a.lvl3{padding-left:26px;font-size:10px}
+.stats{padding:10px 12px;border-top:1px solid var(--hair);font-size:10px;color:var(--muted)}
+.stats b{color:var(--ink);font-weight:500}
+@media(max-width:980px){.workspace{grid-template-columns:200px minmax(300px,1fr)}.pane.right{display:none}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="tabbar">
+    <div class="tab">▤ Markdown Studio <span class="x">×</span></div>
+    <small id="crumb">Documentation / Untitled vegetation port</small>
+    <span class="spacer"></span>
+    <small>Scale</small><input type="range" id="scale" min="80" max="140" value="100">
+    <button class="tool" id="back">← Demo</button>
+  </div>
+  <div class="workspace">
+    <aside class="pane">
+      <div class="head">Documents <span class="count" id="docCount"></span></div>
+      <input class="search" id="search" placeholder="Filter documents…" spellcheck="false">
+      <div class="docs" id="docs"></div>
+      <div class="footer"><span class="dot"></span><span>Local autosave · read-only reference</span></div>
+    </aside>
+    <main class="stage"><article class="mk" id="content"></article></main>
+    <aside class="pane right">
+      <div class="head">Outline</div>
+      <div class="outline" id="outline"></div>
+      <div class="stats" id="stats"></div>
+    </aside>
+  </div>
+</div>
+<script type="application/json" id="docData">[{"path": "docs/VegetationPortPlan.md", "name": "VegetationPortPlan.md", "group": "Vegetation port", "content": "# Untitled → C++ vegetation generator: wind, clusters, UV, fracture, SDF, 10k forest\n\n> **Scope of this branch.** `egoistinbox-hue/Frontier` starts from an empty initial commit, so this branch contains a *porting scaffold*, an interactive browser reference, and this decision document. It is not a drop-in patch to the full Frontier engine checkout: the engine units named below (`OutlinerPanel`, `ClusterPyramid`, `FastRuntimeFracture`, …) are identified by reading the referenced branches and are the integration points to target once this work lands there. Every claim about the existing engine comes from those two branches; every claim about the code in this branch can be verified with the commands in §10.\n\n## 0. Decisions at a glance\n\n| Question | Decision | Why |\n| :-- | :-- | :-- |\n| Port target | C++20 core with GPU `.slang` animation; JS stays the authoring reference | Slate already emits exactly the attributes a GPU wind program needs (`height, limb, phase, detail` + pivot); port that contract first, not the whole viewer |\n| Wind | **One** `WindFieldSolver` instance in the world; every tree, leaf and SDF proxy samples it | superposed directional + gust components, altitude shear/veer, shared gust envelope; no per-tree wind objects |\n| Presets | All **37 tree** and **14 grass** presets from Slate `params.ts` / `grassParams.ts`, grouped as in `PRESET_GROUPS` | one deterministic catalogue, keyed by name; full botanical parameter blocks migrate file-by-file |\n| UV | Keep Slate's face-varying UVs; cylindrical bark strips + atlas leaves; split seams at export; lock seams in simplification | textures need stable texel density; crack-free clusters must share the same island borders |\n| LOD | Reuse Frontier `ClusterPyramid` (128-tri clusters, monotone group error, UV-seam lock) + two-phase cull | do **not** build a second Nanite; inflate cluster bounds by max wind displacement or swaying trees get culled |\n| Leaf shuffle | Hybrid: procedural vertex sway for trunk/limbs, **VAT** for leaves, **XPBD only for hero trees / fracture debris** | 10k trees × hundreds of leaves cannot run XPBD per frame; offline XPBD can *bake into* VAT |\n| Nanite | No new Nanite implementation; extend the existing cluster pyramid | its cluster DAG already carries UV/material/normal data and error-monotone cuts |\n| SDF | Static baked local volume + **animated analytic capsule/sphere proxies posed by the same wind sample**; no per-frame global rebake | rigid-proxy evaluation is a cheap inverse-transform; a 10k-tree grid re-bake every frame is not |\n| Fracture | Offline baked cuts per species + near-field `FastRuntimeFracture`; shared cut tokens; fragments get their own SDF proxies | deterministic pieces, intact UVs, no global topology rebuild at runtime |\n\n## 1. Source-of-truth mapping\n\n| Slate (TS reference) | C++ target in this branch | Engine integration point |\n| :-- | :-- | :-- |\n| `src/tree/params.ts` (`PRESETS`, `PRESET_GROUPS`) | `Engine/Vegetation/VegetationPresetCatalog.{h,cpp}` | `Engine/Interchange/` preset codec; outliner construct sheet |\n| `src/tree/skeleton.ts` (Weber–Penn turtle) | **not ported yet** — milestone B | `Engine/GeometrySpace/Network/PolygonNetwork` |\n| `src/tree/mesher.ts` (welded collars, roots, `windAt`) | **not ported yet** — milestone B | same `PolygonNetwork`; export through `UVCodec` / `SceneCodec` |\n| `src/tree/mesh.ts` (`VertexWind`, face-varying UVs) | `CanopyDeformer`, `ClusterLodSelector` | vertex layout: `POSITION`, `NORMAL`, `TEXCOORD_0`, `TEXCOORD_1`, `COLOR_0` |\n| `src/viewer/shaders.ts` (`applyWind`) | `Engine/Shaders/Vegetation/TreeSway.slang` + `CanopyDeformer.cpp` | `Engine/GeometricRaster/` visibility/material channels |\n| `src/plant/grassParams.ts` | `VegetationPresetCatalog` (grass entries) | same pipeline with ribbon mesher |\n| ProjectZero `WindSpecification.js` / `WindInspector.cpp` | `WindFieldSolver.{h,cpp}` | `WindInstanceData`, `AtmosphericWindSolver` |\n\n**Coordinate conversion.** Slate is Y-up; Frontier is right-handed +Z-up. Convert at the interchange boundary with `(X, Y, Z)_Slate → (X, -Z, Y)_Frontier` (this preserves handedness). The standalone C++ scaffold deliberately keeps Y-up locally so its deformer stays bit-comparable with `shaders.ts`; convert the whole mesh and all pivots once at insertion, *then* transform the wind direction into world space.\n\n## 2. \"Untitled\": where the generator attaches to the editor\n\n1. Create one outliner entry for the generator with `DomainTag = \"vegetation:tree-generator\"`, category `GeometryVolume`, editable title `Tree generator`, and a subtitle such as `Seed 1337 · 12 000 instances`. This reuses `OutlinerPanel` / `OutlinerRecordEntry` verbatim — no new tree pane.\n2. Register a `VegetationInstanceRegister` (in `Engine/Vegetation/`) keyed by `OutlinerSlotToken`, matching the `InspectorInstanceRegister` pattern. The entry in the outliner is the *generator*; per-species entries become nested records with the same token namespace.\n3. Extend `InspectorPanel` through `ConfigureCustomSectionCallback` (already provided) with the cards shown in §9: Generation, Wind field (bound to the existing `WindInstanceData`), Vegetation animation, Cluster LOD, Surface/UV, Fracture, Distance field. Do not fork `InspectorPanel`.\n4. The wind entry is a **single** `WindInstanceData` in the world. Trees reference its token; the inspector shows \"WindField shared\". The SDF entry references the same token with an `ApplyToSdf` toggle.\n5. Undo/redo stores `VegetationInstanceRecord` deltas plus the generator seed; geometry is derived data and can be rebuilt deterministically.\n\n## 3. One wind field, three consumers\n\nThe field is the superposition implemented in ProjectZero `EvaluateWind` plus the atmosphere parameters from `AtmosphericWindSolver.h`:\n\n```text\nF(x,z,t)   = Σ Directional(strength, bearing)\n           + Σ Gust(strength, bearing, radius, frequency) · falloff² · (0.65 + 0.35 sin(2πft))\n           + Tornado / Radial components (only where authored)\nspeed     *= 1 + ShearPerKm · altitude_km\nbearing   += VeerDegPerKm · altitude_km\ngust       = GustStrength · (0.5 + 0.5 sin(2π f t)) · (0.35 + 0.65 · Steadiness)\nturbulence = Turbulence · (1.05 - 0.45 · Steadiness)\n```\n\n`WindFieldSolver::Resolve(x, y, z, t)` returns velocity, direction, strength, gust and turbulence. Consumers:\n\n| Consumer | Sample point | Cost | Notes |\n| :-- | :-- | :-- | :-- |\n| Trunk/limb vertex sway | once per **instance** (tree origin) → uploaded as instance uniform | O(1) per tree | height-dependent phase lag is applied from the vertex's `height` weight |\n| Leaf flutter | same instance sample + per-leaf `phase` from the mesh | O(1) per vertex | procedural or VAT; see §6 |\n| SDF proxies | same instance sample, evaluated on CPU at ~30 Hz for near trees only | O(near trees) | proxy joints rotate with the same gust envelope |\n| Wind overlay / debug | grid of samples in the viewport | O(grid) | visualises the one field; no second field is created |\n\nPer-tree variety comes from `WindFieldSolver::InstancePhase(token)` — a deterministic hash used for limb phase, LOD dither and leaf offset. **Never** clone the field per tree.\n\n### Mesh deformation contract\n\nSlate's welded mesh already stores what the GPU needs:\n\n```text\nCOLOR_0    = (height ∈ [0,1], limb ∈ [0,1], phase ∈ [0,1], detail ∈ [0,1])\nTEXCOORD_1 = (level / 4, junction flag)\naPivot     = limb-root position (vertex attribute in the viewer)\n```\n\n`TreeSway.slang` ports `applyWind()` exactly: cantilever trunk sway (`height²`), limb rotation about `aPivot`, and high-frequency twig/leaf flutter. `CanopyDeformer.cpp` is the CPU mirror used for verification and SDF proxy posing. Roots carry `(0,0,0,0)` and stay anchored.\n\n## 4. All presets and the full botanical port\n\n`VegetationPresetCatalog` contains the exact names and groups from Slate: Oaks, Forest·broadleaf, Forest·conifers, Jungle, Savanna, Desert, Rocky terrain, plus three grass groups. The runtime-authoring fields (height, height variance, levels, trunk ratio, per-level branch counts, leaves, leaf scale, root count) were extracted from `params.ts` and are checked in as data. `WindFlex` is a new authoring value for this port; it is not in Slate.\n\nTo reach visual parity, migrate these files in order and keep their tests:\n\n1. `skeleton.ts` — turtle recursion, phyllotaxis, tropism, root flare. Preserve `seed` determinism.\n2. `mesher.ts` — welded branch windows, collars, caps; preserve the topology validation from `validate.ts`.\n3. `roots.ts` — environment-aware roots; preserve the collision/scatter contract from `env/environment.ts`.\n4. `export.ts` — OBJ/glTF with seam splitting (`toGpuBuffers`) and the `extras.wind` documentation.\n\nAcceptance gate: for a fixed seed, every preset produces the same vertex/quad counts and the same `wind` tuple statistics as the TS generator. The scaffold's 51-entry catalogue is the seed for that work, not a substitute for the mesher.\n\n## 5. UV unwrapping and textures\n\n- Slate UVs are **face-varying**: `quadUVs` / `triUVs` are per corner, so the cylindrical seam does not duplicate vertices; `toGpuBuffers()` splits only at export. Preserve this; do not re-unwrap the welded mesh unless texel density is wrong.\n- Bark: cylindrical strips with U = circumference fraction and V = arc length / scale; repeat vertically. Leaves: five-vertex islands in an atlas (`mesher.ts` already emits `(0.4,0) … (0.5,1)` corners). Pack with the existing UV workspace (`UVCodec`, `IslandLayoutPacker`) and generate tangents from `TEXCOORD_0`.\n- Materials: bark (opaque, roughness ~0.9) and leaf (double-sided, alpha-tested) are separate primitives/material slots, as in `toGLB()`. Keep `MaterialOrdinal` stable through cluster building.\n- With cluster LOD set `ClusterPyramid.LockUvSeams = true` and `LockMaterialBoundaries = true`. Simplification that crosses an island border breaks texture continuity and causes popping.\n- The demo's UV mode shows the seam overlay and an atlas preview; toggling textures changes the atlas fill only — it does not fetch images, so the demo stays self-contained.\n\n## 6. Leaves: procedural, VAT or XPBD?\n\n| Option | Per-frame cost | Quality | Verdict for 10k+ trees |\n| :-- | :-- | :-- | :-- |\n| Procedural vertex wind (Slate `shaders.ts`) | a few sine/cos per vertex | good trunk/limb motion, acceptable leaf flutter | **use** for bark and near leaves |\n| VAT (texture of baked frames) | 1 texture fetch + lerp per leaf | authored turbulence, perfectly stable, no CPU cost | **use** for leaf shuffle; 16–32 frames is enough at 30 Hz playback with linear interpolation |\n| XPBD (distance/bend constraints on each leaf) | O(leaves × iterations) per tree | best contact/response | **do not** run per frame on the forest; use for one hero tree and fracture debris, or offline to *generate* VAT |\n| Rigid-body leaf cards | physics broadphase | exotic | unnecessary; leaf collisions are visually negligible at forest distance |\n\n**Recommended hybrid.** Bake 16–32 frames of leaf motion per species into an RGBA16F VAT (XY = displacement, Z = extension, W = normal tilt), sampled with per-leaf phase and the shared wind strength/phase. XPBD solves 8–12 iterations offline for the bake and remains as a runtime solver only for the selected hero tree. Add a per-instance phase offset so 10k trees do not flutter in lockstep. Far LODs drop leaf flutter entirely and use a static canopy card — the leaf VAT is only sampled for L0/L1.\n\nThe demo's `leafModes` segmented control shows all three behaviours; \"XPBD hero\" limits the spring solve to the selected tree and reports that in the HUD.\n\n## 7. Nanite-style clusters and the 10k forest\n\nFrontier already owns the mechanism: `Engine/SpatialAcceleration/ClusterPyramid.h` (128-triangle clusters, monotone group error, UV/material/normal preservation, 128 B cluster headers) plus `ClusterCullEncoder` (frustum, normal cone, continuous cut, Hi-Z, two-phase rescue). **Extend these; do not build a separate Nanite.**\n\n```text\nper species (offline):\n  welded mesh → 128-tri clusters → group 4 clusters → lock border → simplify interior 0.5×\n  → store (error, sphere) once per group → repeat until triangle budget\nper frame (GPU-driven):\n  for instance in forest:\n    wind = WindFieldSolver::Resolve(origin, height, t)       // 1 sample\n    for cluster in instance:\n      bound.radius += CanopyDeformer::MaximumDisplacement(wind)\n      if error_px <= 1.25 && frustum && normalCone && !HiZ: draw(cluster)\n      else if < 4 px: compute software raster path\n```\n\nKey details:\n\n- **Wind-safe bounds.** Deform after the cut but cull using the inflated sphere; otherwise a swaying crown can be culled at the silhouette. `ClusterLodSelector::WindSafeRadius()` implements the inflation.\n- **Stable cut.** Group error must be monotone (`group.error ≥ every child error`) and both sides of a group border must use the same sphere, or mixed LOD levels crack.\n- **Wind attributes survive simplification.** Carry `TEXCOORD_1` / `COLOR_0` through quadric simplification; if a collapse would blend incompatible wind phases, lock that edge.\n- **Instance layout.** `VegetationInstanceRecord` is 64 B aligned (token, preset ordinal, seed, position, scale, yaw, phase, LOD, flags). At 10 000 trees that is 640 kB — trivial for a storage buffer. No virtual calls and no per-tree wind component.\n- **Update rates.** Wind uniform + instance LOD cut at 60 Hz; wind field solve per visible instance; SDF proxy poses at 30 Hz near field; VAT frames at 30 Hz; fracture simulation at 60 Hz for at most a handful of impacts.\n- **Budget.** 10k trees × ~9 000 source triangles is 90 M triangles; cluster cuts reduce visible geometry by two orders of magnitude at forest distance. Keep far trees at 240–900 triangles and drop leaves beyond the mid LOD.\n\n## 8. Fracture\n\nWire into `Engine/GeometrySpace/Fracture/`: `FastRuntimeFracture` for near-field cuts, `EngineeringBakedFracture` for deterministic per-species offline cuts, `FractureSimulationRunner` + `FractureMaterialRepository` for rigid fragments and materials.\n\n1. Author cut planes on trunk and primary limbs only; `FractureSpecification::BuildTrunkCuts()` gives deterministic planes and shared `CutToken`s.\n2. Bake fragment UVs and interior cap UVs with the same atlas; a cut face samples bark end-grain, not a black void.\n3. Fragments inherit cluster LODs of their source triangles; after fracture, disable the original instance's cluster cut and draw fragment records instead.\n4. Each moving fragment gets one analytic SDF proxy (capsule or convex shell) so shadows/occlusion follow it; remove the source tree's proxy at impact time.\n5. Do not run runtime fracture on all 10k trees: cap active fracture sets to the near field (e.g. 8 trees) and stream pre-baked fracture variants for anything else.\n\n## 9. SDF: how to let wind move it\n\n| Option | Cost | Accuracy | Verdict |\n| :-- | :-- | :-- | :-- |\n| A. Rebake global distance field every frame from deformed meshes | huge (voxels × 10k trees) | exact | **reject** — does not scale |\n| B. \"VAT for SDF\": bake a grid per frame and interpolate | 16–32 × grid memory, still no sparse update | approximate | **reject as the primary path**; too much memory for a forest, and interpolation smears contact |\n| C. Analytic primitives (spheres/capsules) moved by the wind field | ~10 primitives per near tree | good for trunk/canopy | **use** |\n| D. Static baked local volume + C for the animated part | one compact `LocalSignedDistanceVolume` per species + cheap proxies | good hybrid | **use** (recommended) |\n\n### Recommended design\n\n- **Static part.** Bake one compact local volume per species offline (`LocalSignedDistanceVolume::BakeSignedFromTrianglesAspect`, 48³ half-float) and place it rigidly per instance. It carries trunk/root detail that never moves much.\n- **Dynamic part.** Build a `DistanceProxySet`: a tapered capsule for the trunk (`TaperedLimbCapsule32` layout), one per primary limb, a sphere for the canopy. `UpdatePose()` rotates each proxy with the *same* `WindSample` used by `TreeSway.slang`. Evaluate with smooth-min (`k ≈ 0.24 m`).\n- **Shader trick.** For a rigid proxy, evaluate the SDF in the proxy's rest space by inverse-transforming the query point; this is the SDF equivalent of skinning and is much cheaper than re-voxelising.\n- **Global field.** Only near-camera clipmap tiles include dynamic proxies; each tile keeps a short list of proxy indices, culled by bounding sphere. Update tiles at 30 Hz (or on camera movement), never the whole forest at 60 Hz. Far trees remain in the static baked layer.\n- **Engine constraint.** In the referenced Frontier branch, local distance volumes are restricted to the `GtxLowEnd` tier and the former global SDF GI path was removed pending redo. Keep this vegetation SDF for collision/occlusion/AO on that tier; use the existing BVH4/ray-query path on high tier instead of reviving removed GI code.\n- **Fracture.** Replace the source proxy with fragment proxies at impact and return them to the static layer once they come to rest.\n\nThe demo's SDF mode renders a live signed-distance slice around the selected tree, overlays the capsule proxies, and toggles between static/animated/hybrid behaviour; the \"Apply to SDF\" switch is the same `WindSample` coupling described here.\n\n## 10. C++ scaffold, verification and the HTML demo\n\n```bash\nbash scripts/build_vegetation_core.sh     # compile + run the standalone checks\n```\n\nCovers: 51 presets, field superposition/shear, root anchoring vs crown displacement, monotone LOD cut, SDF inside/outside and pose update, fracture piece counts, and 10 000 instance records.\n\n| File | Role |\n| :-- | :-- |\n| `Engine/Vegetation/VegetationMath.h` | vector math, deterministic hash, smooth-min, Rodrigues rotation |\n| `Engine/Vegetation/WindFieldSolver.{h,cpp}` | shared field (component superposition + shear/veer/gust/turbulence) |\n| `Engine/Vegetation/VegetationPresetCatalog.{h,cpp}` | all Slate tree/grass presets |\n| `Engine/Vegetation/CanopyDeformer.{h,cpp}` | CPU mirror of the GPU wind program |\n| `Engine/Vegetation/ClusterLodSelector.{h,cpp}` | screen-error cut + wind-safe bounds |\n| `Engine/Vegetation/DistanceProxySet.{h,cpp}` | analytic SDF proxies posed from wind |\n| `Engine/Vegetation/FractureSpecification.h` | deterministic cut planes and tokens |\n| `Engine/Vegetation/VegetationInstanceRegister.h` | 64 B instance records keyed by outliner token |\n| `Engine/Shaders/Vegetation/TreeSway.slang` | GPU deformer matching the CPU mirror |\n| `tests/VegetationCoreTest.cpp` | standalone verification |\n\n### Demo\n\nOpen `demos/tree-generator/index.html` (no server or build needed). It uses the same dark dock tokens, outliner rows and property cards as the Project Zero / Frontier editor reference; the Markdown Studio copy is `demos/tree-generator/markdown-studio.html`.\n\n- **Outliner:** 10 groups, all 51 presets, search, tree/grass filter, per-species visibility, selection sync.\n- **Viewport:** orbit drag, wheel zoom, click a tree to select; modes `1` sway, `2` LOD clusters, `3` UV atlas, `4` fracture, `5` SDF proxies; `F` fractures the selected tree; `Space` pauses.\n- **Inspector:** live wind field sliders, flex weights, leaf-shuffle strategy, cluster error budget, UV atlas, fracture strength, SDF proxy mode. All sliders feed the same simulation the viewport draws.\n- **Stats:** visible trees, active clusters, triangle estimate, wind at focus, LOD histogram and FPS, so the forest scale is visible rather than asserted.\n\nThe demo is a *behavioural reference*, not an engine render: it uses Canvas 2D for the forest, a pseudo-3D projection, and a low-resolution SDF slice. Its numbers and formulas mirror the C++ units, but it does not run Vulkan, Slang, or the real cluster rasteriser.\n\n## 11. Migration sequence and acceptance gates\n\n| Phase | Work | Gate |\n| :--: | :-- | :-- |\n| A | Land this scaffold, preset catalogue and HTML reference; screenshot each demo mode | C++ checks pass; all 51 presets selectable; each mode renders |\n| B | Port `skeleton.ts` → C++ turtle, then welded `mesher.ts`, `roots.ts`, `validate.ts` | Fixed-seed vertex/quad counts match TS for all 37 tree presets |\n| C | Wire generator into Untitled outliner + inspector cards via existing panels; one wind entry | Selection, visibility and undo round-trip; no new UI pane classes |\n| D | GPU `TreeSway.slang` + preserve wind attributes through `ClusterPyramid`; wind-safe bounds | CPU/GPU deformer screenshots match; no cluster popping during gusts |\n| E | VAT bake from offline XPBD; runtime XPBD limited to hero tree | 10k instanced trees at target budget; leaf phases decorrelated |\n| F | Static local volumes + animated analytical proxies; near-field clipmap integration | Moving proxies track deformed silhouette; no per-frame global rebake |\n| G | Offline fracture variants + near-field runtime solver + fragment proxies | Shared cut tokens; fragment UVs and SDF proxies stay consistent |\n\n## Appendix: references consulted\n\n- Slate `arena/01a096c9-slate`: `src/tree/{params,skeleton,mesher,mesh,export,validate}.ts`, `src/viewer/shaders.ts`, `src/plant/grassParams.ts`.\n- Frontier `arena/d929ef36-frontier`: `Engine/Components/Panes/{OutlinerPanel,InspectorPanel}.h`, `Engine/Editor/Inspectors/WindInspector.{h,cpp}`, `Engine/GeometricRaster/Atmosphere/AtmosphericWindSolver.h`, `Engine/SpatialAcceleration/ClusterPyramid.h`, `Engine/GeometricRaster/Visibility/ClusterCullEncoder.h`, `Engine/GeometrySpace/Fracture/README.md`, `Engine/DistanceFieldSpace/README.md`, `Engine/DistanceFieldSpace/ArticulatedCapsuleRig.h`, `Experimental/ProjectZeroEditor/{WindSpecification.js,Editor.css,InspectorDepot/styles.css}`, `Documentation/Plans/{UVWorkspaceArchitecturePlan.md,MarkdownStudioViewer.html}`.\n"}, {"path": "README.md", "name": "README.md", "group": "Repository root", "content": "# Frontier — vegetation porting lab\n\nThis branch is the **Untitled** vegetation prototype: a C++20 porting scaffold, a self-contained HTML reference demo, and the architecture decisions behind both.\n\n```bash\nbash scripts/build_vegetation_core.sh          # compile + run C++ checks\npython3 scripts/build_markdown_studio.py       # rebuild the Markdown Studio viewer\n```\n\n| Path | What it is |\n| :-- | :-- |\n| [`docs/VegetationPortPlan.md`](docs/VegetationPortPlan.md) | Full design: wind field, all presets, UV unwrap, cluster LOD, leaf VAT/XPBD, fracture, SDF strategy, 10k forest, editor UI |\n| [`demos/tree-generator/index.html`](demos/tree-generator/index.html) | Interactive Frontier/Project-Zero-style editor demo (outliner, inspector, five viewport modes) |\n| [`demos/tree-generator/markdown-studio.html`](demos/tree-generator/markdown-studio.html) | Markdown Studio view of the design document (no server required) |\n| [`Engine/Vegetation/`](Engine/Vegetation/) | Standalone C++20 units: shared wind solver, 51 presets, canopy deformer, cluster cut, SDF proxies, fracture specification, instance register |\n| [`Engine/Shaders/Vegetation/TreeSway.slang`](Engine/Shaders/Vegetation/TreeSway.slang) | GPU mirror of the CPU wind deformer |\n| [`tests/VegetationCoreTest.cpp`](tests/VegetationCoreTest.cpp) | Verification for 10 000 instances and the wind → mesh → SDF pipeline |\n\nSources consulted: Slate branch `arena/01a096c9-slate` (tree generator) and Frontier branch `arena/d929ef36-frontier` (editor UI, cluster LOD, fracture, SDF, wind inspector). See the document appendix for the exact files.\n"}]</script>
+<script>
+"use strict";
+const docs = JSON.parse(document.getElementById("docData").textContent);
+let active = 0;
+const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function inline(text){
+  let s = esc(text);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  return s;
+}
+function slug(text, index){ return "s" + index + "-" + text.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,48); }
+function renderMarkdown(source){
+  const lines = source.split("\n"), out = [], outline = [];
+  let i = 0, paragraph = [], list = null, listItems = [], code = null, quote = [];
+  const flushParagraph = () => { if(paragraph.length){ out.push("<p>"+inline(paragraph.join(" "))+"</p>"); paragraph=[]; } };
+  const flushList = () => { if(list){ out.push(`<${list}>`+listItems.map(x=>"<li>"+inline(x)+"</li>").join("")+`</${list}>`); list=null; listItems=[]; } };
+  const flushQuote = () => { if(quote.length){ out.push("<blockquote>"+inline(quote.join(" "))+"</blockquote>"); quote=[]; } };
+  while(i < lines.length){
+    const line = lines[i];
+    if(code){ if(line.trim().startsWith("```")){ out.push("<pre><code>"+esc(code.join("\n"))+"</code></pre>"); code=null; } else code.push(line); i++; continue; }
+    if(line.trim().startsWith("```")){ flushParagraph(); flushList(); flushQuote(); code=[]; i++; continue; }
+    if(!line.trim()){ flushParagraph(); flushList(); flushQuote(); i++; continue; }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if(heading){ flushParagraph(); flushList(); flushQuote(); const level=heading[1].length, text=heading[2], id=slug(text,i);
+      outline.push({level,text,id}); out.push(`<h${level} id="${id}">${inline(text)}</h${level}>`); i++; continue; }
+    if(/^\|.*\|$/.test(line.trim()) && i+1<lines.length && /^\|[\s:|-]+\|$/.test(lines[i+1].trim())){
+      flushParagraph(); flushList(); flushQuote();
+      const cells = row => row.trim().slice(1,-1).split("|").map(c=>c.trim());
+      const header = cells(line); i+=2; const rows=[];
+      while(i<lines.length && /^\|.*\|$/.test(lines[i].trim())){ rows.push(cells(lines[i])); i++; }
+      out.push("<table><thead><tr>"+header.map(c=>`<th>${inline(c)}</th>`).join("")+"</tr></thead><tbody>"+
+        rows.map(r=>"<tr>"+r.map(c=>`<td>${inline(c)}</td>`).join("")+"</tr>").join("")+"</tbody></table>");
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*]\s+(.*)$/), ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if(unordered || ordered){ flushParagraph(); flushQuote(); const kind = unordered?"ul":"ol";
+      if(list && list!==kind) flushList(); list=kind; listItems.push((unordered||ordered)[1]); i++; continue; }
+    if(line.trim().startsWith(">")){ flushParagraph(); flushList(); quote.push(line.trim().slice(1).trim()); i++; continue; }
+    flushList(); flushQuote(); paragraph.push(line.trim()); i++;
+  }
+  flushParagraph(); flushList(); flushQuote();
+  if(code) out.push("<pre><code>"+esc(code.join("\n"))+"</code></pre>");
+  return {html:out.join("\n"), outline};
+}
+function renderDocs(){
+  const query = $("search").value.trim().toLowerCase();
+  const host = $("docs"); host.innerHTML = "";
+  docs.forEach((d,idx)=>{
+    if(d.name.toLowerCase().includes(query) || d.path.toLowerCase().includes(query)){
+      const el = document.createElement("div"); el.className = "doc"+(idx===active?" active":"");
+      el.innerHTML = `<div class="n">${esc(d.name)}</div><div class="m">${esc(d.group)} · ${(d.content.length/1024).toFixed(1)} kB</div>`;
+      el.onclick = ()=>{active=idx; renderDocs(); renderDoc();};
+      host.appendChild(el);
+    }
+  });
+  $("docCount").textContent = `${docs.length} files`;
+}
+function renderDoc(){
+  const d = docs[active], result = renderMarkdown(d.content);
+  $("content").innerHTML = result.html;
+  $("crumb").textContent = d.path;
+  const outline = $("outline"); outline.innerHTML = "";
+  for(const h of result.outline){
+    const a = document.createElement("a"); a.href = "#"+h.id; a.className = "lvl"+h.level;
+    a.textContent = h.text; outline.appendChild(a);
+  }
+  const words = d.content.split(/\s+/).length;
+  $("stats").innerHTML = `<b>${words.toLocaleString()}</b> words · <b>${result.outline.length}</b> headings · <b>${(d.content.match(/^\|/gm)||[]).length}</b> table rows`;
+  $("content").scrollIntoView({block:"start"});
+}
+function $(id){return document.getElementById(id);}
+$("search").oninput = renderDocs;
+$("scale").oninput = e => document.documentElement.style.setProperty("--scale", (+e.target.value/100).toString());
+$("back").onclick = () => { location.href = "index.html"; };
+renderDocs(); renderDoc();
+</script>
+</body>
+</html>

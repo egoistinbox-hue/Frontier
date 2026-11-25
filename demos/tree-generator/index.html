@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frontier · Untitled — Vegetation Wind Lab</title>
+<!--
+  Frontier-style vegetation lab. Self-contained: no CDN, no build step, no engine connection.
+  Mirrors Engine/Vegetation/*.cpp and Engine/Shaders/Vegetation/TreeSway.slang.
+-->
+<style>
+:root{
+  --bg:#050505; --panel:#121212; --inset:#1a1a1a; --field:#000; --raised:#222;
+  --selected:#262626; --stroke:rgba(255,255,255,.065); --stroke-strong:#2e2e2e;
+  --text:#f0f0f0; --dim:#9a9a9a; --faint:#5c5c5c;
+  --blue:#3b82f6; --blue-soft:rgba(59,130,246,.16); --amber:#ffb454; --green:#34d399;
+  --red:#ef5350; --purple:#9aa2ff; --r:18px; --pill:999px; --ease:cubic-bezier(.22,.61,.36,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font:13px/1.45 "DM Sans",Inter,"Segoe UI",system-ui,sans-serif;overflow:hidden;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+::selection{background:rgba(59,130,246,.35)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#262626;border-radius:9px}
+::-webkit-scrollbar-track{background:transparent}
+#app{height:100%;display:flex;flex-direction:column;gap:8px;padding:8px}
+
+/* ── application bar ─────────────────────────────────────────────────────── */
+.topbar{flex:0 0 46px;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--panel);
+  border:1px solid var(--stroke);border-radius:14px}
+.brand{display:flex;align-items:center;gap:9px;font-size:12px;letter-spacing:.12em;font-weight:600}
+.brand .mark{width:26px;height:26px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(140deg,#3b82f6,#1d4ed8);color:#fff;font-size:13px}
+.crumbs{display:flex;align-items:center;gap:7px;color:var(--dim);font-size:11.5px;min-width:0}
+.crumbs b{color:var(--text);font-weight:500}
+.crumbs .sep{color:var(--faint)}
+.topbar .spacer{flex:1}
+.btn{height:30px;padding:0 13px;border-radius:var(--pill);border:1px solid var(--stroke);background:var(--raised);
+  font-size:11.5px;display:inline-flex;align-items:center;gap:7px;transition:background .15s var(--ease)}
+.btn:hover{background:#303030}
+.btn.primary{background:var(--blue);border-color:transparent;color:#fff;font-weight:600}
+.btn.primary:hover{background:#2563eb}
+.btn.ghost{background:transparent;color:var(--dim)}
+.btn.ghost:hover{color:var(--text);background:var(--raised)}
+.btn.on{border-color:var(--blue);color:#bfdbfe}
+.pill-status{display:flex;align-items:center;gap:7px;font-size:10.5px;color:var(--dim);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px rgba(52,211,153,.6)}
+.dot.warn{background:var(--amber);box-shadow:0 0 8px rgba(255,180,84,.5)}
+
+/* ── shell ───────────────────────────────────────────────────────────────── */
+.workspace{flex:1;min-height:0;display:grid;grid-template-columns:286px minmax(320px,1fr) 336px;gap:8px}
+.dock{background:var(--panel);border:1px solid var(--stroke);border-radius:var(--r);display:flex;flex-direction:column;
+  min-height:0;min-width:0;overflow:hidden;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+.panel-header{flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:11px 12px;border-bottom:1px solid var(--stroke);background:rgba(255,255,255,.018)}
+.ph-title{font-size:12px;font-weight:600;letter-spacing:.04em}
+.ph-sub{font-size:10px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ph-icon{width:26px;height:26px;flex:none;border-radius:9px;display:grid;place-items:center;background:var(--inset);border:1px solid var(--stroke);color:var(--dim)}
+.iconbtn{width:26px;height:26px;flex:none;border:0;border-radius:9px;background:transparent;color:var(--faint);display:grid;place-items:center}
+.iconbtn:hover{background:var(--raised);color:var(--text)}
+.spacer{flex:1}
+
+/* ── outliner ────────────────────────────────────────────────────────────── */
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:10px 11px 6px}
+.tile{border:1px solid var(--stroke);border-radius:13px;padding:9px 10px;background:linear-gradient(145deg,#ffffff08,#ffffff01);min-height:62px}
+.tile small{display:block;color:var(--faint);font-size:9px;letter-spacing:.08em;text-transform:uppercase}
+.tile b{font-size:19px;font-weight:400;line-height:1.3;font-variant-numeric:tabular-nums}
+.tile.amber b{color:var(--amber)}
+.search-row{display:flex;gap:6px;padding:4px 11px 8px}
+.search{height:30px;flex:1;min-width:0;border:1px solid var(--stroke);border-radius:var(--pill);background:var(--field);padding:0 12px;font-size:11.5px;outline:none}
+.search:focus{border-color:var(--blue)}
+select.sel{height:30px;border:1px solid var(--stroke);border-radius:var(--pill);background:var(--field);color:var(--dim);font-size:10.5px;padding:0 8px;outline:none}
+.sec-label{font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);padding:7px 14px 6px;display:flex;gap:8px;align-items:center}
+.tree{flex:1;min-height:0;overflow:auto;padding:0 7px 10px}
+.group{margin-bottom:4px}
+.group-head{display:flex;align-items:center;gap:7px;height:27px;padding:0 7px;border-radius:9px;color:var(--dim);font-size:10.5px;cursor:pointer}
+.group-head:hover{background:#1c1c1c}
+.tw{width:12px;color:var(--faint);font-size:9px;transition:transform .18s var(--ease)}
+.tw.open{transform:rotate(90deg)}
+.glyph{width:17px;height:17px;flex:none;border-radius:6px;display:grid;place-items:center;background:#242424;color:var(--amber);font-size:10px}
+.group-head .count{font-size:9px;color:var(--faint);font-variant-numeric:tabular-nums}
+.row{display:flex;align-items:center;gap:7px;height:28px;padding:0 8px 0 24px;border-radius:9px;cursor:pointer;color:#c9c9c9;font-size:11.5px}
+.row:hover{background:#1b1b1b}
+.row.sel{background:var(--selected);box-shadow:inset 2px 0 0 var(--blue);color:#fff}
+.row.hidden-node{opacity:.4}
+.row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.row .tag{font-size:8px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.row .eye{border:0;background:transparent;color:var(--faint);font-size:11px;width:20px;height:20px;border-radius:6px}
+.row .eye:hover{background:var(--raised);color:var(--text)}
+.row .eye.off{color:#3a3a3a}
+.panel-footer{flex:0 0 auto;border-top:1px solid var(--stroke);padding:9px 12px;font-size:10px;color:var(--faint);display:flex;gap:8px;align-items:center;background:rgba(255,255,255,.018)}
+
+/* ── viewport ────────────────────────────────────────────────────────────── */
+.stage{background:#080a0c;border:1px solid var(--stroke);border-radius:var(--r);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;box-shadow:0 18px 40px rgba(0,0,0,.35)}
+.vp-head{flex:0 0 44px;display:flex;align-items:center;gap:8px;padding:0 9px;background:linear-gradient(180deg,#ffffff09,#ffffff02);border-bottom:1px solid var(--stroke)}
+.seg{display:flex;padding:3px;gap:2px;border-radius:var(--pill);background:var(--field);border:1px solid var(--stroke);min-width:0;overflow:auto;scrollbar-width:none}
+.seg::-webkit-scrollbar{display:none}
+.seg button{border:0;background:transparent;color:var(--faint);height:24px;padding:0 10px;border-radius:var(--pill);font-size:10.5px;white-space:nowrap}
+.seg button:hover{color:var(--text)}
+.seg button.active{background:var(--blue);color:#fff;font-weight:600}
+.vp-view{position:relative;flex:1;min-height:0;overflow:hidden;background:#080c10}
+#viewport{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab}
+#viewport.drag{cursor:grabbing}
+.hud{position:absolute;pointer-events:none;font-size:10px;color:#c9d4dd;background:rgba(8,12,16,.68);border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:9px 11px;backdrop-filter:blur(6px)}
+.hud.left{left:12px;top:12px;max-width:230px}
+.hud.right{right:12px;top:12px;min-width:158px}
+.hud .h{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--amber);margin-bottom:5px}
+.hud .line{display:flex;justify-content:space-between;gap:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+.hud .line b{color:var(--text);font-weight:500}
+.legend{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px;font-size:9px;color:var(--dim)}
+.legend i{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:3px}
+.hint{position:absolute;left:12px;bottom:11px;font-size:9.5px;color:#6d7a84;pointer-events:none}
+.vp-foot{flex:0 0 34px;display:flex;align-items:center;gap:12px;padding:0 12px;border-top:1px solid var(--stroke);background:rgba(255,255,255,.018);
+  font-size:10px;color:var(--faint);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden}
+.vp-foot b{color:var(--text);font-weight:500}
+.vp-foot .ok{color:var(--green)}
+
+/* ── inspector ───────────────────────────────────────────────────────────── */
+.props{flex:1;min-height:0;overflow:auto;padding:11px}
+.ident{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid var(--stroke);border-radius:14px;background:var(--inset);margin-bottom:10px}
+.ident .glyph{width:36px;height:36px;border-radius:11px;background:linear-gradient(140deg,#2a3a4e,#161c24);border:1px solid var(--stroke);display:grid;place-items:center;color:var(--amber);font-size:17px}
+.ident .who{min-width:0;flex:1}
+.ident .name{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ident .kind{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+.pcard{background:var(--inset);border:1px solid var(--stroke);border-radius:var(--r);padding:10px 12px 12px;margin-bottom:9px}
+.pcard>h4{font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:var(--faint);display:flex;align-items:center;gap:8px;margin-bottom:9px;cursor:pointer}
+.pcard>h4 .chev{margin-left:auto;transition:transform .2s var(--ease)}
+.pcard.shut>h4 .chev{transform:rotate(-90deg)}
+.pcard.shut .pbody{display:none}
+.prow{display:flex;align-items:center;gap:8px;min-height:28px;margin-bottom:6px}
+.prow:last-child{margin-bottom:0}
+.prow .pl{flex:0 0 88px;font-size:10.5px;color:var(--dim)}
+.prow .pv{flex:1;min-width:0}
+input[type=range]{appearance:none;-webkit-appearance:none;width:100%;height:22px;border:0;background:transparent;cursor:ew-resize}
+input[type=range]::-webkit-slider-runnable-track{height:5px;border-radius:9px;background:linear-gradient(90deg,#3f3f3f 0 var(--fill,50%),#2a2a2a var(--fill,50%) 100%)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;margin-top:-4.5px;border-radius:50%;background:#e6e6e6;box-shadow:0 1px 3px #000a}
+input[type=range]::-moz-range-track{height:5px;border-radius:9px;background:#333}
+input[type=range]::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:#e6e6e6}
+.num{font-size:10.5px;color:var(--text);font-variant-numeric:tabular-nums;min-width:44px;text-align:right}
+select.inp,input.num-inp{height:28px;width:100%;border:1px solid var(--stroke);border-radius:9px;background:var(--field);padding:0 8px;font-size:10.5px;outline:none}
+select.inp:focus,input.num-inp:focus{border-color:var(--blue)}
+.switch{width:38px;height:22px;flex:none;border-radius:var(--pill);border:1px solid var(--stroke);background:var(--raised);position:relative;cursor:pointer}
+.switch::after{content:"";position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:50%;background:#bdbdbd;transition:transform .18s var(--ease),background .18s var(--ease)}
+.switch[data-on=true]{background:var(--blue);border-color:transparent}
+.switch[data-on=true]::after{transform:translateX(16px);background:#fff}
+.note{font-size:9.5px;color:var(--faint);line-height:1.5;margin-top:7px}
+.tagline{display:inline-flex;align-items:center;gap:5px;font-size:9px;color:var(--blue);background:var(--blue-soft);border-radius:var(--pill);padding:3px 8px}
+.tagline.amber{color:var(--amber);background:rgba(255,180,84,.12)}
+.atlas{width:100%;height:92px;border-radius:10px;border:1px solid var(--stroke);background:#070707;display:block}
+.hist{display:flex;align-items:end;gap:4px;height:38px;margin-top:5px}
+.hist div{flex:1;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--blue),#1e3a8a);min-height:3px}
+.hist span{display:block;text-align:center;font-size:8px;color:var(--faint);margin-top:2px}
+@media(max-width:1100px){.workspace{grid-template-columns:230px minmax(280px,1fr) 290px}.prow .pl{flex-basis:74px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand"><span class="mark">F</span> FRONTIER</div>
+    <div class="crumbs"><span>Projects</span><span class="sep">/</span><b>Untitled</b><span class="sep">/</span><span>Vegetation Wind Lab</span></div>
+    <div class="spacer"></div>
+    <div class="pill-status"><span class="dot" id="liveDot"></span><span id="liveText">WindField shared</span></div>
+    <button class="btn ghost" id="btnPlay" title="Space">⏸ Pause</button>
+    <button class="btn" id="btnRegenerate">↻ Regenerate</button>
+    <a class="btn" href="markdown-studio.html" title="Open the Markdown Studio document">▤ Markdown Studio</a>
+  </header>
+
+  <div class="workspace">
+    <!-- OUTLINER -->
+    <aside class="dock">
+      <div class="panel-header"><span class="ph-icon">☰</span><div><div class="ph-title">Outliner</div><div class="ph-sub">Untitled · vegetation entries</div></div><span class="spacer"></span><button class="iconbtn" id="btnExpand" title="Expand all">⌄</button></div>
+      <div class="tiles">
+        <div class="tile"><small>Presets</small><b id="tilePresets">51</b></div>
+        <div class="tile amber"><small>Instances</small><b id="tileInstances">—</b></div>
+        <div class="tile"><small>Visible</small><b id="tileVisible">—</b></div>
+        <div class="tile"><small>LOD cut</small><b id="tileLod">—</b></div>
+      </div>
+      <div class="search-row"><input class="search" id="search" placeholder="Search species…" spellcheck="false"><select class="sel" id="filter"><option>All</option><option>Trees</option><option>Grasses</option></select></div>
+      <div class="sec-label">Scene entries <span class="spacer"></span><span id="groupNote">10 groups</span></div>
+      <div class="tree" id="tree"></div>
+      <div class="panel-footer"><span class="dot"></span><span>Generator slot · DomainTag <b>vegetation:tree-generator</b></span></div>
+    </aside>
+
+    <!-- VIEWPORT -->
+    <main class="stage">
+      <div class="vp-head">
+        <div class="seg" id="modes">
+          <button class="active" data-mode="sway">Sway</button>
+          <button data-mode="lod">LOD clusters</button>
+          <button data-mode="uv">UV atlas</button>
+          <button data-mode="fracture">Fracture</button>
+          <button data-mode="sdf">SDF proxies</button>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn ghost" id="btnWind" title="Toggle wind field overlay">◉ Wind overlay</button>
+        <button class="btn ghost" id="btnFocus" title="Focus selected tree">⌖ Focus</button>
+      </div>
+      <div class="vp-view">
+        <canvas id="viewport"></canvas>
+        <div class="hud left">
+          <div class="h" id="modeTitle">Three-tier wind · shared field</div>
+          <div class="line"><span>Field at focus</span><b id="hudWind">—</b></div>
+          <div class="line"><span>Selected species</span><b id="hudSpecies">—</b></div>
+          <div class="line"><span>Leaf shuffle</span><b id="hudLeaf">Procedural</b></div>
+          <div class="legend" id="legend"></div>
+        </div>
+        <div class="hud right">
+          <div class="h">Cluster cut</div>
+          <div class="line"><span>128-tri clusters</span><b id="hudClusters">—</b></div>
+          <div class="line"><span>Error budget</span><b id="hudBudget">1.25 px</b></div>
+          <div class="line"><span>Wind-safe bounds</span><b>ON</b></div>
+          <div class="line"><span>UV seams</span><b>LOCKED</b></div>
+        </div>
+        <div class="hint" id="hint">drag orbit · wheel zoom · click tree select · F fracture · 1–5 modes · Space pause</div>
+      </div>
+      <div class="vp-foot">
+        <span>FPS <b id="statFps">—</b></span><span>Trees <b id="statTrees">—</b></span>
+        <span>Visible clusters <b id="statClusters">—</b></span><span>Triangles <b id="statTris">—</b></span>
+        <span>Wind <b id="statWind">—</b></span><span>LOD <span id="statLod">—</span></span>
+        <span class="spacer"></span><span class="ok" id="statField">One WindField</span>
+      </div>
+    </main>
+
+    <!-- INSPECTOR -->
+    <aside class="dock">
+      <div class="panel-header"><span class="ph-icon">◫</span><div><div class="ph-title">Inspector</div><div class="ph-sub">Selected outliner entry</div></div><span class="spacer"></span><span class="tagline">C++ mirror ready</span></div>
+      <div class="props">
+        <div class="ident"><div class="glyph">♣</div><div class="who"><div class="name" id="insName">English Oak</div><div class="kind" id="insKind">Tree · Oaks</div></div><span class="tagline amber" id="insToken">#1</span></div>
+
+        <section class="pcard"><h4>Generation <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Species</span><div class="pv"><select class="inp" id="species"></select></div></div>
+          <div class="prow"><span class="pl">Seed</span><div class="pv"><input class="num-inp" id="seed" type="number" value="1337" min="1" max="999999"></div></div>
+          <div class="prow"><span class="pl">Height scale</span><div class="pv"><input type="range" id="heightScale" min="0.4" max="2" step="0.01" value="1"></div><span class="num" id="heightScaleV">1.00×</span></div>
+          <div class="prow"><span class="pl">Levels</span><div class="pv"><input type="range" id="levels" min="1" max="4" step="1" value="4"></div><span class="num" id="levelsV">4</span></div>
+          <div class="prow"><span class="pl">Leaves / twig</span><span class="num" id="leavesV">12</span><span class="spacer"></span><span class="tagline">Welded quad mesh</span></div>
+          <div class="note">Vertex wind = (height, limb, phase, detail) + limb pivot, preserved from Slate's <code>mesher.ts</code>.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Wind field · shared <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Speed</span><div class="pv"><input type="range" id="windSpeed" min="0" max="30" step="0.1" value="7"></div><span class="num" id="windSpeedV">7.0</span></div>
+          <div class="prow"><span class="pl">Bearing</span><div class="pv"><input type="range" id="windBearing" min="0" max="360" step="1" value="250"></div><span class="num" id="windBearingV">250°</span></div>
+          <div class="prow"><span class="pl">Shear / km</span><div class="pv"><input type="range" id="windShear" min="0" max="2" step="0.01" value="0.35"></div><span class="num" id="windShearV">0.35</span></div>
+          <div class="prow"><span class="pl">Gust</span><div class="pv"><input type="range" id="windGust" min="0" max="1" step="0.01" value="0.25"></div><span class="num" id="windGustV">0.25</span></div>
+          <div class="prow"><span class="pl">Frequency</span><div class="pv"><input type="range" id="windFreq" min="0" max="2" step="0.01" value="0.3"></div><span class="num" id="windFreqV">0.30 Hz</span></div>
+          <div class="prow"><span class="pl">Turbulence</span><div class="pv"><input type="range" id="windTurb" min="0" max="1" step="0.01" value="0.3"></div><span class="num" id="windTurbV">0.30</span></div>
+          <div class="prow"><span class="pl">Apply to SDF</span><div class="spacer"></div><div class="switch" id="sdfFollow" data-on="true"></div></div>
+          <div class="note">Directional + gust components (linear superposition), altitude shear and veer. The identical sample feeds vertex sway, leaf flutter and SDF proxy poses.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Vegetation animation <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Trunk flex</span><div class="pv"><input type="range" id="trunkFlex" min="0" max="2" step="0.01" value="1"></div><span class="num" id="trunkFlexV">1.00</span></div>
+          <div class="prow"><span class="pl">Limb flex</span><div class="pv"><input type="range" id="limbFlex" min="0" max="2" step="0.01" value="1"></div><span class="num" id="limbFlexV">1.00</span></div>
+          <div class="prow"><span class="pl">Detail flex</span><div class="pv"><input type="range" id="detailFlex" min="0" max="2" step="0.01" value="1"></div><span class="num" id="detailFlexV">1.00</span></div>
+          <div class="prow"><span class="pl">Leaf shuffle</span><div class="pv seg mini" id="leafModes"><button class="active" data-leaf="procedural">Procedural</button><button data-leaf="vat">VAT</button><button data-leaf="xpbd">XPBD hero</button></div></div>
+          <div class="prow"><span class="pl">VAT frames</span><div class="pv"><input type="range" id="vatFrames" min="8" max="64" step="8" value="16"></div><span class="num" id="vatFramesV">16</span></div>
+          <div class="note" id="leafNote">Procedural: 3-wave wind in the vertex stage. VAT: offline-baked leaf frames. XPBD hero: per-leaf constraint solve on one selected tree only.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Cluster LOD <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Cluster size</span><div class="pv"><input type="range" id="clusterSize" min="32" max="256" step="32" value="128"></div><span class="num" id="clusterSizeV">128</span></div>
+          <div class="prow"><span class="pl">Max error</span><div class="pv"><input type="range" id="maxError" min="0.25" max="4" step="0.05" value="1.25"></div><span class="num" id="maxErrorV">1.25 px</span></div>
+          <div class="prow"><span class="pl">Continuous cut</span><div class="spacer"></div><div class="switch" id="autoLod" data-on="true"></div></div>
+          <div class="hist" id="lodHist"><div style="height:10%"><span>0</span></div><div style="height:30%"><span>1</span></div><div style="height:65%"><span>2</span></div><div style="height:100%"><span>3</span></div></div>
+          <div class="note">Group error is monotone; UV seams are locked during simplification; cluster bounds are inflated by maximum wind displacement.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Surface · UV unwrap <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Unwrap mode</span><div class="pv seg mini" id="uvModes"><button class="active" data-uv="cylindrical">Cylindrical</button><button data-uv="atlas">Atlas</button><button data-uv="udim">UDIM</button></div></div>
+          <div class="prow"><span class="pl">Textures</span><div class="spacer"></div><div class="switch" id="texturesOn" data-on="true"></div></div>
+          <canvas class="atlas" id="atlas" width="300" height="92"></canvas>
+          <div class="note">Bark strips + leaf islands from face-varying UVs; seams split only at export. Islands stay locked through cluster simplification.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Fracture <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Impact height</span><div class="pv"><input type="range" id="impactHeight" min="0.1" max="0.9" step="0.01" value="0.5"></div><span class="num" id="impactHeightV">0.50</span></div>
+          <div class="prow"><span class="pl">Strength</span><div class="pv"><input type="range" id="impactStrength" min="0" max="1" step="0.01" value="0.6"></div><span class="num" id="impactStrengthV">0.60</span></div>
+          <div class="prow"><span class="pl">Pieces</span><span class="num" id="pieceCount">3</span><span class="spacer"></span><button class="btn primary" id="btnFracture" style="height:26px">Fracture selected</button></div>
+          <div class="note">Cut tokens shared across cells; runtime convex clip near camera, baked fracture for distant instances.</div>
+        </div></section>
+
+        <section class="pcard"><h4>Distance field <span class="chev">⌄</span></h4><div class="pbody">
+          <div class="prow"><span class="pl">Proxy mode</span><div class="pv seg mini" id="sdfModes"><button data-sdf="baked">Baked</button><button data-sdf="analytic">Analytic</button><button class="active" data-sdf="hybrid">Hybrid</button></div></div>
+          <div class="prow"><span class="pl">Smoothing</span><div class="pv"><input type="range" id="sdfSmooth" min="0" max="1" step="0.01" value="0.24"></div><span class="num" id="sdfSmoothV">0.24 m</span></div>
+          <div class="prow"><span class="pl">Clipmap radius</span><div class="pv"><input type="range" id="sdfRadius" min="40" max="500" step="10" value="220"></div><span class="num" id="sdfRadiusV">220 m</span></div>
+          <div class="prow"><span class="pl">Animated proxies</span><span class="num" id="proxyCount">—</span></div>
+          <div class="note">Static local volume for the whole tree + moving capsule/sphere proxies near the camera. No per-frame global SDF rebake.</div>
+        </div></section>
+      </div>
+      <div class="panel-footer"><span id="footerToken">OutlinerSlotToken 1</span><span class="spacer"></span><span>Revision 0 · saved</span></div>
+    </aside>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ── Species library: generated from Slate src/tree/params.ts ─────────────── */
+const PRESETS = [
+  {"name": "English Oak", "group": "Oaks", "kind": "Tree", "height": 16.0, "levels": 4, "ratio": 0.022, "branches": [1, 14, 22, 14], "leaves": 12, "flex": 0.72},
+  {"name": "Quaking Aspen", "group": "Forest · broadleaf", "kind": "Tree", "height": 13.0, "levels": 3, "ratio": 0.015, "branches": [1, 45, 26, 1], "leaves": 30, "flex": 1.15},
+  {"name": "Black Tupelo", "group": "Forest · broadleaf", "kind": "Tree", "height": 23.0, "levels": 4, "ratio": 0.015, "branches": [1, 55, 20, 12], "leaves": 14, "flex": 0.72},
+  {"name": "California Black Oak", "group": "Oaks", "kind": "Tree", "height": 10.0, "levels": 3, "ratio": 0.018, "branches": [1, 24, 60, 0], "leaves": 20, "flex": 0.72},
+  {"name": "Southern Live Oak", "group": "Oaks", "kind": "Tree", "height": 11.0, "levels": 4, "ratio": 0.036, "branches": [1, 10, 22, 14], "leaves": 14, "flex": 0.72},
+  {"name": "White Oak", "group": "Oaks", "kind": "Tree", "height": 17.0, "levels": 4, "ratio": 0.028, "branches": [1, 13, 24, 14], "leaves": 12, "flex": 0.72},
+  {"name": "Northern Red Oak", "group": "Oaks", "kind": "Tree", "height": 26.0, "levels": 4, "ratio": 0.02, "branches": [1, 13, 24, 14], "leaves": 12, "flex": 0.72},
+  {"name": "Valley Oak", "group": "Oaks", "kind": "Tree", "height": 22.0, "levels": 4, "ratio": 0.03, "branches": [1, 12, 22, 16], "leaves": 14, "flex": 0.72},
+  {"name": "Pin Oak", "group": "Oaks", "kind": "Tree", "height": 20.0, "levels": 4, "ratio": 0.019, "branches": [1, 40, 22, 8], "leaves": 16, "flex": 0.72},
+  {"name": "Cork Oak", "group": "Oaks", "kind": "Tree", "height": 11.0, "levels": 4, "ratio": 0.04, "branches": [1, 9, 16, 12], "leaves": 14, "flex": 0.72},
+  {"name": "Silver Birch", "group": "Forest · broadleaf", "kind": "Tree", "height": 18.0, "levels": 3, "ratio": 0.013, "branches": [1, 28, 40, 0], "leaves": 40, "flex": 1.15},
+  {"name": "Weeping Willow", "group": "Forest · broadleaf", "kind": "Tree", "height": 15.0, "levels": 4, "ratio": 0.03, "branches": [1, 14, 18, 40], "leaves": 15, "flex": 1.15},
+  {"name": "Scots Pine", "group": "Forest · conifers", "kind": "Tree", "height": 22.0, "levels": 3, "ratio": 0.014, "branches": [1, 42, 24, 0], "leaves": 60, "flex": 0.45},
+  {"name": "Coast Redwood", "group": "Forest · conifers", "kind": "Tree", "height": 70.0, "levels": 3, "ratio": 0.017, "branches": [1, 90, 26, 0], "leaves": 40, "flex": 0.45},
+  {"name": "Norway Spruce", "group": "Forest · conifers", "kind": "Tree", "height": 32.0, "levels": 3, "ratio": 0.012, "branches": [1, 170, 26, 0], "leaves": 60, "flex": 0.45},
+  {"name": "Bamboo", "group": "Jungle", "kind": "Tree", "height": 11.0, "levels": 3, "ratio": 0.0075, "branches": [1, 36, 8, 0], "leaves": 30, "flex": 1.15},
+  {"name": "Umbrella Thorn", "group": "Savanna", "kind": "Tree", "height": 8.0, "levels": 4, "ratio": 0.032, "branches": [1, 20, 16, 12], "leaves": 20, "flex": 0.72},
+  {"name": "Baobab", "group": "Savanna", "kind": "Tree", "height": 16.0, "levels": 4, "ratio": 0.15, "branches": [1, 16, 10, 6], "leaves": 10, "flex": 0.72},
+  {"name": "European Beech", "group": "Forest · broadleaf", "kind": "Tree", "height": 24.0, "levels": 4, "ratio": 0.02, "branches": [1, 16, 22, 16], "leaves": 22, "flex": 0.72},
+  {"name": "Sugar Maple", "group": "Forest · broadleaf", "kind": "Tree", "height": 24.0, "levels": 4, "ratio": 0.019, "branches": [1, 16, 22, 16], "leaves": 20, "flex": 1.15},
+  {"name": "Douglas Fir", "group": "Forest · conifers", "kind": "Tree", "height": 55.0, "levels": 3, "ratio": 0.012, "branches": [1, 130, 24, 0], "leaves": 30, "flex": 0.45},
+  {"name": "Kapok", "group": "Jungle", "kind": "Tree", "height": 50.0, "levels": 4, "ratio": 0.022, "branches": [1, 8, 18, 14], "leaves": 16, "flex": 0.72},
+  {"name": "Rain-Forest Fig", "group": "Jungle", "kind": "Tree", "height": 28.0, "levels": 4, "ratio": 0.03, "branches": [1, 12, 20, 14], "leaves": 18, "flex": 0.72},
+  {"name": "Marula", "group": "Savanna", "kind": "Tree", "height": 12.0, "levels": 4, "ratio": 0.034, "branches": [1, 8, 16, 12], "leaves": 14, "flex": 0.72},
+  {"name": "Fever Tree", "group": "Savanna", "kind": "Tree", "height": 16.0, "levels": 4, "ratio": 0.018, "branches": [1, 10, 14, 12], "leaves": 16, "flex": 0.72},
+  {"name": "Joshua Tree", "group": "Desert", "kind": "Tree", "height": 5.5, "levels": 3, "ratio": 0.07, "branches": [1, 4, 3, 0], "leaves": 110, "flex": 0.18},
+  {"name": "Desert Ironwood", "group": "Desert", "kind": "Tree", "height": 7.0, "levels": 4, "ratio": 0.035, "branches": [1, 8, 14, 12], "leaves": 14, "flex": 0.18},
+  {"name": "Saguaro Cactus", "group": "Desert", "kind": "Tree", "height": 8.5, "levels": 3, "ratio": 0.065, "branches": [1, 3, 2, 0], "leaves": 0, "flex": 0.18},
+  {"name": "Golden Barrel Cactus", "group": "Desert", "kind": "Tree", "height": 1.45, "levels": 1, "ratio": 0.24, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.18},
+  {"name": "Organ Pipe Cactus", "group": "Desert", "kind": "Tree", "height": 6.2, "levels": 2, "ratio": 0.052, "branches": [1, 2, 0, 0], "leaves": 0, "flex": 0.18},
+  {"name": "Agave Americana", "group": "Desert", "kind": "Tree", "height": 1.25, "levels": 2, "ratio": 0.04, "branches": [1, 9, 0, 0], "leaves": 72, "flex": 0.18},
+  {"name": "Aloe Vera", "group": "Desert", "kind": "Tree", "height": 0.62, "levels": 2, "ratio": 0.045, "branches": [1, 8, 0, 0], "leaves": 44, "flex": 0.18},
+  {"name": "Ocotillo", "group": "Desert", "kind": "Tree", "height": 4.2, "levels": 3, "ratio": 0.014, "branches": [1, 10, 9, 0], "leaves": 50, "flex": 0.45},
+  {"name": "Dasylirion Sotol", "group": "Desert", "kind": "Tree", "height": 1.05, "levels": 2, "ratio": 0.05, "branches": [1, 10, 0, 0], "leaves": 72, "flex": 0.18},
+  {"name": "Bristlecone Pine", "group": "Rocky terrain", "kind": "Tree", "height": 7.0, "levels": 3, "ratio": 0.075, "branches": [1, 7, 16, 0], "leaves": 220, "flex": 0.45},
+  {"name": "Rowan", "group": "Rocky terrain", "kind": "Tree", "height": 9.0, "levels": 4, "ratio": 0.02, "branches": [1, 10, 16, 12], "leaves": 18, "flex": 0.72},
+  {"name": "Japanese Maple", "group": "Forest · broadleaf", "kind": "Tree", "height": 6.0, "levels": 4, "ratio": 0.03, "branches": [1, 8, 14, 12], "leaves": 24, "flex": 1.15},
+  {"name": "Lawn Turf", "group": "Grasses · turf & meadow", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Meadow Grass", "group": "Grasses · turf & meadow", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Timothy", "group": "Grasses · turf & meadow", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Red Oat Grass", "group": "Grasses · turf & meadow", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Blue Fescue", "group": "Grasses · tussock", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Fountain Grass", "group": "Grasses · tussock", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Marram Grass", "group": "Grasses · tussock", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Chinese Silver Grass", "group": "Grasses · tussock", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Pampas Grass", "group": "Grasses · tussock", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Wheat", "group": "Grasses · cereals & reeds", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Barley", "group": "Grasses · cereals & reeds", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Oat", "group": "Grasses · cereals & reeds", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Common Reed", "group": "Grasses · cereals & reeds", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9},
+  {"name": "Elephant Grass", "group": "Grasses · cereals & reeds", "kind": "Grass", "height": 1.0, "levels": 1, "ratio": 0.01, "branches": [0, 0, 0, 0], "leaves": 0, "flex": 0.9}
+];
+const GROUPS = [...new Set(PRESETS.map(p => p.group))];
+const byName = new Map(PRESETS.map(p => [p.name, p]));
+
+const state = {
+  time: 6.2, playing: true, mode: "sway", count: 12000, seed: 1337,
+  wind: {speed:7, bearing:250, shear:0.35, gust:0.25, freq:0.3, turb:0.3},
+  flex: {trunk:1, limb:1, detail:1}, leafMode:"procedural", vatFrames:16,
+  lod: {cluster:128, maxError:1.25, auto:true},
+  sdf: {mode:"hybrid", smooth:0.24, radius:220, follow:true},
+  fracture: {height:0.5, strength:0.6, active:false, started:0},
+  camera: {yaw:0.58, pitch:0.19, dist:170, tx:0, tz:0},
+  selectedToken: 1, selectedPreset: "English Oak", hidden:new Set(), showWind:true,
+  uvMode:"cylindrical", textures:true, instances:[], projected:[], fps:60,
+  histogram:[0,0,0,0], visibleTrees:0, visibleClusters:0, triangles:0, windAtFocus:0
+};
+
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const lerp = (a,b,t) => a + (b-a)*t;
+function hash01(seed){
+  let s = (Math.imul(seed>>>0, 747796405) + 2891336453) >>> 0;
+  s = ((s >>> ((s >>> 28) + 4)) ^ s) >>> 0;
+  s = Math.imul(s, 277803737) >>> 0;
+  s = ((s >>> 22) ^ s) >>> 0;
+  return (s & 0x00ffffff) / 0x01000000;
+}
+const radians = d => d * Math.PI / 180;
+
+/* ── The single wind field (WindFieldSolver.cpp parity) ───────────────────── */
+function evaluateWind(x, z, t){
+  const w = state.wind;
+  const bearing = radians(w.bearing);
+  let vx = Math.sin(bearing) * w.speed;
+  let vz = -Math.cos(bearing) * w.speed;
+  // Passing gust: moving finite-radius component, same falloff as WindSpecification.js.
+  const gx = Math.sin(t*0.11) * 240, gz = Math.cos(t*0.083) * 180;
+  const dx = x-gx, dz = z-gz, d = Math.hypot(dx,dz), radius = d/420;
+  const falloff = Math.max(0, 1-radius*radius)**2;
+  const pulse = 0.65 + 0.35*Math.sin(6.2831853*w.freq*t);
+  const amount = w.speed * w.gust * falloff * pulse;
+  vx += Math.sin(bearing)*amount;
+  vz += -Math.cos(bearing)*amount;
+  const strength = Math.hypot(vx,vz);
+  return {vx, vz, strength, gust:w.gust, turb:w.turb*(1-0.45),
+    dirX: strength>1e-6 ? vx/strength : 1, dirZ: strength>1e-6 ? vz/strength : 0};
+}
+function windWave(t){ return Math.sin(t)*0.7 + Math.sin(t*2.31+1.3)*0.2 + Math.sin(t*4.7+0.7)*0.1; }
+
+/* ── Deterministic forest ─────────────────────────────────────────────────── */
+function buildForest(){
+  const trees = PRESETS.filter(p => p.kind === "Tree");
+  const list = [];
+  for(let i=0;i<state.count;i++){
+    const token = i+1;
+    // First record of every species exists so outliner selection always resolves to geometry.
+    const preset = i < PRESETS.length ? PRESETS[i] : trees[Math.floor(hash01(i*2654435761 ^ state.seed)*trees.length)%trees.length];
+    const r = 35 + Math.sqrt(hash01(i*7919 ^ state.seed))*620;
+    const a = hash01(i*104729 ^ state.seed)*Math.PI*2;
+    list.push({
+      token, preset, x:Math.cos(a)*r, z:Math.sin(a)*r,
+      scale:0.72+hash01(i*31 ^ state.seed)*0.75,
+      phase:hash01(i*131 ^ state.seed), height:preset.height,
+      lod:0, sx:0, sy:0, depth:0, visible:true,
+      leaves: Array.from({length:8}, (_,k)=>({x:0, y:0, v:0, phase:hash01(i*17+k)}))
+    });
+  }
+  state.instances = list;
+  state.projected = new Array(list.length);
+  applyHidden();
+  selectToken(state.selectedToken, false);
+}
+function applyHidden(){
+  for(const t of state.instances) t.visible = !state.hidden.has(t.preset.name);
+}
+function selectToken(token, focus){
+  const t = state.instances.find(v => v.token === token);
+  if(!t) return;
+  state.selectedToken = token;
+  state.selectedPreset = t.preset.name;
+  if(focus){
+    state.camera.tx = t.x; state.camera.tz = t.z;
+    state.camera.dist = Math.max(26, t.height*t.scale*3.4);
+  }
+  syncInspector(); renderOutliner(); drawAtlas();
+}
+
+/* ── Outliner ─────────────────────────────────────────────────────────────── */
+const expanded = new Set(GROUPS);
+function renderOutliner(){
+  const root = $("tree"), query = $("search").value.trim().toLowerCase();
+  const filter = $("filter").value;
+  root.innerHTML = "";
+  for(const group of GROUPS){
+    const presets = PRESETS.filter(p => p.group===group && p.name.toLowerCase().includes(query) &&
+      (filter==="All" || (filter==="Trees" ? p.kind==="Tree" : p.kind==="Grass")));
+    if(!presets.length) continue;
+    const g = document.createElement("div"); g.className = "group";
+    const head = document.createElement("div"); head.className = "group-head";
+    head.innerHTML = `<span class="tw ${expanded.has(group)?"open":""}">▶</span><span class="glyph">${group.startsWith("Grasses")?"❋":"♣"}</span><span>${group}</span><span class="spacer"></span><span class="count">${presets.length}</span>`;
+    head.onclick = () => { expanded.has(group)?expanded.delete(group):expanded.add(group); renderOutliner(); };
+    g.appendChild(head);
+    if(expanded.has(group)){
+      for(const p of presets){
+        const row = document.createElement("div");
+        row.className = "row" + (p.name===state.selectedPreset?" sel":"") + (state.hidden.has(p.name)?" hidden-node":"");
+        row.innerHTML = `<span class="nm">${p.name}</span><span class="tag">${p.kind==="Tree"?"tree":"grass"}</span><button class="eye ${state.hidden.has(p.name)?"off":""}" title="Toggle visibility">◉</button>`;
+        row.onclick = e => {
+          if(e.target.classList.contains("eye")){
+            state.hidden.has(p.name)?state.hidden.delete(p.name):state.hidden.add(p.name);
+            applyHidden(); renderOutliner(); return;
+          }
+          const t = state.instances.find(v => v.preset.name===p.name);
+          if(t) selectToken(t.token, true);
+        };
+        g.appendChild(row);
+      }
+    }
+    root.appendChild(g);
+  }
+  $("groupNote").textContent = `${GROUPS.length} groups`;
+  $("tilePresets").textContent = PRESETS.length;
+  $("tileInstances").textContent = state.instances.length.toLocaleString();
+  $("tileVisible").textContent = state.instances.filter(t=>t.visible).length.toLocaleString();
+}
+
+/* ── Inspector wiring ─────────────────────────────────────────────────────── */
+const species = $("species");
+for(const p of PRESETS){ const o=document.createElement("option"); o.value=p.name; o.textContent=`${p.name} · ${p.group}`; species.appendChild(o); }
+species.onchange = () => {
+  const t = current(); const p = byName.get(species.value);
+  if(!t||!p) return;
+  t.preset = p; t.height = p.height; state.selectedPreset = p.name;
+  syncInspector(); renderOutliner();
+};
+function current(){ return state.instances.find(t => t.token===state.selectedToken); }
+function syncInspector(){
+  const t = current(); if(!t) return;
+  const p = t.preset;
+  species.value = p.name;
+  $("insName").textContent = p.name;
+  $("insKind").textContent = `${p.kind} · ${p.group}`;
+  $("insToken").textContent = `#${t.token}`;
+  $("footerToken").textContent = `OutlinerSlotToken ${t.token}`;
+  $("leavesV").textContent = p.leaves;
+  $("levels").value = p.levels; $("levelsV").textContent = p.levels;
+  $("hudSpecies").textContent = p.name;
+  $("proxyCount").textContent = `${Math.min(8, Math.max(1,p.branches[1]))+2}`;
+  $("pieceCount").textContent = String(2 + (state.fracture.strength>0.8?4:state.fracture.strength>0.3?2:1));
+}
+function bindRange(id, apply, format){
+  const el = $(id), out = $(id+"V");
+  const paint = () => { el.style.setProperty("--fill", ((el.value-el.min)/(el.max-el.min)*100)+"%"); if(out) out.textContent = format?format(+el.value):el.value; };
+  el.addEventListener("input", () => { apply(+el.value); paint(); });
+  paint();
+}
+bindRange("heightScale", v => { const t=current(); if(t){t.height=t.preset.height*v;} }, v=>v.toFixed(2)+"×");
+bindRange("levels", v => { const t=current(); if(t) t.levels=v; }, v=>String(v));
+bindRange("windSpeed", v => state.wind.speed=v, v=>v.toFixed(1));
+bindRange("windBearing", v => state.wind.bearing=v, v=>v+"°");
+bindRange("windShear", v => state.wind.shear=v, v=>v.toFixed(2));
+bindRange("windGust", v => state.wind.gust=v, v=>v.toFixed(2));
+bindRange("windFreq", v => state.wind.freq=v, v=>v.toFixed(2)+" Hz");
+bindRange("windTurb", v => state.wind.turb=v, v=>v.toFixed(2));
+bindRange("trunkFlex", v => state.flex.trunk=v, v=>v.toFixed(2));
+bindRange("limbFlex", v => state.flex.limb=v, v=>v.toFixed(2));
+bindRange("detailFlex", v => state.flex.detail=v, v=>v.toFixed(2));
+bindRange("vatFrames", v => state.vatFrames=v, v=>String(v));
+bindRange("clusterSize", v => state.lod.cluster=v, v=>String(v));
+bindRange("maxError", v => {state.lod.maxError=v; $("hudBudget").textContent=v.toFixed(2)+" px";}, v=>v.toFixed(2)+" px");
+bindRange("impactHeight", v => state.fracture.height=v, v=>v.toFixed(2));
+bindRange("impactStrength", v => {state.fracture.strength=v; $("pieceCount").textContent=String(2+(v>0.8?4:v>0.3?2:1));}, v=>v.toFixed(2));
+bindRange("sdfSmooth", v => state.sdf.smooth=v, v=>v.toFixed(2)+" m");
+bindRange("sdfRadius", v => state.sdf.radius=v, v=>v+" m");
+
+function bindSwitch(id, apply){
+  const el = $(id);
+  el.onclick = () => { const on = el.dataset.on!=="true"; el.dataset.on=String(on); apply(on); };
+}
+bindSwitch("sdfFollow", on => { state.sdf.follow=on; $("liveText").textContent = on?"WindField shared · SDF coupled":"WindField shared · SDF static"; });
+bindSwitch("autoLod", on => state.lod.auto=on);
+bindSwitch("texturesOn", on => {state.textures=on; drawAtlas();});
+function bindSeg(id, key, apply){
+  $(id).addEventListener("click", e => {
+    const b = e.target.closest("button"); if(!b) return;
+    [...$(id).children].forEach(x=>x.classList.toggle("active", x===b));
+    apply(b.dataset[key]); syncInspector(); drawAtlas();
+  });
+}
+bindSeg("leafModes", "leaf", v => { state.leafMode=v; $("hudLeaf").textContent = v==="procedural"?"Procedural VAT":v==="vat"?"VAT baked":"XPBD hero only";
+  $("leafNote").textContent = v==="procedural" ? "Procedural: 3-wave wind in the vertex stage."
+    : v==="vat" ? `VAT: ${state.vatFrames} baked frames sampled and interpolated per leaf; zero runtime simulation.`
+    : "XPBD hero: per-leaf distance/bend constraints solved only for the selected tree."; });
+bindSeg("uvModes", "uv", v => state.uvMode=v);
+bindSeg("sdfModes", "sdf", v => state.sdf.mode=v);
+document.querySelectorAll(".pcard>h4").forEach(h => h.onclick = () => h.parentElement.classList.toggle("shut"));
+
+$("modes").addEventListener("click", e => {
+  const b = e.target.closest("button"); if(!b) return;
+  [...$("modes").children].forEach(x=>x.classList.toggle("active", x===b));
+  state.mode = b.dataset.mode;
+  const titles = {sway:"Three-tier wind · shared field", lod:"Continuous cluster cut · 128 tri", uv:"Face-varying UV · seam locked", fracture:"Shared-cut convex fracture", sdf:"Analytic distance proxies · hybrid"};
+  $("modeTitle").textContent = titles[state.mode];
+  renderLegend();
+});
+function renderLegend(){
+  const data = {
+    sway: [["#34d399","trunk sway"],["#9aa2ff","limb bend"],["#ffb454","leaf flutter"]],
+    lod: [["#34d399","L0"],["#60a5fa","L1"],["#ffb454","L2"],["#ef5350","L3"]],
+    uv: [["#60a5fa","bark U strip"],["#34d399","leaf island"],["#ffb454","locked seam"]],
+    fracture:[["#ffb454","cut plane"],["#ef5350","fragment"],["#9aa2ff","bond"]],
+    sdf:[["#3b82f6","inside < 0"],["#4b5563","outside > 0"],["#34d399","capsule proxy"]]
+  }[state.mode];
+  $("legend").innerHTML = data.map(([c,l])=>`<span><i style="background:${c}"></i>${l}</span>`).join("");
+}
+renderLegend();
+
+$("btnPlay").onclick = () => { state.playing=!state.playing; $("btnPlay").textContent = state.playing?"⏸ Pause":"▶ Play"; $("liveDot").classList.toggle("warn", !state.playing); };
+$("btnWind").onclick = () => { state.showWind=!state.showWind; $("btnWind").classList.toggle("on", state.showWind); };
+$("btnWind").classList.add("on");
+$("btnFocus").onclick = () => selectToken(state.selectedToken, true);
+$("btnRegenerate").onclick = () => { state.seed = +$("seed").value || 1; buildForest(); };
+$("seed").onchange = () => { state.seed = +$("seed").value || 1; buildForest(); };
+$("btnExpand").onclick = () => {
+  const all = GROUPS.every(g=>expanded.has(g));
+  GROUPS.forEach(g => all?expanded.delete(g):expanded.add(g)); renderOutliner();
+};
+$("btnFracture").onclick = () => { state.fracture.active=true; state.fracture.started=state.time; if(state.mode!=="fracture") $("modes").querySelector('[data-mode="fracture"]').click(); };
+$("search").oninput = renderOutliner;
+$("filter").onchange = renderOutliner;
+window.addEventListener("keydown", e => {
+  if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT") return;
+  if(e.code==="Space"){ e.preventDefault(); $("btnPlay").click(); }
+  if(e.key.toLowerCase()==="f") $("btnFracture").click();
+  const modes=["sway","lod","uv","fracture","sdf"];
+  if(e.key>="1"&&e.key<="5") $("modes").querySelector(`[data-mode="${modes[+e.key-1]}"]`).click();
+});
+
+/* ── UV atlas preview ─────────────────────────────────────────────────────── */
+function drawAtlas(){
+  const c=$("atlas"), g=c.getContext("2d"), w=c.width, h=c.height;
+  g.fillStyle="#070707"; g.fillRect(0,0,w,h);
+  g.strokeStyle="rgba(255,255,255,.045)"; g.lineWidth=1;
+  for(let x=0;x<w;x+=15){g.beginPath();g.moveTo(x,0);g.lineTo(x,h);g.stroke();}
+  for(let y=0;y<h;y+=15){g.beginPath();g.moveTo(0,y);g.lineTo(w,y);g.stroke();}
+  const p=current()?.preset||PRESETS[0];
+  if(state.uvMode==="cylindrical"){
+    for(let i=0;i<4;i++){ g.fillStyle=["#2d4d70","#3b628c","#47759c","#5487ac"][i];
+      g.fillRect(12+i*72, 14+i*4, 66, 64-i*4); }
+  } else if(state.uvMode==="udim"){
+    g.fillStyle="#1f2b3d"; g.fillRect(12,12,132,68);
+    g.fillStyle="#29425e"; g.fillRect(150,12,138,68);
+    g.fillStyle="#3b82f6"; g.fillRect(12,12,132,2);
+    g.fillStyle="rgba(255,255,255,.3)"; g.font="9px monospace"; g.fillText("1001",16,25); g.fillText("1002",154,25);
+  } else {
+    const cols=8, cell=34;
+    for(let i=0;i<Math.min(24,Math.max(6,Math.round(p.leaves/3)));i++){
+      const x=10+(i%cols)*cell, y=10+Math.floor(i/cols)*cell;
+      g.beginPath(); g.moveTo(x+cell/2,y+2); g.lineTo(x+cell-3,y+cell/2); g.lineTo(x+cell/2,y+cell-3); g.lineTo(x+3,y+cell/2); g.closePath();
+      g.fillStyle=state.textures?"rgba(52,211,153,.36)":"rgba(52,211,153,.12)"; g.fill();
+      g.strokeStyle="#34d399"; g.stroke();
+    }
+    g.fillStyle="rgba(96,165,250,.35)"; g.fillRect(10,80,270,8);
+  }
+  g.strokeStyle="#ffb454"; g.setLineDash([3,3]); g.strokeRect(11,11,w-22,h-22); g.setLineDash([]);
+  g.fillStyle="#8a9199"; g.font="9px monospace"; g.fillText(state.uvMode.toUpperCase()+" · bark + leaf",14,h-5);
+}
+
+/* ── Camera / projection ──────────────────────────────────────────────────── */
+const canvas=$("viewport"), ctx=canvas.getContext("2d", {alpha:false});
+let W=0,H=0,DPR=1, view={};
+function resize(){
+  DPR=Math.min(2, window.devicePixelRatio||1);
+  const r=canvas.getBoundingClientRect(); W=Math.max(1,r.width); H=Math.max(1,r.height);
+  canvas.width=Math.round(W*DPR); canvas.height=Math.round(H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener("resize", resize); resize();
+
+function updateCamera(){
+  const c=state.camera;
+  const cp=Math.cos(c.pitch), sp=Math.sin(c.pitch);
+  const ex=c.tx+Math.sin(c.yaw)*cp*c.dist, ey=sp*c.dist+18, ez=c.tz+Math.cos(c.yaw)*cp*c.dist;
+  const fx=c.tx-ex, fy=10-ey, fz=c.tz-ez;
+  const fl=Math.hypot(fx,fy,fz)||1; const Fx=fx/fl,Fy=fy/fl,Fz=fz/fl;
+  // right = normalize(cross(forward, worldUp))
+  let Rx=Fz, Ry=0, Rz=-Fx; const rl=Math.hypot(Rx,Rz)||1; Rx/=rl; Rz/=rl;
+  const Ux=Ry*Fz-Rz*Fy, Uy=Rz*Fx-Rx*Fz, Uz=Rx*Fy-Ry*Fx;
+  view={ex,ey,ez,Fx,Fy,Fz,Rx,Ry,Rz,Ux,Uy,Uz,focal:H*0.92};
+}
+function project(x,y,z,out){
+  const rx=x-view.ex, ry=y-view.ey, rz=z-view.ez;
+  const d=rx*view.Fx+ry*view.Fy+rz*view.Fz;
+  if(d<1){ out[2]=-1; return out; }
+  out[0]=W/2+(rx*view.Rx+ry*view.Ry+rz*view.Rz)*view.focal/d;
+  out[1]=H/2-(rx*view.Ux+ry*view.Uy+rz*view.Uz)*view.focal/d;
+  out[2]=d; return out;
+}
+const pa=[0,0,0], pb=[0,0,0], pc=[0,0,0];
+
+/* ── Pointer interaction ──────────────────────────────────────────────────── */
+let dragging=false, lastX=0,lastY=0;
+canvas.addEventListener("pointerdown", e => { dragging=true; lastX=e.clientX;lastY=e.clientY; canvas.classList.add("drag"); canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener("pointerup", e => {
+  if(!dragging) return; dragging=false; canvas.classList.remove("drag");
+  if(Math.abs(e.clientX-lastX)+Math.abs(e.clientY-lastY)<5) pickTree(e.clientX, e.clientY);
+});
+canvas.addEventListener("pointermove", e => {
+  if(!dragging) return;
+  state.camera.yaw -= (e.clientX-lastX)*0.006;
+  state.camera.pitch = clamp(state.camera.pitch+(e.clientY-lastY)*0.004, -0.1, 1.05);
+  lastX=e.clientX; lastY=e.clientY;
+});
+canvas.addEventListener("wheel", e => { e.preventDefault(); state.camera.dist=clamp(state.camera.dist*Math.exp(e.deltaY*0.001), 12, 1500); }, {passive:false});
+function pickTree(px,py){
+  const r=canvas.getBoundingClientRect(); const x=px-r.left,y=py-r.top;
+  let best=null,bestD=22*22;
+  for(const t of state.instances){
+    if(t.depth<=0 || t.sx<-40 || t.sx>W+40) continue;
+    const dx=t.sx-x, dy=t.sy-y, dd=dx*dx+dy*dy;
+    if(dd<bestD){bestD=dd;best=t;}
+  }
+  if(best) selectToken(best.token, false);
+}
+
+/* ── SDF proxy evaluation (DistanceProxySet.cpp parity) ───────────────────── */
+function proxyList(t, wind){
+  const h=t.height*t.scale, trunkRadius=h*t.preset.ratio;
+  const p=[{ax:0,ay:0,az:0,bx:0,by:h*0.72,bz:0,r0:trunkRadius*1.4,r1:trunkRadius*0.55,phase:0}];
+  const side={x:-wind.dirZ, z:wind.dirX};
+  const sway=state.sdf.follow ? wind.strength*0.035*h*t.preset.flex*state.flex.trunk*(windWave(state.time*0.85)*0.7+0.3) : 0;
+  const n=Math.min(8,Math.max(1,t.preset.branches[1]));
+  for(let i=0;i<n;i++){
+    const ph=hash01(t.token*131+i*17), az=ph*Math.PI*2;
+    const y=h*(0.42+0.36*(i+1)/(n+1)), len=h*(0.18+0.12*ph);
+    p.push({ax:sway*0.4,ay:y,az:0,bx:sway+Math.cos(az)*len,by:y+len*0.32,bz:Math.sin(az)*len,
+      r0:trunkRadius*0.45,r1:trunkRadius*0.16,phase:ph});
+  }
+  if(t.preset.leaves>0) p.push({ax:sway,ay:h*0.82,az:0,bx:sway,by:h*0.82,bz:0,r0:h*0.24,r1:h*0.24,phase:0.31});
+  return p;
+}
+function capsuleDistance(p,x,y,z){
+  const sx=p.bx-p.ax, sy=p.by-p.ay, sz=p.bz-p.az;
+  const rx=x-p.ax, ry=y-p.ay, rz=z-p.az;
+  const len=sx*sx+sy*sy+sz*sz;
+  const f=len>1e-8?clamp((rx*sx+ry*sy+rz*sz)/len,0,1):0;
+  const r=p.r0+(p.r1-p.r0)*f;
+  return Math.hypot(rx-sx*f, ry-sy*f, rz-sz*f)-r;
+}
+function sdfEvaluate(proxies,x,y,z,k){
+  let best=1e5;
+  for(const p of proxies){
+    const d=capsuleDistance(p,x,y,z);
+    if(k<=0){ best=Math.min(best,d); continue; }
+    const hh=clamp(0.5+0.5*(best-d)/k,0,1);
+    best=d+(best-d)*hh-k*hh*(1-hh);
+  }
+  return best;
+}
+
+/* ── Drawing ──────────────────────────────────────────────────────────────── */
+function drawGround(){
+  const step=64, extent=960;
+  ctx.lineWidth=1; ctx.font="9px monospace";
+  for(let i=-extent;i<=extent;i+=step){
+    for(const axis of [0,1]){
+      const a=axis?[-extent,0,i]:[i,0,-extent], b=axis?[extent,0,i]:[i,0,extent];
+      project(a[0],a[1],a[2],pa); project(b[0],b[1],b[2],pb);
+      if(pa[2]<1||pb[2]<1) continue;
+      ctx.strokeStyle=i===0?"rgba(120,160,190,.20)":"rgba(120,160,190,.075)";
+      ctx.beginPath(); ctx.moveTo(pa[0],pa[1]); ctx.lineTo(pb[0],pb[1]); ctx.stroke();
+    }
+  }
+}
+function drawWindOverlay(){
+  if(!state.showWind) return;
+  const spacing=96, reach=420;
+  for(let x=-reach;x<=reach;x+=spacing){
+    for(let z=-reach;z<=reach;z+=spacing){
+      const w=evaluateWind(x+state.camera.tx, z+state.camera.tz, state.time);
+      project(x+state.camera.tx,2,z+state.camera.tz,pa); project(x+state.camera.tx+w.dirX*22,2,z+state.camera.tz+w.dirZ*22,pb);
+      if(pa[2]<1||pb[2]<1) continue;
+      const mag=clamp(w.strength/24,0,1);
+      ctx.strokeStyle=`rgba(${Math.round(48+180*mag)},${Math.round(150+60*(1-mag))},${Math.round(150-70*mag)},.55)`;
+      ctx.lineWidth=1.6; ctx.beginPath(); ctx.moveTo(pa[0],pa[1]); ctx.lineTo(pb[0],pb[1]); ctx.stroke();
+      ctx.beginPath(); ctx.arc(pb[0],pb[1],2,0,7); ctx.fillStyle=ctx.strokeStyle; ctx.fill();
+    }
+  }
+}
+function treeColor(p, lod){
+  if(state.mode==="lod") return ["#34d399","#60a5fa","#ffb454","#ef5350"][lod];
+  if(state.mode==="sdf") return "#9aa2ff";
+  if(/Cactus|Agave|Aloe|Sotol|Ironwood|Joshua|Ocotillo/.test(p.name)) return "#6c8a55";
+  if(/Pine|Fir|Spruce|Redwood|Bristlecone/.test(p.name)) return "#2f6b52";
+  if(/Maple|Birch|Aspen|Willow/.test(p.name)) return "#7dac53";
+  if(/Grass|Wheat|Barley|Oat|Reed/.test(p.name)) return "#9aa65a";
+  return "#4c8a4a";
+}
+function drawTree(t, pixelHeight){
+  const p=t.preset, w=evaluateWind(t.x,t.z,state.time);
+  const h=t.height*t.scale;
+  const flex=p.flex*state.flex.trunk;
+  const sway=state.playing ? w.strength*0.035*h*flex*(windWave(state.time*0.85)*0.7+0.3) : 0;
+  const sx=w.dirX*sway, sz=w.dirZ*sway;
+  const color=treeColor(p,t.lod);
+  const dx=sway;
+  const topX=t.sx + sx*view.focal/Math.max(1,t.depth);
+  const baseY=t.sy, topY=t.sy-pixelHeight;
+
+  ctx.strokeStyle="#5b4938"; ctx.lineWidth=Math.max(1, pixelHeight*0.035);
+  ctx.beginPath(); ctx.moveTo(t.sx,baseY);
+  ctx.quadraticCurveTo((t.sx+topX)/2+dx*0.05, (baseY+topY)/2, topX, topY); ctx.stroke();
+
+  const detail = t.lod===0 || t.token===state.selectedToken;
+  if(pixelHeight<9){ return; }
+  const limbs=detail?Math.min(7,Math.max(2,Math.round(p.branches[1]/12))):3;
+  ctx.strokeStyle="#6b5944"; ctx.lineWidth=Math.max(1, pixelHeight*0.016);
+  for(let i=0;i<limbs;i++){
+    const f=(i+1)/(limbs+1), yy=lerp(baseY,topY,0.32+0.55*f), xx=lerp(t.sx,topX,0.32+0.55*f);
+    const side=(i%2?1:-1), len=pixelHeight*(0.16+0.13*hash01(t.token*31+i));
+    ctx.beginPath(); ctx.moveTo(xx,yy); ctx.lineTo(xx+side*len, yy-len*0.55); ctx.stroke();
+  }
+
+  if(state.mode==="fracture" && t.token===state.selectedToken && state.fracture.active){
+    drawFracture(t,pixelHeight,baseY,topY); return;
+  }
+  if(state.mode==="uv" && t.token===state.selectedToken){
+    drawUvWire(t,pixelHeight,baseY,topY); return;
+  }
+  if(state.mode==="sdf"){
+    if(t.token===state.selectedToken){ drawProxies(t, w, h); return; }
+  }
+
+  // Canopy / leaves.
+  const leafCount = p.leaves===0 ? 0 : detail?Math.min(9, Math.max(3, Math.round(p.leaves/8))):2;
+  if(leafCount===0){
+    ctx.fillStyle=color;
+    ctx.beginPath(); ctx.ellipse(topX,topY+pixelHeight*0.09,pixelHeight*0.055,pixelHeight*0.15,0,0,7); ctx.fill();
+    return;
+  }
+  const radius=pixelHeight*(p.kind==="Grass"?0.10:0.19);
+  for(let i=0;i<leafCount;i++){
+    const ph=hash01(t.token*17+i*7);
+    let jitter=0;
+    if(state.leafMode==="procedural") jitter=Math.sin(state.time*7.3+ph*12.5)*p.flex*w.strength*0.08*state.flex.detail*pixelHeight*0.035;
+    else if(state.leafMode==="vat"){
+      const frame=Math.floor(state.time*state.vatFrames/6)%state.vatFrames;
+      jitter=Math.sin((frame+ph*state.vatFrames)*Math.PI*2/state.vatFrames)*pixelHeight*0.02;
+    } else if(t.token===state.selectedToken){
+      const leaf=t.leaves[i]; leaf.v += (Math.sin(state.time*5+leaf.phase)*4-leaf.x)*0.04; leaf.v*=0.92; leaf.x+=leaf.v;
+      jitter=leaf.x*pixelHeight*0.012;
+    }
+    const angle=ph*Math.PI*2;
+    const lx=topX+Math.cos(angle)*radius*(0.5+ph*0.6)+jitter;
+    const ly=topY+pixelHeight*0.04+Math.sin(angle)*radius*0.6+Math.abs(jitter)*0.3;
+    ctx.fillStyle=state.textures?color:color+"aa";
+    ctx.beginPath(); ctx.ellipse(lx,ly,Math.max(1.2,radius*0.55),Math.max(1,radius*0.34),angle*0.2,0,7); ctx.fill();
+  }
+}
+function drawFracture(t,pixelHeight,baseY,topY){
+  const elapsed=state.time-state.fracture.started;
+  const cuts=state.fracture.strength>0.8?4:state.fracture.strength>0.3?2:1;
+  const pieces=cuts+1;
+  for(let i=0;i<pieces;i++){
+    const y0=lerp(topY,baseY,i/pieces), y1=lerp(topY,baseY,(i+1)/pieces);
+    const drift=(i-(pieces-1)/2)*Math.min(elapsed,3)*(state.fracture.strength*7+1);
+    const drop=Math.min(60, 0.5*elapsed*elapsed*12*(0.4+i/pieces));
+    ctx.fillStyle=i%2?"#7b6551":"#57483a";
+    ctx.beginPath(); ctx.moveTo(t.sx+drift,y0+drop); ctx.lineTo(t.sx+12+drift,y0+drop);
+    ctx.lineTo(t.sx+8+drift,y1+drop); ctx.lineTo(t.sx-4+drift,y1+drop); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle="#ffb454"; ctx.setLineDash([4,3]); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(t.sx-12+drift,y1+drop); ctx.lineTo(t.sx+18+drift,y1+drop); ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.fillStyle="#ffb454"; ctx.font="10px monospace";
+  ctx.fillText(`${pieces} pieces · shared CutTokens`, t.sx+16, topY-8);
+}
+function drawUvWire(t,pixelHeight,baseY,topY){
+  ctx.strokeStyle="#60a5fa"; ctx.lineWidth=1;
+  for(let i=0;i<4;i++){
+    const yy=lerp(baseY,topY,i/4);
+    ctx.beginPath(); ctx.ellipse(t.sx,yy,pixelHeight*(0.09-i*0.015),pixelHeight*0.022,0,0,7); ctx.stroke();
+  }
+  ctx.strokeStyle="#ffb454"; ctx.setLineDash([4,3]);
+  ctx.beginPath(); ctx.moveTo(t.sx+pixelHeight*0.09,baseY); ctx.lineTo(t.sx+pixelHeight*0.035,topY); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle="#ffb454"; ctx.font="10px monospace"; ctx.fillText("UV seam locked through cluster cut",t.sx+18,topY-6);
+}
+function drawProxies(t,wind,h){
+  const proxies=proxyList(t,wind);
+  ctx.lineWidth=2;
+  for(const p of proxies){
+    project(t.x+p.ax,p.ay,t.z+p.az,pa); project(t.x+p.bx,p.by,t.z+p.bz,pb);
+    if(pa[2]<1||pb[2]<1) continue;
+    ctx.strokeStyle=p.phase>0?"#8be0a5":"#3b82f6";
+    ctx.beginPath(); ctx.moveTo(pa[0],pa[1]); ctx.lineTo(pb[0],pb[1]); ctx.stroke();
+    ctx.beginPath(); ctx.arc(pa[0],pa[1],3,0,7); ctx.fillStyle=ctx.strokeStyle; ctx.fill();
+  }
+}
+function drawSdfSlice(t){
+  const h=t.height*t.scale, wind=evaluateWind(t.x,t.z,state.time), proxies=proxyList(t,wind,h);
+  // Project slice corners to place the heat map over the selected tree.
+  project(t.x-h,h,t.z,pa); const x0=pa[0], y0=pa[1];
+  project(t.x+h,0,t.z,pb); const x1=pb[0], y1=pb[1];
+  if(x1-x0<20||y1-y0<20||pa[2]<1) return;
+  const gw=104,gh=78, off=document.createElement("canvas"); off.width=gw; off.height=gh;
+  const g=off.getContext("2d"), img=g.createImageData(gw,gh);
+  for(let j=0;j<gh;j++) for(let i=0;i<gw;i++){
+    const wx=lerp(-h,h,i/(gw-1)), wy=lerp(h,0,j/(gh-1));
+    const d=sdfEvaluate(proxies,wx,wy,0,state.sdf.smooth);
+    const k=(j*gw+i)*4;
+    if(d<0){ img.data[k]=40; img.data[k+1]=120; img.data[k+2]=255; img.data[k+3]=125; }
+    else if(d<1.5){ img.data[k]=70; img.data[k+1]=80; img.data[k+2]=90; img.data[k+3]=Math.round(90*(1-d/1.5)); }
+    else img.data[k+3]=0;
+  }
+  g.putImageData(img,0,0);
+  ctx.globalAlpha=0.75; ctx.drawImage(off, Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0)); ctx.globalAlpha=1;
+}
+function drawForest(){
+  state.visibleTrees=0; state.visibleClusters=0; state.triangles=0; state.histogram=[0,0,0,0];
+  const farBatch=[[],[],[],[]]; // Flat [screenX, screenY, pixelHeight, …] per LOD level.
+  for(const t of state.instances){
+    if(!t.visible) continue;
+    project(t.x,0,t.z,pa);
+    if(pa[2]<1){ t.depth=-1; continue; }
+    const pixelHeight=t.height*t.scale*view.focal/pa[2];
+    if(pixelHeight<1.2 || pa[0]<-60 || pa[0]>W+60 || pa[1]<-80 || pa[1]>H+80){ t.depth=-1; continue; }
+    t.sx=pa[0]; t.sy=pa[1]; t.depth=pa[2];
+    // Continuous cluster cut approximation: finer levels for larger projected error budget.
+    const projectedError=(t.height*t.scale*0.055*view.focal/pa[2]);
+    t.lod = !state.lod.auto ? 0 : projectedError<=state.lod.maxError?0 : projectedError<=state.lod.maxError*3?1 : projectedError<=state.lod.maxError*9?2:3;
+    state.histogram[t.lod]++;
+    state.visibleTrees++;
+    state.visibleClusters+=Math.max(1,Math.round(pixelHeight/22));
+    state.triangles+=[9000,3000,900,240][t.lod];
+    if(pixelHeight<7){ farBatch[t.lod].push(t.sx,t.sy,pixelHeight); continue; }
+    drawTree(t,pixelHeight);
+  }
+  for(let lod=0;lod<4;lod++){
+    const batch=farBatch[lod]; if(!batch.length) continue;
+    ctx.fillStyle=treeColor(PRESETS[0],lod);
+    ctx.beginPath();
+    for(let i=0;i<batch.length;i+=3){
+      const x=batch[i], y=batch[i+1], ph=batch[i+2];
+      ctx.rect(x,y-ph*0.45,Math.max(1,ph*0.09),Math.max(1,ph*0.5));
+    }
+    ctx.fill();
+  }
+}
+function drawFrame(now){
+  const dt=Math.min(0.05,(now-(drawFrame.last||now))/1000); drawFrame.last=now;
+  if(state.playing) state.time+=dt;
+  state.fps=lerp(state.fps,1/Math.max(0.001,dt),0.08);
+  updateCamera();
+  const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0d141b"); g.addColorStop(0.55,"#0b1016"); g.addColorStop(1,"#07090c");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  drawGround();
+  if(state.mode==="sdf"){ const t=current(); if(t&&t.depth!==-1) drawSdfSlice(t); }
+  drawWindOverlay();
+  drawForest();
+  const focus=evaluateWind(state.camera.tx,state.camera.tz,state.time);
+  state.windAtFocus=focus.strength;
+  if(Math.floor(now/180)!==drawFrame.lastUi){
+    drawFrame.lastUi=Math.floor(now/180);
+    $("statFps").textContent=state.fps.toFixed(0);
+    $("statTrees").textContent=state.visibleTrees.toLocaleString();
+    $("statClusters").textContent=state.visibleClusters.toLocaleString();
+    $("statTris").textContent=state.triangles>1e6?(state.triangles/1e6).toFixed(2)+"M":Math.round(state.triangles/1000)+"k";
+    $("statWind").textContent=focus.strength.toFixed(1)+" m/s";
+    $("statLod").textContent="L"+state.histogram.indexOf(Math.max(...state.histogram));
+    $("tileLod").textContent="L"+state.histogram.indexOf(Math.max(...state.histogram));
+    $("hudWind").textContent=focus.strength.toFixed(1)+" m/s @ "+state.wind.bearing+"°";
+    $("hudClusters").textContent=state.visibleClusters.toLocaleString();
+    const max=Math.max(1,...state.histogram);
+    [...$("lodHist").children].forEach((el,i)=>el.style.height=Math.max(4,state.histogram[i]/max*100)+"%");
+  }
+  requestAnimationFrame(drawFrame);
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────────────── */
+buildForest(); renderOutliner(); syncInspector(); drawAtlas(); renderLegend();
+requestAnimationFrame(drawFrame);
+</script>
+</body>
+</html>

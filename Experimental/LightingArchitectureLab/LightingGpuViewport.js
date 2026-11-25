@@ -128,7 +128,7 @@ void main() {
     float rad = 4.25 + float(ring) * 1.2;
     float phase = float(ring) * 0.19635;
     float a = float(sector) * (TWO_PI / 16.0) + phase;
-    vec3 center = vec3(cos(a) * rad, 0.30 + 0.10 * sin(float(idx) * 1.7), sin(a) * rad + 0.5);
+    vec3 center = vec3(cos(a) * rad, 0.40 + 0.10 * sin(float(idx) * 1.7), sin(a) * rad + 0.5);
     worldP = localP + center;
     worldN = aNormal;
     outMat = 20.0 + float(idx);
@@ -175,7 +175,7 @@ vec3 acesFilmicToneMap(vec3 x) {
 }
 
 void main() {
-  vec4 acc = texture(uAccumTex, vUv);
+  vec4 acc = texelFetch(uAccumTex, ivec2(gl_FragCoord.xy), 0);
   vec3 col = max(acc.rgb, vec3(0.0)) / max(acc.a, 1.0);
   col *= uExposure;
   col = acesFilmicToneMap(col);
@@ -1222,8 +1222,8 @@ export class LightingGpuViewport {
       const tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texImage2D(gl.TEXTURE_2D, 0, internalFmt, w, h, 0, gl.RGBA, texType, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
@@ -1236,7 +1236,11 @@ export class LightingGpuViewport {
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
       gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
 
-      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && internalFmt !== gl.RGBA8) {
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && useFloat && this.halfFloatFboExt) {
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      }
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       }
@@ -1387,11 +1391,21 @@ export class LightingGpuViewport {
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.blitProg);
     gl.bindVertexArray(this.emptyVao);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, null);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.accumTextures[writeIdx]);
     gl.uniform1i(this.blitUniforms.uAccumTex, 0);
     gl.uniform1f(this.blitUniforms.uExposure, params.exposure);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (!this._checkedFirstFrameError) {
+      this._checkedFirstFrameError = true;
+      const err = gl.getError();
+      if (err !== gl.NO_ERROR) {
+        console.error("WebGL2 error in LightingGpuViewport:", err);
+      }
+    }
 
     this.accumIndex = writeIdx;
     this.accumFrame = isPt ? Math.min(this.accumFrame + 1, 256) : 0;

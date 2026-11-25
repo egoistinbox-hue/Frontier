@@ -54,6 +54,57 @@ bool UntitledLifecycle::Initialize(
     Metrics.BootLoadedFromDisk    = Reading.BootLoadedFromDisk;
     Metrics.WorkerChannelsRunning = Reading.CadenceMetrics.WorkerChannelsActive;
     Metrics.AssetStreamRunning    = Reading.CadenceMetrics.AssetStreamActive;
+
+    // Load Frontier's .botanical species library (Ferns -> Palms -> Oak) & populate WorldPartition grove
+    BotanicalRegistry  = {};
+    BotanicalPartition = Frontier::GeometrySpace::Botanical::BotanicalWorldPartition{};
+    BotanicalWind      = {};
+    BotanicalWind.WindVelocityMps = { 4.8f, 1.4f, 0.0f };
+    BotanicalWind.GustStrengthMps = 2.6f;
+    BotanicalWind.GustFrequencyHz = 0.55f;
+
+    std::error_code FsEc;
+    const std::filesystem::path RepoRoot = ProjectRootPath.parent_path().parent_path();
+    const std::filesystem::path SpeciesDir = RepoRoot / "EngineContent" / "Botanical" / "Species";
+    std::string BotanicalDiag {};
+    if (std::filesystem::exists(SpeciesDir, FsEc) && !FsEc)
+    {
+        (void)BotanicalRegistry.LoadDirectory(SpeciesDir, BotanicalDiag);
+    }
+
+    auto registerStarter = [&](const char* speciesId, float x, float y, float yawDeg, float scale)
+    {
+        using namespace Frontier::GeometrySpace::Botanical;
+        const auto* sp = BotanicalRegistry.FindById(speciesId);
+        BotanicalPlantInstance inst {};
+        inst.SpeciesId         = speciesId;
+        inst.WorldPosMeters    = { x, y, 0.0f };
+        inst.YawRad            = yawDeg * 0.0174532925f;
+        inst.Scale             = scale;
+        inst.GrowthForm        = sp ? sp->GrowthForm : BotanicalGrowthForm::Fern;
+        inst.HeightMeters      = sp ? (sp->GrowthForm == BotanicalGrowthForm::Fern ? sp->Fern.FrondLengthMeters : sp->Trunk.HeightMeters) : 1.0f;
+        inst.TrunkRadiusMeters = sp ? sp->Trunk.BaseRadiusMeters : 0.06f;
+        inst.StiffnessNmPerRad = sp ? sp->WindAndMotion.StemStiffness : 18.0f;
+        inst.DampingRatio      = sp ? std::clamp(sp->WindAndMotion.StemDamping * 0.10f, 0.15f, 0.65f) : 0.28f;
+        inst.WindFlexibility   = sp ? std::clamp(sp->WindAndMotion.WindSensitivity * 0.65f, 0.15f, 1.0f) : 0.75f;
+        inst.AbscissionThreshN = sp ? sp->Leaves.DetachWindMps : 14.0f;
+        inst.PhaseOffset       = std::fmod(std::fabs(x * 0.37f + y * 0.53f), 1.0f);
+        (void)BotanicalPartition.RegisterPlant(inst);
+    };
+
+    registerStarter("sword_fern",           -1.8f, -1.6f,  18.0f, 1.05f);
+    registerStarter("sword_fern",            1.6f, -2.1f, 112.0f, 0.96f);
+    registerStarter("bracken_fern",         -0.4f, -2.8f, 240.0f, 1.08f);
+    registerStarter("medjool_date_palm",    -4.4f,  2.2f,  35.0f, 1.00f);
+    registerStarter("coastal_coconut_palm",  4.8f,  2.6f, 152.0f, 0.98f);
+    registerStarter("english_oak",           0.2f,  5.4f,  15.0f, 1.00f);
+
+    const auto BotTel = BotanicalPartition.GetTelemetry();
+    Metrics.BotanicalSpeciesLoaded = static_cast<uint32_t>(BotanicalRegistry.QueryCount());
+    Metrics.BotanicalPlantsActive  = static_cast<uint32_t>(BotanicalPartition.Plants().size());
+    Metrics.BotanicalCpuCells      = BotTel.CpuCells;
+    Metrics.BotanicalGpuCells      = BotTel.GpuCells;
+
     Initialized                   = true;
     OutDiagnostic.clear();
     return true;
@@ -135,7 +186,24 @@ void UntitledLifecycle::OnFixedSimulationStep(double FixedDeltaSeconds, uint64_t
         ++Metrics.DirectivesRejected;
     }
 
-    // 4. Advance networking replication publish timer & compute deterministic 64-bit world alignment hash
+    // 4. Advance Projects/Untitled Botanical WorldPartition (smooth GPU<->Deterministic CPU cells + falling/sleeping leaves)
+    {
+        Frontier::GeometrySpace::Botanical::BotanicalObserverProxy vehObs {};
+        vehObs.PositionMeters = {
+            static_cast<float>(ReferenceVehicle.PositionMetersX),
+            static_cast<float>(ReferenceVehicle.PositionMetersY),
+            0.6f
+        };
+        vehObs.VelocityMps = { ReferenceVehicle.VelocityMetersSecX, ReferenceVehicle.VelocityMetersSecY, 0.0f };
+        vehObs.RadiusMeters = 1.6f;
+        vehObs.IsVehicle = true;
+        BotanicalPartition.Step(static_cast<float>(FixedDeltaSeconds), BotanicalWind, { vehObs });
+        const auto BotTel = BotanicalPartition.GetTelemetry();
+        Metrics.BotanicalCpuCells = BotTel.CpuCells;
+        Metrics.BotanicalGpuCells = BotTel.GpuCells;
+    }
+
+    // 5. Advance networking replication publish timer & compute deterministic 64-bit world alignment hash
     Frontier::NetworkingSpace::AccumulateReplicationElapsed(Policies.VehicleContract, FixedDeltaSeconds);
 
     ++Metrics.TotalFixedStepsExecuted;

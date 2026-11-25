@@ -50,3 +50,67 @@ TangentialDistortionP = [ 0.0, 0.0 ]
 DefaultUpAxis = '+Z'
 MetersPerUnit = 1.0
 WorldTitle = 'MainWorld'
+
+[BotanicalWorldPartition]
+CellSizeMeters = 16.0
+LeafSubcellMeters = 4.0
+PromoteRadiusMeters = 24.0
+DemoteRadiusMeters = 32.0
+PromoteBlendSec = 0.35
+DemoteBlendSec = 0.65
+MaxActiveFallingLeaves = 8192
+
+[BotanicalWindField]
+ForceModel = 'DirectionalWind'
+WindVelocityMps = [ 4.8, 1.4, 0.0 ]
+GustStrengthMps = 2.6
+GustFrequencyHz = 0.55
+
+[[BotanicalInstances]]
+Label = 'Sword Fern Cluster A'
+SpeciesAsset = 'EngineContent/Botanical/Species/SwordFern.botanical'
+PositionMeters = [ -1.8, -1.6, 0.0 ]
+YawDeg = 18.0
+Scale = 1.05
+Seed = 101
+
+[[BotanicalInstances]]
+Label = 'Sword Fern Cluster B'
+SpeciesAsset = 'EngineContent/Botanical/Species/SwordFern.botanical'
+PositionMeters = [ 1.6, -2.1, 0.0 ]
+YawDeg = 112.0
+Scale = 0.96
+Seed = 102
+
+[[BotanicalInstances]]
+Label = 'Bracken Fern Frond Patch'
+SpeciesAsset = 'EngineContent/Botanical/Species/BrackenFern.botanical'
+PositionMeters = [ -0.4, -2.8, 0.0 ]
+YawDeg = 240.0
+Scale = 1.08
+Seed = 103
+
+[[BotanicalInstances]]
+Label = 'Medjool Date Palm Hero'
+SpeciesAsset = 'EngineContent/Botanical/Species/MedjoolDatePalm.botanical'
+PositionMeters = [ -4.4, 2.2, 0.0 ]
+YawDeg = 35.0
+Scale = 1.00
+Seed = 201
+
+[[BotanicalInstances]]
+Label = 'Coastal Coconut Palm'
+SpeciesAsset = 'EngineContent/Botanical/Species/CoastalCoconutPalm.botanical'
+PositionMeters = [ 4.8, 2.6, 0.0 ]
+YawDeg = 152.0
+Scale = 0.98
+Seed = 202
+
+[[BotanicalInstances]]
+Label = 'Ancient English Oak'
+SpeciesAsset = 'EngineContent/Botanical/Species/EnglishOak.botanical'
+PositionMeters = [ 0.2, 5.4, 0.0 ]
+YawDeg = 15.0
+Scale = 1.00
+Seed = 301
+

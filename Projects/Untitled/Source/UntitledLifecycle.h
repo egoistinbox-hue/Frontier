@@ -9,6 +9,8 @@
 //                                                        INCLUDES
 //------------------------------------------------------------------------------------------------------------------------
 
+#include "Engine/GeometrySpace/Procedural/Botanical/BotanicalSpeciesSchema.h"
+#include "Engine/GeometrySpace/Procedural/Botanical/BotanicalWorldPartition.h"
 #include "Engine/Lifecycle/RuntimeLifecycle.h"
 #include "Source/UntitledPolicies.h"
 
@@ -40,6 +42,10 @@ struct UntitledLoopMetrics
     bool     BootLoadedFromDisk       = false;// [-]     - True when Projects/Untitled/ TOML chain loaded cleanly
     bool     WorkerChannelsRunning    = false;// [-]     - True when opt-in ExecutionChannels are active
     bool     AssetStreamRunning       = false;// [-]     - True when opt-in AssetStreamThread is active
+    uint32_t BotanicalSpeciesLoaded   = 0u;   // [count] - Number of .botanical species resolved into Projects/Untitled
+    uint32_t BotanicalPlantsActive    = 0u;   // [count] - Total botanical plants registered in WorldPartition
+    uint32_t BotanicalCpuCells        = 0u;   // [count] - 16m x 16m WorldPartition cells on Deterministic CPU simulation
+    uint32_t BotanicalGpuCells        = 0u;   // [count] - 16m x 16m WorldPartition cells on GPU analytic simulation
 };
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -71,6 +77,8 @@ public:
     [[nodiscard]] UntitledLoopMetrics                       InspectMetrics() const noexcept;
     [[nodiscard]] const UntitledPolicyBundle&               InspectPolicies() const noexcept { return Policies; }
     [[nodiscard]] Frontier::Lifecycle::RuntimeLifecycle&    AccessRuntimeLoop() noexcept { return RuntimeLoop; }
+    [[nodiscard]] const Frontier::GeometrySpace::Botanical::BotanicalSpeciesRegistry& InspectBotanicalRegistry() const noexcept { return BotanicalRegistry; }
+    [[nodiscard]] const Frontier::GeometrySpace::Botanical::BotanicalWorldPartition&  InspectBotanicalPartition() const noexcept { return BotanicalPartition; }
 
 private:
     static void DispatchFixedStep(double FixedDeltaSeconds, uint64_t FixedStepOrdinal, void* Payload) noexcept;
@@ -79,11 +87,14 @@ private:
     void OnFixedSimulationStep(double FixedDeltaSeconds, uint64_t FixedStepOrdinal) noexcept;
     void OnPresentationStep(double InterpolationAlpha, double WallDeltaSeconds) noexcept;
 
-    Frontier::Lifecycle::RuntimeLifecycle                               RuntimeLoop      {};    // [-] - Zero-Editor tight runtime loop
-    UntitledPolicyBundle                                                Policies         {};    // [-] - Project execution, gameplay & driving policies
-    Frontier::SimulationSpace::Policies::WorldKinematicsDigestEntry     ReferenceVehicle {};    // [-] - Deterministic reference actor for fixed steps
-    UntitledLoopMetrics                                                 Metrics          {};    // [-] - Live runtime & policy telemetry
-    bool                                                                Initialized      = false;// [-] - Lifecycle active flag
+    Frontier::Lifecycle::RuntimeLifecycle                               RuntimeLoop       {};    // [-] - Zero-Editor tight runtime loop
+    UntitledPolicyBundle                                                Policies          {};    // [-] - Project execution, gameplay & driving policies
+    Frontier::SimulationSpace::Policies::WorldKinematicsDigestEntry     ReferenceVehicle  {};    // [-] - Deterministic reference actor for fixed steps
+    Frontier::GeometrySpace::Botanical::BotanicalSpeciesRegistry        BotanicalRegistry {};    // [-] - Loaded .botanical species library (Ferns -> Palms -> Oak)
+    Frontier::GeometrySpace::Botanical::BotanicalWorldPartition         BotanicalPartition{};    // [-] - 16m x 16m GPU<->CPU WorldPartition & 4m x 4m falling leaves
+    Frontier::GeometrySpace::Botanical::BotanicalWindFieldState         BotanicalWind     {};    // [-] - ForceField wind driving Projects/Untitled foliage
+    UntitledLoopMetrics                                                 Metrics           {};    // [-] - Live runtime & policy telemetry
+    bool                                                                Initialized       = false;// [-] - Lifecycle active flag
 };
 
 } // namespace Untitled

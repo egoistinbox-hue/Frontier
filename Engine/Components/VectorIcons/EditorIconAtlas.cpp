@@ -301,6 +301,7 @@ const char* QuerySymbolSvgFilename(EnvironmentSymbolCategory Symbol) noexcept
         case EnvironmentSymbolCategory::FolderWorld:      return "folder-environment.svg";
         case EnvironmentSymbolCategory::FolderGeneric:    return "folder-generic.svg";
         case EnvironmentSymbolCategory::FolderWater:      return "folder-water.svg";
+        case EnvironmentSymbolCategory::FolderBotanical:  return "folder-botanical.svg";
         case EnvironmentSymbolCategory::Collection:       return "collection-bracketed-objects.svg";
         case EnvironmentSymbolCategory::Material:         return "editor-material.svg";
         case EnvironmentSymbolCategory::Forest:           return "forest.svg";

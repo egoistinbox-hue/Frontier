@@ -78,7 +78,8 @@ enum class EnvironmentSymbolCategory : uint8_t
     Forest           = 37, // [-] - Foliage / forest biome (forest.svg)
     Fluid            = 38, // [-] - Liquid / water volume (fluid-glass.svg)
     Earth            = 39, // [-] - Project / world root globe (earth.svg)
-    Count            = 40, // [count] - Total editor icon categories
+    FolderBotanical  = 40, // [-] - Botanical / foliage outliner folder (folder-botanical.svg)
+    Count            = 41, // [count] - Total editor icon categories
 };
 
 enum class VisualTokenShape : uint8_t

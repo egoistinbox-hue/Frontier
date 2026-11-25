@@ -1,18 +1,17 @@
 /*============================================================================================================================================
                                                          AUTOSPACELIFECYCLE.CPP
 ============================================================================================================================================*/
-// 🧩 Single-level runtime lifecycle implementation for project AutoSpace (policy-driven 3-lobby architecture in MainWorld.WorldSpace)
+// 🧩 Top-level project runtime lifecycle delegating policy-driven single-level Studio Lobbies to LobbyLifecycle
 
 //------------------------------------------------------------------------------------------------------------------------
 //                                                        INCLUDES
 //------------------------------------------------------------------------------------------------------------------------
 
-#include "Source/AutoSpaceLifecycle.h"
+#include "Source/Gameplay/AutoSpaceLifecycle.h"
 
 #include "Engine/Codecs/PhotometrySpaceCodec.h"
 #include "Engine/Codecs/VolumetricSpaceCodec.h"
 #include "Engine/Codecs/WorldSpaceCodec.h"
-#include "Engine/Serialization/Container/DocumentContainerCodec.h"
 
 #include <algorithm>
 #include <array>
@@ -46,10 +45,6 @@ namespace
 
 } // namespace
 
-//------------------------------------------------------------------------------------------------------------------------
-//                                                LIFECYCLE IMPLEMENTATION
-//------------------------------------------------------------------------------------------------------------------------
-
 AutoSpaceLifecycle::~AutoSpaceLifecycle() noexcept
 {
     Finalize();
@@ -63,9 +58,8 @@ bool AutoSpaceLifecycle::Initialize(
 {
     Finalize();
 
-    Policies = BuildAutoSpacePolicyBundle();
-    Policies.LobbyPolicy.SelectedLobby = InitialLobby;
-    ClampStudioLobbyPolicyBounds(Policies.LobbyPolicy);
+    Policies = BuildAutoSpacePolicyBundle(0x4155544Full, InitialLobby);
+    LobbyPolicyEngine::ClampToSafeBounds(Policies.Lobby);
     Metrics = {};
 
     std::filesystem::path EffectiveProjectRoot = ProjectRootPath;
@@ -85,7 +79,6 @@ bool AutoSpaceLifecycle::Initialize(
         static_cast<uint32_t>(std::lround(1.0 / std::max(0.001, Policies.ExecutionPolicy.FixedStepSeconds)));
     Frontier::SimulationSpace::Policies::GameplayRulePolicyEngine::ClampToSafeBounds(Policies.GameplayPolicy);
 
-    // Load single-level MainWorld.WorldSpace (zero baked placements; lobbies build dynamically into this one level)
     (void)WorldHost.Initialize();
     const std::filesystem::path StartupWorldPath = EffectiveProjectRoot / "Content" / "Worlds" / "MainWorld.WorldSpace";
     std::string WorldDiag {};
@@ -130,10 +123,10 @@ bool AutoSpaceLifecycle::Initialize(
 
 #if FRONTIER_PROFILE_EDITOR
     EditorOutliner.ClearAll();
-    LobbyHost.AttachOutliner(&EditorOutliner);
+    Lobby.AttachOutliner(&EditorOutliner);
 #endif
 
-    if (!LobbyHost.BuildLobbyInSingleWorld(RepositoryRoot, Policies.LobbyPolicy, OutDiagnostic))
+    if (!Lobby.InitializeAndBuild(RepositoryRoot, Policies.Lobby, OutDiagnostic))
     {
         Finalize();
         return false;
@@ -143,26 +136,26 @@ bool AutoSpaceLifecycle::Initialize(
     Metrics.BootLoadedFromDisk    = Reading.BootLoadedFromDisk;
     Metrics.WorkerChannelsRunning = Reading.CadenceMetrics.WorkerChannelsActive;
     Metrics.AssetStreamRunning    = Reading.CadenceMetrics.AssetStreamActive;
-    Metrics.LobbyTelemetry        = LobbyHost.InspectTelemetry();
+    Metrics.LobbyTelemetry        = Lobby.InspectTelemetry();
     Initialized                   = true;
     OutDiagnostic.clear();
     return true;
 }
 
-bool AutoSpaceLifecycle::SelectStudioLobby(StudioLobbyId Lobby, std::string& OutDiagnostic)
+bool AutoSpaceLifecycle::SelectStudioLobby(StudioLobbyId LobbyId, std::string& OutDiagnostic)
 {
     if (!Initialized)
     {
         OutDiagnostic = "AutoSpaceLifecycle is not initialized.";
         return false;
     }
-    Policies.LobbyPolicy.SelectedLobby = Lobby;
-    ClampStudioLobbyPolicyBounds(Policies.LobbyPolicy);
-    if (!LobbyHost.BuildLobbyInSingleWorld(RepositoryRoot, Policies.LobbyPolicy, OutDiagnostic))
+    Policies.Lobby.SelectedLobby = LobbyId;
+    LobbyPolicyEngine::ClampToSafeBounds(Policies.Lobby);
+    if (!Lobby.InitializeAndBuild(RepositoryRoot, Policies.Lobby, OutDiagnostic))
     {
         return false;
     }
-    Metrics.LobbyTelemetry = LobbyHost.InspectTelemetry();
+    Metrics.LobbyTelemetry = Lobby.InspectTelemetry();
     return true;
 }
 
@@ -177,7 +170,7 @@ bool AutoSpaceLifecycle::RenderLobbyVisualProof(
         OutDiagnostic = "AutoSpaceLifecycle is not initialized.";
         return false;
     }
-    return LobbyHost.RenderVisualProof(OutputDirectory, RepositoryRoot, WidthPx, HeightPx, OutDiagnostic);
+    return Lobby.RenderVisualProof(OutputDirectory, RepositoryRoot, WidthPx, HeightPx, OutDiagnostic);
 }
 
 uint32_t AutoSpaceLifecycle::RunBoundedTicks(uint32_t MaximumOuterTicks, double WallStepSeconds) noexcept
@@ -214,15 +207,15 @@ bool AutoSpaceLifecycle::VerifyProjectContracts(std::string& OutDiagnostic) cons
         return false;
     }
 
-    const auto Telemetry = LobbyHost.InspectTelemetry();
+    const auto Telemetry = Lobby.InspectTelemetry();
     if (!Telemetry.VehicleDecoderLoaded || !Telemetry.PhotometryLoaded)
     {
-        OutDiagnostic = "AutoSpace StudioLobbyHost failed to load ControlVehicle or PhotometrySuite.";
+        OutDiagnostic = "AutoSpace LobbyLifecycle failed to load ControlVehicle or PhotometrySuite.";
         return false;
     }
     if (Telemetry.VehicleCount < 3u || Telemetry.SurfaceInstanceCount < 6u)
     {
-        OutDiagnostic = "AutoSpace StudioLobbyHost produced fewer vehicles or surfaces than expected.";
+        OutDiagnostic = "AutoSpace LobbyLifecycle produced fewer vehicles or surfaces than expected.";
         return false;
     }
 #if FRONTIER_PROFILE_EDITOR
@@ -233,13 +226,13 @@ bool AutoSpaceLifecycle::VerifyProjectContracts(std::string& OutDiagnostic) cons
     }
 #endif
 
-    std::array<std::byte, GameplayRulePolicy::WirePayloadBytes> RuleWire{};
+    std::array<std::byte, GameplayRulePolicy::WirePayloadBytes> RuleWire {};
     if (!GameplayRulePolicyEngine::EncodePolicyWireBytes(Policies.GameplayPolicy, RuleWire))
     {
         OutDiagnostic = "AutoSpace GameplayRulePolicy wire encode failed.";
         return false;
     }
-    GameplayRulePolicy DecodedRule{};
+    GameplayRulePolicy DecodedRule {};
     if (!GameplayRulePolicyEngine::DecodePolicyWireBytes(RuleWire, DecodedRule, OutDiagnostic))
     {
         return false;
@@ -266,7 +259,7 @@ bool AutoSpaceLifecycle::Resume() noexcept
 
 void AutoSpaceLifecycle::Finalize() noexcept
 {
-    LobbyHost.Shutdown();
+    Lobby.Shutdown();
     RuntimeLoop.Finalize();
     WorldHost.ClearWorld();
     Initialized = false;
@@ -275,7 +268,7 @@ void AutoSpaceLifecycle::Finalize() noexcept
 AutoSpaceLoopMetrics AutoSpaceLifecycle::InspectMetrics() const noexcept
 {
     AutoSpaceLoopMetrics Snapshot = Metrics;
-    Snapshot.LobbyTelemetry = LobbyHost.InspectTelemetry();
+    Snapshot.LobbyTelemetry = Lobby.InspectTelemetry();
     return Snapshot;
 }
 
@@ -298,7 +291,7 @@ void AutoSpaceLifecycle::DispatchPresentationStep(double InterpolationAlpha, dou
 void AutoSpaceLifecycle::OnFixedSimulationStep(double FixedDeltaSeconds, uint64_t /*FixedStepOrdinal*/) noexcept
 {
     (void)WorldHost.StepRuntimeWorld(FixedDeltaSeconds);
-    LobbyHost.TickSimulation(FixedDeltaSeconds);
+    Lobby.TickSimulation(FixedDeltaSeconds);
     ++Metrics.TotalFixedStepsExecuted;
     Metrics.SimulatedElapsedSeconds += FixedDeltaSeconds;
 }

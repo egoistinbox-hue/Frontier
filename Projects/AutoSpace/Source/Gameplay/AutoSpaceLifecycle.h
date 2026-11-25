@@ -1,7 +1,7 @@
 /*============================================================================================================================================
                                                           AUTOSPACELIFECYCLE.H
 ============================================================================================================================================*/
-// 🧩 Single-level runtime lifecycle for project AutoSpace hosting policy-selected Studio Lobbies inside MainWorld.WorldSpace
+// 🧩 Top-level project runtime lifecycle for AutoSpace orchestrating RuntimeLifecycle, WorldHost, and LobbyLifecycle inside MainWorld
 
 #pragma once
 
@@ -12,8 +12,8 @@
 #include "Engine/Configuration/BuildConfiguration.h"
 #include "Engine/Lifecycle/RuntimeLifecycle.h"
 #include "Engine/Lifecycle/RuntimeWorldHost.h"
-#include "Source/AutoSpacePolicies.h"
-#include "Source/StudioLobbyHost.h"
+#include "Source/Gameplay/LobbyLifecycle.h"
+#include "Source/Policies/AutoSpacePolicies.h"
 
 #if FRONTIER_PROFILE_EDITOR
 #include "Engine/Components/Panes/OutlinerPanel.h"
@@ -32,22 +32,22 @@ namespace AutoSpace
 
 struct AutoSpaceLoopMetrics
 {
-    uint64_t      TotalFixedStepsExecuted  = 0ull;                                // [count] - Total deterministic fixed simulation steps completed
-    uint64_t      PresentationTicksCount   = 0ull;                                // [count] - Total outer presentation ticks completed
-    double        SimulatedElapsedSeconds  = 0.0;                                 // [s]     - Cumulative deterministic simulated time
-    double        LastInterpolationAlpha   = 0.0;                                 // [-]     - Last presentation blend factor [0..1)
-    uint32_t      LoadedGeometryInstances  = 0u;                                  // [count] - Baked geometry count in MainWorld.WorldSpace (0)
-    bool          SunEnabled               = false;                               // [-]     - True when Solar ephemeris is active in MainWorld.WorldSpace
-    bool          SkyAtmosphereEnabled     = false;                               // [-]     - True when Rayleigh/Mie sky medium is active in MainWorld.WorldSpace
-    bool          BootLoadedFromDisk       = false;                               // [-]     - True when Projects/AutoSpace/ TOML chain loaded cleanly
-    bool          MainWorldLoaded          = false;                               // [-]     - True when Content/Worlds/MainWorld.WorldSpace loaded cleanly
-    bool          WorkerChannelsRunning    = false;                               // [-]     - True when opt-in ExecutionChannels are active
-    bool          AssetStreamRunning       = false;                               // [-]     - True when opt-in AssetStreamThread is active
-    StudioLobbyTelemetry LobbyTelemetry    {};                                    // [-]     - Active policy-driven lobby geometry, lights, particles & Outliner counts
+    uint64_t                TotalFixedStepsExecuted  = 0ull; // [count] - Total deterministic fixed simulation steps completed
+    uint64_t                PresentationTicksCount   = 0ull; // [count] - Total outer presentation ticks completed
+    double                  SimulatedElapsedSeconds  = 0.0;  // [s]     - Cumulative deterministic simulated time
+    double                  LastInterpolationAlpha   = 0.0;  // [-]     - Last presentation blend factor [0..1)
+    uint32_t                LoadedGeometryInstances  = 0u;   // [count] - Baked geometry count in MainWorld.WorldSpace (0)
+    bool                    SunEnabled               = false;// [-]     - True when Solar ephemeris is active in MainWorld.WorldSpace
+    bool                    SkyAtmosphereEnabled     = false;// [-]     - True when Rayleigh/Mie sky medium is active in MainWorld.WorldSpace
+    bool                    BootLoadedFromDisk       = false;// [-]     - True when Projects/AutoSpace/ TOML chain loaded cleanly
+    bool                    MainWorldLoaded          = false;// [-]     - True when Content/Worlds/MainWorld.WorldSpace loaded cleanly
+    bool                    WorkerChannelsRunning    = false;// [-]     - True when opt-in ExecutionChannels are active
+    bool                    AssetStreamRunning       = false;// [-]     - True when opt-in AssetStreamThread is active
+    LobbyLifecycleTelemetry LobbyTelemetry           {};   // [-]     - Active LobbyPolicy geometry, lights, particles & Outliner counts
 };
 
 //------------------------------------------------------------------------------------------------------------------------
-//                                                  FUNCTION PROTOTYPES
+//                                                    AUTOSPACELIFECYCLE
 //------------------------------------------------------------------------------------------------------------------------
 
 class AutoSpaceLifecycle
@@ -84,7 +84,7 @@ public:
 
     [[nodiscard]] AutoSpaceLoopMetrics                   InspectMetrics() const noexcept;
     [[nodiscard]] const AutoSpacePolicyBundle&           InspectPolicies() const noexcept { return Policies; }
-    [[nodiscard]] const StudioLobbyHost&                 InspectLobbyHost() const noexcept { return LobbyHost; }
+    [[nodiscard]] const LobbyLifecycle&                  InspectLobbyLifecycle() const noexcept { return Lobby; }
     [[nodiscard]] Frontier::Lifecycle::RuntimeLifecycle& AccessRuntimeLoop() noexcept { return RuntimeLoop; }
     [[nodiscard]] Frontier::Lifecycle::RuntimeWorldHost& AccessWorldHost() noexcept { return WorldHost; }
 #if FRONTIER_PROFILE_EDITOR
@@ -98,16 +98,16 @@ private:
     void OnFixedSimulationStep(double FixedDeltaSeconds, uint64_t FixedStepOrdinal) noexcept;
     void OnPresentationStep(double InterpolationAlpha, double WallDeltaSeconds) noexcept;
 
-    Frontier::Lifecycle::RuntimeLifecycle RuntimeLoop   {}; // [-] - Tight runtime loop
-    Frontier::Lifecycle::RuntimeWorldHost WorldHost     {}; // [-] - Single-level SoA world host (MainWorld.WorldSpace)
-    StudioLobbyHost                       LobbyHost     {}; // [-] - Policy-controlled 3-lobby builder inside MainWorld
+    Frontier::Lifecycle::RuntimeLifecycle RuntimeLoop    {};
+    Frontier::Lifecycle::RuntimeWorldHost WorldHost      {};
+    LobbyLifecycle                        Lobby          {};
 #if FRONTIER_PROFILE_EDITOR
-    Frontier::OutlinerPanel               EditorOutliner{}; // [-] - Outliner hierarchy synced via WorldInstanceEditorBridge
+    Frontier::OutlinerPanel               EditorOutliner {};
 #endif
-    std::filesystem::path                 RepositoryRoot{}; // [-] - Resolved repository root path
-    AutoSpacePolicyBundle                 Policies      {}; // [-] - Project execution, lobby, gameplay & networking policies
-    AutoSpaceLoopMetrics                  Metrics       {}; // [-] - Live runtime & world state telemetry
-    bool                                  Initialized   = false;
+    std::filesystem::path                 RepositoryRoot {};
+    AutoSpacePolicyBundle                 Policies       {};
+    AutoSpaceLoopMetrics                  Metrics        {};
+    bool                                  Initialized    = false;
 };
 
 } // namespace AutoSpace

@@ -7,7 +7,7 @@
 //                                                        INCLUDES
 //------------------------------------------------------------------------------------------------------------------------
 
-#include "Source/AutoSpaceLifecycle.h"
+#include "Source/Gameplay/AutoSpaceLifecycle.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,12 +17,12 @@
 
 int main(int ArgumentCount, char** ArgumentVector)
 {
-    uint32_t                 TickBudget      = 60u;
-    bool                     HeadlessMode    = true;
-    bool                     VerifyAllLobbies= false;
-    AutoSpace::StudioLobbyId SelectedLobby   = AutoSpace::StudioLobbyId::StudioLobby1Cyclorama;
-    std::filesystem::path    ProjectRoot     = std::filesystem::path("Projects") / "AutoSpace";
-    std::filesystem::path    ProofDir        {};
+    uint32_t                 TickBudget       = 60u;
+    bool                     HeadlessMode     = true;
+    bool                     VerifyAllLobbies = false;
+    AutoSpace::StudioLobbyId SelectedLobby    = AutoSpace::StudioLobbyId::StudioLobby1Cyclorama;
+    std::filesystem::path    ProjectRoot      = std::filesystem::path("Projects") / "AutoSpace";
+    std::filesystem::path    ProofDir         {};
 
     for (int Index = 1; Index < ArgumentCount; ++Index)
     {
@@ -51,7 +51,7 @@ int main(int ArgumentCount, char** ArgumentVector)
         }
         else if (std::strncmp(Arg, "--lobby=", 8) == 0)
         {
-            (void)AutoSpace::ParseStudioLobbyId(Arg + 8, SelectedLobby);
+            (void)AutoSpace::LobbyPolicyEngine::ParseLobbyId(Arg + 8, SelectedLobby);
         }
         else if (std::strncmp(Arg, "--render-proof=", 15) == 0)
         {
@@ -86,18 +86,20 @@ int main(int ArgumentCount, char** ArgumentVector)
         {
             if (!Lifecycle.SelectStudioLobby(L, Diagnostic) || !Lifecycle.VerifyProjectContracts(Diagnostic))
             {
+                const auto Slug = AutoSpace::LobbyPolicyEngine::QuerySlug(L);
                 std::fprintf(stderr, "[AutoSpace] Lobby switch validation failed (%.*s): %s\n",
-                    static_cast<int>(AutoSpace::QueryStudioLobbySlug(L).size()),
-                    AutoSpace::QueryStudioLobbySlug(L).data(),
+                    static_cast<int>(Slug.size()),
+                    Slug.data(),
                     Diagnostic.c_str());
                 Lifecycle.Finalize();
                 return 2;
             }
-            const auto Tel = Lifecycle.InspectLobbyHost().InspectTelemetry();
+            const auto Tel  = Lifecycle.InspectLobbyLifecycle().InspectTelemetry();
+            const auto Slug = AutoSpace::LobbyPolicyEngine::QuerySlug(L);
             std::printf(
                 "[AutoSpace] Verified single-level lobby '%.*s': vehicles=%u surfaces=%u areaLights=%u iesLights=%u cameras=%u particles=%u (%u active) tris=%u outlinerRows=%u\n",
-                static_cast<int>(AutoSpace::QueryStudioLobbySlug(L).size()),
-                AutoSpace::QueryStudioLobbySlug(L).data(),
+                static_cast<int>(Slug.size()),
+                Slug.data(),
                 Tel.VehicleCount,
                 Tel.SurfaceInstanceCount,
                 Tel.AreaLightCount,
@@ -124,13 +126,14 @@ int main(int ArgumentCount, char** ArgumentVector)
     }
 
     const auto Metrics = Lifecycle.InspectMetrics();
+    const auto ActiveSlug = AutoSpace::LobbyPolicyEngine::QuerySlug(Metrics.LobbyTelemetry.ActiveLobby);
     std::printf(
         "[AutoSpace] Completed %u outer ticks (%llu fixed steps, %.3f s, lobby=%.*s, outlinerRows=%u, bootDisk=%s)\n",
         CompletedTicks,
         static_cast<unsigned long long>(Metrics.TotalFixedStepsExecuted),
         Metrics.SimulatedElapsedSeconds,
-        static_cast<int>(AutoSpace::QueryStudioLobbySlug(Metrics.LobbyTelemetry.ActiveLobby).size()),
-        AutoSpace::QueryStudioLobbySlug(Metrics.LobbyTelemetry.ActiveLobby).data(),
+        static_cast<int>(ActiveSlug.size()),
+        ActiveSlug.data(),
         Metrics.LobbyTelemetry.OutlinerRowCount,
         Metrics.BootLoadedFromDisk ? "true" : "false");
 

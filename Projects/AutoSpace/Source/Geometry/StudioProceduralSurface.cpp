@@ -7,7 +7,7 @@
 //                                                        INCLUDES
 //------------------------------------------------------------------------------------------------------------------------
 
-#include "Source/StudioProceduralSurface.h"
+#include "Source/Geometry/StudioProceduralSurface.h"
 
 #include "Engine/Constants/MathConstants.h"
 

@@ -1183,6 +1183,7 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/SimulationSpace/Fluid/FluidVolumeRenderer.cpp
     Engine/SimulationSpace/Fluid/FluidSimulationPostOverlay.cpp
     Engine/SimulationSpace/Fluid/FluidPresetRegistry.cpp
+    Engine/SimulationSpace/Fluid/VehicleTireFluidSmokeBridge.cpp
     Engine/SimulationSpace/Deformable/TetrahedralSolidBuilder.cpp
     Engine/SimulationSpace/Deformable/ConflictColorPartitioner.cpp
     Engine/SimulationSpace/Deformable/NeoHookeanTetSolver.cpp
@@ -1544,6 +1545,7 @@ if(BUILD_TESTING)
     frontier_register_exhibit(CrossThreadConstraintValidation           Exhibits/CrossThreadConstraintValidation.cpp)
     frontier_register_exhibit(ControlVehiclePhysicsValidation           Exhibits/ControlVehiclePhysicsValidation.cpp)
     frontier_register_exhibit(VehiclePhysicsDriveExhibit                Exhibits/VehiclePhysicsDriveExhibit.cpp)
+    frontier_register_exhibit(VehicleTireFluidSmokeExhibit              Exhibits/VehicleTireFluidSmokeExhibit.cpp)
     frontier_register_exhibit(ForceFieldValidation                      Exhibits/ForceFieldValidation.cpp)
     target_compile_definitions(ForceFieldValidation PRIVATE FRONTIER_FORCEFIELD_WITH_LIVE_JOLT=1)
     frontier_register_exhibit(ParticleGpuPhysicsValidation              Exhibits/ParticleGpuPhysicsValidation.cpp)

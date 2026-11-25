@@ -1,7 +1,11 @@
 /*============================================================================================================================================
                                                               LIGHTRENDERER.JS
 ============================================================================================================================================*/
-// 🧩 Synchronized WebGL 3D PBR + Shadow Renderer (Ground Truth 32 Lights | Merged/Grid/Nanite/Hybrid | Real-Time Pixel Error Heatmap) + 3D Debug HUD
+// 🧩 Unified 3-System WebGL PBR Renderer:
+//    - 2-Cascade Toroidal Clipmap (Fine + Coarse) for STATIC lights
+//    - Cube-Grid / Pod Directional Atlas + Nanite Light BVH for DYNAMIC lights
+//    - Project Zero Header Debug Views (Lit | Error x8 | Toroidal Clipmap | Static vs Dynamic | Cube-Grid Pods)
+//    - HW GPU Timer Support (EXT_disjoint_timer_query / gl.finish() fallback)
 
 import { SCENE_BOXES, WORLD_HALF_EXTENT } from './LightEngine.js';
 
@@ -16,7 +20,6 @@ void main() {
 }
 `;
 
-// Generates GLSL obstacle list directly from SCENE_BOXES so CPU baker & GPU ray-tracer match 100% identically!
 function BuildGlslBoxesBlock() {
   let code = `const int NUM_BOXES = ${SCENE_BOXES.length};\n`;
   code += `void getBox(int i, out vec3 bMin, out vec3 bMax, out vec3 bCol, out float bRough) {\n`;
@@ -41,35 +44,52 @@ uniform vec3  uCamUp;
 uniform vec3  uCamFwd;
 uniform float uTanHalfFov;
 
-// Mode: 0 = Ground Truth, 1 = Naive Merge, 2 = Directional Light Grid (1 Sample/Cell),
-//       3 = Nanite-for-Lights (Distance BVH), 4 = Error-Guided Hybrid (Grid + High-Error BVH),
-//       5 = Live Per-Pixel Error Heatmap |Truth - SelectedApprox|
-uniform int   uViewMode;
-uniform int   uCompareTarget; // 1=naive, 2=grid, 3=nanite, 4=hybrid (used when uViewMode == 5)
+// Lighting Mode:
+//   0 = Exact (LOD 0 Reference, all 32 raw emitters)
+//   1 = Naive Point Merge (averaged groups -> big error!)
+//   2 = 1 Cube-Grid / Pod (95.1 KB/pod directional pods)
+//   3 = Toroidal Clipmap (Static 2-Cascade Clipmap + Dynamic Pods)
+//   4 = Unified All-3 (Static Toroidal Clipmap + Dynamic Nanite BVH/Pods + Error-Guided Promotion)
+uniform int   uLightMode;
+
+// Debug View Mode (from Project Zero Viewport Header):
+//   0 = Lit PBR
+//   1 = Error x8 Heatmap |Exact - uLightMode|
+//   2 = Toroidal Clipmap Debug (Fine vs Coarse cascades + cell boundaries)
+//   3 = Static (Cyan) vs Dynamic (Gold) Split Visualization
+//   4 = Cube-Grid Pods & Nanite LOD Heatmap
+uniform int   uDebugView;
 uniform float uErrorGain;
 uniform float uFloorRoughness;
 uniform float uHybridErrorGate;
-uniform float uGridRes;
 uniform float uShowGridLines;
-uniform float uShowHybridMask;
 
 // Raw 32 Ground Truth lights
 uniform int   uRawCount;
-uniform vec4  uRawPosFlux[${MAX_LIGHTS}];   // xyz = pos, w = flux
-uniform vec4  uRawDirCone[${MAX_LIGHTS}];   // xyz = dir, w = cosCone
-uniform vec4  uRawColor[${MAX_LIGHTS}];     // rgb = color
+uniform vec4  uRawPosFlux[${MAX_LIGHTS}];
+uniform vec4  uRawDirCone[${MAX_LIGHTS}];
+uniform vec4  uRawColor[${MAX_LIGHTS}];
 
-// Active Merged / BVH Cut lights (up to 32)
+// Primary Approx Array (Naive lights / All Cube-Grid Pods / Dynamic Nanite Cut)
 uniform int   uApproxCount;
 uniform vec4  uApproxPosFlux[${MAX_LIGHTS}];
 uniform vec4  uApproxDirCone[${MAX_LIGHTS}];
 uniform vec4  uApproxColor[${MAX_LIGHTS}];
 
-// Baked Directional Light Grid textures (packed float/half or normalized RGBA)
-uniform sampler2D uGridIrrTex; // rgb = L0 irradiance / 4.0, a = directionality r in [0..1]
-uniform sampler2D uGridDirTex; // rgb = domDir * 0.5 + 0.5, a = cellError / 2.0
-uniform float uIrrScale;
-uniform float uErrScale;
+// Secondary Array (Static Pods for high-error cell promotion in Unified All-3)
+uniform int   uStaticPromoCount;
+uniform vec4  uStaticPromoPosFlux[${MAX_LIGHTS}];
+uniform vec4  uStaticPromoDirCone[${MAX_LIGHTS}];
+uniform vec4  uStaticPromoColor[${MAX_LIGHTS}];
+
+// 2-Cascade Toroidal Clipmap (Fine follows probe/focus, Coarse covers full world)
+uniform sampler2D uFineIrrTex;
+uniform sampler2D uFineDirTex;
+uniform sampler2D uCoarseIrrTex;
+uniform sampler2D uCoarseDirTex;
+uniform vec4      uFineBounds;    // xy = snapped centerXZ, z = halfSpan, w = res
+uniform vec4      uCoarseBounds;  // xy = centerXZ (0,0), z = halfSpan, w = res
+uniform vec4      uClipScales;    // x = fineIrrScale, y = fineErrScale, z = coarseIrrScale, w = coarseErrScale
 
 ${BuildGlslBoxesBlock()}
 
@@ -123,7 +143,6 @@ vec3 evalPbrSingleLight(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, vec4 p
   float vis = shadowRay(P + N * 0.015, posFlux.xyz);
   if (vis <= 0.0) return vec3(0.0);
 
-  // Physically based Diffuse + GGX Specular lobe so double headlights show 2 distinct specular streaks!
   vec3 H = normalize(L + V);
   float ndh = max(dot(N, H), 0.0);
   float ndv = max(dot(N, V), 0.05);
@@ -138,8 +157,8 @@ vec3 evalPbrSingleLight(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, vec4 p
   return col * radiance * (albedo * ndl + vec3(spec * ndl * 0.85));
 }
 
-vec3 evalGroundTruth(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
-  vec3 sum = albedo * vec3(0.018, 0.022, 0.030);
+vec3 evalRawExact(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
+  vec3 sum = albedo * vec3(0.016, 0.020, 0.028);
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uRawCount) break;
     sum += evalPbrSingleLight(P, N, V, albedo, rough, uRawPosFlux[i], uRawDirCone[i], uRawColor[i].rgb);
@@ -147,8 +166,8 @@ vec3 evalGroundTruth(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
   return sum;
 }
 
-vec3 evalMergedArray(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
-  vec3 sum = albedo * vec3(0.018, 0.022, 0.030);
+vec3 evalApproxArray(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
+  vec3 sum = vec3(0.0);
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uApproxCount) break;
     sum += evalPbrSingleLight(P, N, V, albedo, rough, uApproxPosFlux[i], uApproxDirCone[i], uApproxColor[i].rgb);
@@ -156,18 +175,42 @@ vec3 evalMergedArray(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
   return sum;
 }
 
-// Mode 2: 1-Sample Baked Directional Light Grid (L0 Energy Conservation + Dominant Direction L1 + Ambient Residual)
-vec3 evalBakedGrid(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, out float outCellErr) {
-  vec2 guv = clamp((P.xz + vec2(${WORLD_HALF_EXTENT.toFixed(1)})) / ${(WORLD_HALF_EXTENT * 2.0).toFixed(1)}, 0.001, 0.999);
-  vec4 irrSample = texture2D(uGridIrrTex, guv);
-  vec4 dirSample = texture2D(uGridDirTex, guv);
-  vec3 L0 = irrSample.rgb * uIrrScale;
-  float dirStrength = irrSample.a; // r = |L1|/L0 in [0..1]
-  vec3 domDir = normalize(dirSample.rgb * 2.0 - 1.0);
-  outCellErr = dirSample.a * uErrScale;
+vec3 evalStaticPromoArray(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough) {
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    if (i >= uStaticPromoCount) break;
+    sum += evalPbrSingleLight(P, N, V, albedo, rough, uStaticPromoPosFlux[i], uStaticPromoDirCone[i], uStaticPromoColor[i].rgb);
+  }
+  return sum;
+}
 
-  // Split conserved L0 energy into Directional Light (r * L0 along domDir) + Isotropic Residual ((1-r) * L0)
-  // So opposing lights NEVER cancel to black — they preserve energy cleanly!
+// Samples the 2-Cascade Toroidal Clipmap (Fine around focus/probe -> smooth border blend -> Coarse full world)
+vec3 evalToroidalClipmap(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, out float outErr, out float outFineWeight) {
+  vec2 fUv = (P.xz - (uFineBounds.xy - vec2(uFineBounds.z))) / (2.0 * uFineBounds.z);
+  vec2 cUv = clamp((P.xz - (uCoarseBounds.xy - vec2(uCoarseBounds.z))) / (2.0 * uCoarseBounds.z), 0.001, 0.999);
+
+  float edgeDist = min(min(fUv.x, 1.0 - fUv.x), min(fUv.y, 1.0 - fUv.y));
+  outFineWeight = smoothstep(0.0, 0.14, edgeDist);
+
+  vec4 cIrr = texture2D(uCoarseIrrTex, cUv);
+  vec4 cDir = texture2D(uCoarseDirTex, cUv);
+  vec3 L0 = cIrr.rgb * uClipScales.z;
+  float dirR = cIrr.a;
+  vec3 domDir = normalize(cDir.rgb * 2.0 - 1.0);
+  outErr = cDir.a * uClipScales.w;
+
+  if (outFineWeight > 0.001) {
+    vec2 cfUv = clamp(fUv, 0.001, 0.999);
+    vec4 fIrr = texture2D(uFineIrrTex, cfUv);
+    vec4 fDir = texture2D(uFineDirTex, cfUv);
+    vec3 fL0 = fIrr.rgb * uClipScales.x;
+    vec3 fDom = normalize(fDir.rgb * 2.0 - 1.0);
+    L0 = mix(L0, fL0, outFineWeight);
+    dirR = mix(dirR, fIrr.a, outFineWeight);
+    domDir = normalize(mix(domDir, fDom, outFineWeight));
+    outErr = mix(outErr, fDir.a * uClipScales.y, outFineWeight);
+  }
+
   float ndl = max(dot(N, domDir), 0.0);
   vec3 H = normalize(domDir + V);
   float ndh = max(dot(N, H), 0.0);
@@ -179,26 +222,47 @@ vec3 evalBakedGrid(vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, out float o
   float F = 0.04 + 0.96 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
   float spec = (D * F) / (4.0 * ndv * max(ndl, 0.15) + 0.15);
 
-  // Diffuse uses conserved L0 modulated by surface normal alignment with dominant direction
-  float normalMod = mix(1.0, max(0.15, ndl / max(0.25, domDir.y)), dirStrength * 0.85);
-  vec3 diffTerm = albedo * L0 * normalMod;
-  vec3 specTerm = L0 * (dirStrength * spec * 0.72);
-  return albedo * vec3(0.018, 0.022, 0.030) + diffTerm + specTerm;
+  float normalMod = mix(1.0, max(0.16, ndl / max(0.25, domDir.y)), dirR * 0.85);
+  return albedo * L0 * normalMod + L0 * (dirR * spec * 0.72);
 }
 
-vec3 evalByMode(int mode, vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, out float hybridMask) {
-  hybridMask = 0.0;
-  if (mode == 0) return evalGroundTruth(P, N, V, albedo, rough);
-  if (mode == 1 || mode == 3) return evalMergedArray(P, N, V, albedo, rough);
+vec3 evalPipeline(int mode, vec3 P, vec3 N, vec3 V, vec3 albedo, float rough, out vec3 outStaticCol, out vec3 outDynamicCol, out float outFineW, out float outPromoW) {
+  vec3 ambient = albedo * vec3(0.016, 0.020, 0.028);
+  outStaticCol = vec3(0.0);
+  outDynamicCol = vec3(0.0);
+  outFineW = 0.0;
+  outPromoW = 0.0;
+
+  if (mode == 0) {
+    return evalRawExact(P, N, V, albedo, rough);
+  }
+  if (mode == 1 || mode == 2) {
+    // Mode 1: Naive Point Merge | Mode 2: 1 Cube-Grid/Pod
+    outDynamicCol = evalApproxArray(P, N, V, albedo, rough);
+    return ambient + outDynamicCol;
+  }
+
+  // Modes 3 & 4: Separate STATIC Toroidal Clipmap + DYNAMIC Cube-Grid Pod / Nanite BVH!
   float cellErr = 0.0;
-  vec3 gridCol = evalBakedGrid(P, N, V, albedo, rough, cellErr);
-  if (mode == 2) return gridCol;
-  // Mode 4: Error-Guided Hybrid! Low-error cells use 1 Grid Sample; high-error cells promote BVH split!
-  float wSplit = smoothstep(uHybridErrorGate * 0.75, uHybridErrorGate * 1.35, cellErr);
-  hybridMask = wSplit;
-  if (wSplit <= 0.005) return gridCol;
-  vec3 bvhCol = evalMergedArray(P, N, V, albedo, rough);
-  return mix(gridCol, bvhCol, wSplit);
+  vec3 clipStatic = evalToroidalClipmap(P, N, V, albedo, rough, cellErr, outFineW);
+  vec3 dynLights = evalApproxArray(P, N, V, albedo, rough);
+  outDynamicCol = dynLights;
+
+  if (mode == 3) {
+    outStaticCol = clipStatic;
+    return ambient + clipStatic + dynLights;
+  }
+
+  // Mode 4: Unified All-3! Uses Error-Guided Promotion ONLY where Static Toroidal cell error is high!
+  float wPromo = smoothstep(uHybridErrorGate * 0.75, uHybridErrorGate * 1.35, cellErr);
+  outPromoW = wPromo;
+  vec3 finalStatic = clipStatic;
+  if (wPromo > 0.01) {
+    vec3 promoStatic = evalStaticPromoArray(P, N, V, albedo, rough);
+    finalStatic = mix(clipStatic, promoStatic, wPromo);
+  }
+  outStaticCol = finalStatic;
+  return ambient + finalStatic + dynLights;
 }
 
 vec3 toneMap(vec3 c) {
@@ -206,7 +270,6 @@ vec3 toneMap(vec3 c) {
   return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
 }
 
-// High-contrast Inferno Heatmap for pixel error visualization
 vec3 infernoPalette(float t) {
   t = clamp(t, 0.0, 1.0);
   vec3 c0 = vec3(0.03, 0.03, 0.07);
@@ -224,7 +287,6 @@ void main() {
   vec3 rd = normalize(uCamFwd + uCamRight * (ndc.x * aspect * uTanHalfFov) + uCamUp * (ndc.y * uTanHalfFov));
   vec3 ro = uCamPos;
 
-  // Intersect Floor (y = 0) + 3D Scene Boxes
   float bestT = 1e6;
   vec3 hitN = vec3(0.0, 1.0, 0.0);
   vec3 hitCol = vec3(0.35);
@@ -238,7 +300,6 @@ void main() {
       if (abs(fp.x) <= ${WORLD_HALF_EXTENT.toFixed(1)} && abs(fp.z) <= ${WORLD_HALF_EXTENT.toFixed(1)}) {
         bestT = tf;
         hitFloor = true;
-        // Subtle architectural tile checkerboard (alternating matte & glossy tiles to expose specular error!)
         vec2 tile = floor(fp.xz * 0.5);
         float chk = mod(tile.x + tile.y, 2.0);
         hitCol = mix(vec3(0.24, 0.26, 0.29), vec3(0.32, 0.34, 0.38), chk);
@@ -253,16 +314,11 @@ void main() {
     vec3 bn;
     vec2 h = intersectBox(ro, rd, bMin, bMax, bn);
     if (h.x > 0.0 && h.x < bestT) {
-      bestT = h.x;
-      hitN = bn;
-      hitCol = bCol;
-      hitRough = bR;
-      hitFloor = false;
+      bestT = h.x; hitN = bn; hitCol = bCol; hitRough = bR; hitFloor = false;
     }
   }
 
   if (bestT > 1e5) {
-    // Deep studio horizon gradient
     float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
     gl_FragColor = vec4(mix(vec3(0.04, 0.05, 0.07), vec3(0.08, 0.10, 0.14), h), 1.0);
     return;
@@ -270,31 +326,53 @@ void main() {
 
   vec3 P = ro + rd * bestT;
   vec3 V = -rd;
+  vec3 staticCol, dynamicCol;
+  float fineW, promoW;
   vec3 outRgb;
 
-  if (uViewMode == 5) {
-    // Live Exact Per-Pixel Error Heatmap: |ToneMap(GroundTruth) - ToneMap(Approx)| * Gain
-    float dummyMask = 0.0;
-    vec3 truth = toneMap(evalGroundTruth(P, hitN, V, hitCol, hitRough));
-    vec3 approx = toneMap(evalByMode(uCompareTarget, P, hitN, V, hitCol, hitRough, dummyMask));
+  if (uDebugView == 1) {
+    // Error x8 Heatmap |Exact - uLightMode|
+    vec3 truth = toneMap(evalRawExact(P, hitN, V, hitCol, hitRough));
+    vec3 approx = toneMap(evalPipeline(uLightMode, P, hitN, V, hitCol, hitRough, staticCol, dynamicCol, fineW, promoW));
     float err = length(truth - approx) * 0.57735;
     outRgb = infernoPalette(err * uErrorGain);
   } else {
-    float hybridMask = 0.0;
-    vec3 hdr = evalByMode(uViewMode, P, hitN, V, hitCol, hitRough, hybridMask);
+    vec3 hdr = evalPipeline(uLightMode, P, hitN, V, hitCol, hitRough, staticCol, dynamicCol, fineW, promoW);
     outRgb = toneMap(hdr);
-    if (uShowHybridMask > 0.5 && uViewMode == 4) {
-      // Subtle tint showing where Hybrid uses 1 Grid Sample (teal) vs Error-Split BVH (amber)
-      outRgb = mix(outRgb, mix(vec3(0.18, 0.72, 0.62), vec3(1.0, 0.58, 0.20), hybridMask), 0.22);
+
+    if (uDebugView == 2) {
+      // Toroidal Clipmap Cascade Visualization: Fine Cascade (Cyan) vs Coarse Cascade (Amber) + Error Promotion (Magenta)
+      vec3 cascCol = mix(vec3(0.88, 0.55, 0.18), vec3(0.18, 0.82, 0.94), fineW);
+      if (promoW > 0.15) cascCol = mix(cascCol, vec3(0.95, 0.25, 0.65), promoW * 0.7);
+      outRgb = mix(outRgb * 0.65, cascCol, 0.42);
+    } else if (uDebugView == 3) {
+      // Static vs Dynamic System Split: Static Clipmap = Cyan-Teal, Dynamic Pods/Nanite BVH = Warm Gold
+      float sLum = dot(toneMap(staticCol), vec3(0.3, 0.6, 0.1));
+      float dLum = dot(toneMap(dynamicCol), vec3(0.3, 0.6, 0.1));
+      outRgb = vec3(0.10, 0.85, 0.95) * (sLum * 1.45) + vec3(1.0, 0.68, 0.18) * (dLum * 1.45) + vec3(0.03);
+    } else if (uDebugView == 4) {
+      // Cube-Grid Pods & Error-Promotion Overlay
+      outRgb = mix(outRgb, mix(vec3(0.18, 0.72, 0.56), vec3(1.0, 0.52, 0.18), promoW), 0.30);
     }
   }
 
-  // Crisp subtle floor grid lines when Show Grid is enabled
-  if (hitFloor && uShowGridLines > 0.5) {
-    vec2 cellUv = fract((P.xz + vec2(${WORLD_HALF_EXTENT.toFixed(1)})) / ${(WORLD_HALF_EXTENT * 2.0).toFixed(1)} * uGridRes);
-    float edge = min(min(cellUv.x, 1.0 - cellUv.x), min(cellUv.y, 1.0 - cellUv.y));
-    float line = 1.0 - smoothstep(0.0, 0.045, edge);
-    outRgb = mix(outRgb, vec3(0.45, 0.85, 0.95), line * 0.34);
+  // Toroidal Clipmap Cell Grid Lines (Fine = Cyan, Coarse = Dim Slate)
+  if (hitFloor && (uShowGridLines > 0.5 || uDebugView == 2)) {
+    vec2 fUv = (P.xz - (uFineBounds.xy - vec2(uFineBounds.z))) / (2.0 * uFineBounds.z);
+    bool inFine = fUv.x >= 0.0 && fUv.x <= 1.0 && fUv.y >= 0.0 && fUv.y <= 1.0;
+    if (inFine) {
+      vec2 cellUv = fract(fUv * uFineBounds.w);
+      float edge = min(min(cellUv.x, 1.0 - cellUv.x), min(cellUv.y, 1.0 - cellUv.y));
+      float line = 1.0 - smoothstep(0.0, 0.05, edge);
+      float border = 1.0 - smoothstep(0.0, 0.012, min(min(fUv.x, 1.0 - fUv.x), min(fUv.y, 1.0 - fUv.y)));
+      outRgb = mix(outRgb, vec3(0.28, 0.90, 1.0), max(line * 0.32, border * 0.85));
+    } else {
+      vec2 cUv = (P.xz - (uCoarseBounds.xy - vec2(uCoarseBounds.z))) / (2.0 * uCoarseBounds.z);
+      vec2 cellUv = fract(cUv * uCoarseBounds.w);
+      float edge = min(min(cellUv.x, 1.0 - cellUv.x), min(cellUv.y, 1.0 - cellUv.y));
+      float line = 1.0 - smoothstep(0.0, 0.045, edge);
+      outRgb = mix(outRgb, vec3(0.85, 0.62, 0.28), line * 0.25);
+    }
   }
 
   gl_FragColor = vec4(outRgb, 1.0);
@@ -309,6 +387,9 @@ export class LightViewportRenderer {
     const gl = glCanvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false });
     if (!gl) throw new Error('WebGL not available');
     this.gl = gl;
+    // Detect HW GPU Timer extension (matches reference benchmark: EXT_disjoint_timer_query)
+    this.timerExt = gl.getExtension('EXT_disjoint_timer_query') || null;
+    this.timerLabel = this.timerExt ? 'HW GPU Timer (EXT_disjoint_timer_query)' : 'Isolated GPU Pass Timer (gl.finish)';
 
     const vs = this._compile(gl.VERTEX_SHADER, VERT_SRC);
     const fs = this._compile(gl.FRAGMENT_SHADER, FRAG_SRC);
@@ -332,26 +413,32 @@ export class LightViewportRenderer {
     this.loc = {};
     const names = [
       'uResolution', 'uCamPos', 'uCamRight', 'uCamUp', 'uCamFwd', 'uTanHalfFov',
-      'uViewMode', 'uCompareTarget', 'uErrorGain', 'uFloorRoughness', 'uHybridErrorGate',
-      'uGridRes', 'uShowGridLines', 'uShowHybridMask',
+      'uLightMode', 'uDebugView', 'uErrorGain', 'uFloorRoughness', 'uHybridErrorGate', 'uShowGridLines',
       'uRawCount', 'uRawPosFlux', 'uRawDirCone', 'uRawColor',
       'uApproxCount', 'uApproxPosFlux', 'uApproxDirCone', 'uApproxColor',
-      'uGridIrrTex', 'uGridDirTex', 'uIrrScale', 'uErrScale',
+      'uStaticPromoCount', 'uStaticPromoPosFlux', 'uStaticPromoDirCone', 'uStaticPromoColor',
+      'uFineIrrTex', 'uFineDirTex', 'uCoarseIrrTex', 'uCoarseDirTex',
+      'uFineBounds', 'uCoarseBounds', 'uClipScales',
     ];
     for (const n of names) this.loc[n] = gl.getUniformLocation(prog, n);
 
-    this.gridIrrTex = this._createGridTexture(0);
-    this.gridDirTex = this._createGridTexture(1);
-    this.irrScale = 4.0;
-    this.errScale = 2.0;
+    this.fineIrrTex = this._createTex(0);
+    this.fineDirTex = this._createTex(1);
+    this.coarseIrrTex = this._createTex(2);
+    this.coarseDirTex = this._createTex(3);
+    this.clipScales = new Float32Array([4, 2, 4, 2]);
+    this.fineBounds = new Float32Array([0, 0, 6, 16]);
+    this.coarseBounds = new Float32Array([0, 0, 12, 16]);
 
-    // Reusable typed arrays for light uploads
     this._rawPos = new Float32Array(MAX_LIGHTS * 4);
     this._rawDir = new Float32Array(MAX_LIGHTS * 4);
     this._rawCol = new Float32Array(MAX_LIGHTS * 4);
     this._appPos = new Float32Array(MAX_LIGHTS * 4);
     this._appDir = new Float32Array(MAX_LIGHTS * 4);
     this._appCol = new Float32Array(MAX_LIGHTS * 4);
+    this._proPos = new Float32Array(MAX_LIGHTS * 4);
+    this._proDir = new Float32Array(MAX_LIGHTS * 4);
+    this._proCol = new Float32Array(MAX_LIGHTS * 4);
   }
 
   _compile(type, src) {
@@ -365,7 +452,7 @@ export class LightViewportRenderer {
     return sh;
   }
 
-  _createGridTexture(unit) {
+  _createTex(unit) {
     const gl = this.gl;
     const tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0 + unit);
@@ -377,42 +464,44 @@ export class LightViewportRenderer {
     return tex;
   }
 
-  uploadBakedGrid(bakedGrid) {
+  _uploadCascade(casc, irrUnit, irrTex, dirUnit, dirTex) {
     const gl = this.gl;
-    const res = bakedGrid.gridRes;
+    const res = casc.res;
     const count = res * res;
-
-    // Compute dynamic max scale for crisp 8-bit normalized texture precision (works universally on all WebGL1/2 GPUs!)
-    let maxIrr = 0.5;
-    let maxErr = 0.25;
+    let maxIrr = 0.25, maxErr = 0.20;
     for (let i = 0; i < count; i++) {
-      maxIrr = Math.max(maxIrr, bakedGrid.texIrr[i * 4], bakedGrid.texIrr[i * 4 + 1], bakedGrid.texIrr[i * 4 + 2]);
-      maxErr = Math.max(maxErr, bakedGrid.texDir[i * 4 + 3]);
+      maxIrr = Math.max(maxIrr, casc.texIrr[i * 4], casc.texIrr[i * 4 + 1], casc.texIrr[i * 4 + 2]);
+      maxErr = Math.max(maxErr, casc.texDir[i * 4 + 3]);
     }
-    this.irrScale = maxIrr;
-    this.errScale = maxErr;
-
-    const bytesIrr = new Uint8Array(count * 4);
-    const bytesDir = new Uint8Array(count * 4);
+    const bIrr = new Uint8Array(count * 4);
+    const bDir = new Uint8Array(count * 4);
     for (let i = 0; i < count; i++) {
-      bytesIrr[i * 4 + 0] = Math.min(255, Math.round((bakedGrid.texIrr[i * 4 + 0] / maxIrr) * 255));
-      bytesIrr[i * 4 + 1] = Math.min(255, Math.round((bakedGrid.texIrr[i * 4 + 1] / maxIrr) * 255));
-      bytesIrr[i * 4 + 2] = Math.min(255, Math.round((bakedGrid.texIrr[i * 4 + 2] / maxIrr) * 255));
-      bytesIrr[i * 4 + 3] = Math.min(255, Math.round(bakedGrid.texIrr[i * 4 + 3] * 255));
+      bIrr[i * 4 + 0] = Math.min(255, Math.round((casc.texIrr[i * 4 + 0] / maxIrr) * 255));
+      bIrr[i * 4 + 1] = Math.min(255, Math.round((casc.texIrr[i * 4 + 1] / maxIrr) * 255));
+      bIrr[i * 4 + 2] = Math.min(255, Math.round((casc.texIrr[i * 4 + 2] / maxIrr) * 255));
+      bIrr[i * 4 + 3] = Math.min(255, Math.round(casc.texIrr[i * 4 + 3] * 255));
 
-      bytesDir[i * 4 + 0] = Math.min(255, Math.max(0, Math.round((bakedGrid.texDir[i * 4 + 0] * 0.5 + 0.5) * 255)));
-      bytesDir[i * 4 + 1] = Math.min(255, Math.max(0, Math.round((bakedGrid.texDir[i * 4 + 1] * 0.5 + 0.5) * 255)));
-      bytesDir[i * 4 + 2] = Math.min(255, Math.max(0, Math.round((bakedGrid.texDir[i * 4 + 2] * 0.5 + 0.5) * 255)));
-      bytesDir[i * 4 + 3] = Math.min(255, Math.round((bakedGrid.texDir[i * 4 + 3] / maxErr) * 255));
+      bDir[i * 4 + 0] = Math.min(255, Math.max(0, Math.round((casc.texDir[i * 4 + 0] * 0.5 + 0.5) * 255)));
+      bDir[i * 4 + 1] = Math.min(255, Math.max(0, Math.round((casc.texDir[i * 4 + 1] * 0.5 + 0.5) * 255)));
+      bDir[i * 4 + 2] = Math.min(255, Math.max(0, Math.round((casc.texDir[i * 4 + 2] * 0.5 + 0.5) * 255)));
+      bDir[i * 4 + 3] = Math.min(255, Math.round((casc.texDir[i * 4 + 3] / maxErr) * 255));
     }
+    gl.activeTexture(gl.TEXTURE0 + irrUnit);
+    gl.bindTexture(gl.TEXTURE_2D, irrTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, res, res, 0, gl.RGBA, gl.UNSIGNED_BYTE, bIrr);
 
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.gridIrrTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, res, res, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytesIrr);
+    gl.activeTexture(gl.TEXTURE0 + dirUnit);
+    gl.bindTexture(gl.TEXTURE_2D, dirTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, res, res, 0, gl.RGBA, gl.UNSIGNED_BYTE, bDir);
+    return [maxIrr, maxErr];
+  }
 
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.gridDirTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, res, res, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytesDir);
+  uploadToroidalClipmap(clipmap) {
+    const [fIrr, fErr] = this._uploadCascade(clipmap.fine, 0, this.fineIrrTex, 1, this.fineDirTex);
+    const [cIrr, cErr] = this._uploadCascade(clipmap.coarse, 2, this.coarseIrrTex, 3, this.coarseDirTex);
+    this.clipScales.set([fIrr, fErr, cIrr, cErr]);
+    this.fineBounds.set([clipmap.fine.centerX, clipmap.fine.centerZ, clipmap.fine.halfSpan, clipmap.fine.res]);
+    this.coarseBounds.set([clipmap.coarse.centerX, clipmap.coarse.centerZ, clipmap.coarse.halfSpan, clipmap.coarse.res]);
   }
 
   resize() {
@@ -429,13 +518,13 @@ export class LightViewportRenderer {
     this.gl.viewport(0, 0, w, h);
   }
 
-  render(cam, rawLights, approxLights, params) {
+  render(cam, rawLights, approxLights, staticPromoLights, params) {
     const gl = this.gl;
     this.resize();
     gl.useProgram(this.prog);
 
     const pack = (list, posArr, dirArr, colArr) => {
-      const n = Math.min(MAX_LIGHTS, list.length);
+      const n = Math.min(MAX_LIGHTS, list ? list.length : 0);
       for (let i = 0; i < n; i++) {
         const l = list[i];
         posArr[i * 4 + 0] = l.pos[0]; posArr[i * 4 + 1] = l.pos[1]; posArr[i * 4 + 2] = l.pos[2]; posArr[i * 4 + 3] = l.flux;
@@ -445,9 +534,6 @@ export class LightViewportRenderer {
       return n;
     };
 
-    const rawN = pack(rawLights, this._rawPos, this._rawDir, this._rawCol);
-    const appN = pack(approxLights, this._appPos, this._appDir, this._appCol);
-
     gl.uniform2f(this.loc.uResolution, this.glCanvas.width, this.glCanvas.height);
     gl.uniform3fv(this.loc.uCamPos, cam.pos);
     gl.uniform3fv(this.loc.uCamRight, cam.right);
@@ -455,42 +541,40 @@ export class LightViewportRenderer {
     gl.uniform3fv(this.loc.uCamFwd, cam.fwd);
     gl.uniform1f(this.loc.uTanHalfFov, cam.tanHalfFov);
 
-    gl.uniform1i(this.loc.uViewMode, params.viewMode);
-    gl.uniform1i(this.loc.uCompareTarget, params.compareTarget);
+    gl.uniform1i(this.loc.uLightMode, params.lightMode);
+    gl.uniform1i(this.loc.uDebugView, params.debugView);
     gl.uniform1f(this.loc.uErrorGain, params.errorGain);
     gl.uniform1f(this.loc.uFloorRoughness, params.floorRoughness);
     gl.uniform1f(this.loc.uHybridErrorGate, params.hybridErrorGate);
-    gl.uniform1f(this.loc.uGridRes, params.gridRes);
     gl.uniform1f(this.loc.uShowGridLines, params.showGrid ? 1.0 : 0.0);
-    gl.uniform1f(this.loc.uShowHybridMask, params.showHybridMask ? 1.0 : 0.0);
 
-    gl.uniform1i(this.loc.uRawCount, rawN);
+    gl.uniform1i(this.loc.uRawCount, pack(rawLights, this._rawPos, this._rawDir, this._rawCol));
     gl.uniform4fv(this.loc.uRawPosFlux, this._rawPos);
     gl.uniform4fv(this.loc.uRawDirCone, this._rawDir);
     gl.uniform4fv(this.loc.uRawColor, this._rawCol);
 
-    gl.uniform1i(this.loc.uApproxCount, appN);
+    gl.uniform1i(this.loc.uApproxCount, pack(approxLights, this._appPos, this._appDir, this._appCol));
     gl.uniform4fv(this.loc.uApproxPosFlux, this._appPos);
     gl.uniform4fv(this.loc.uApproxDirCone, this._appDir);
     gl.uniform4fv(this.loc.uApproxColor, this._appCol);
 
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.gridIrrTex);
-    gl.uniform1i(this.loc.uGridIrrTex, 0);
+    gl.uniform1i(this.loc.uStaticPromoCount, pack(staticPromoLights, this._proPos, this._proDir, this._proCol));
+    gl.uniform4fv(this.loc.uStaticPromoPosFlux, this._proPos);
+    gl.uniform4fv(this.loc.uStaticPromoDirCone, this._proDir);
+    gl.uniform4fv(this.loc.uStaticPromoColor, this._proCol);
 
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.gridDirTex);
-    gl.uniform1i(this.loc.uGridDirTex, 1);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.fineIrrTex);   gl.uniform1i(this.loc.uFineIrrTex, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.fineDirTex);   gl.uniform1i(this.loc.uFineDirTex, 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.coarseIrrTex); gl.uniform1i(this.loc.uCoarseIrrTex, 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.coarseDirTex); gl.uniform1i(this.loc.uCoarseDirTex, 3);
 
-    gl.uniform1f(this.loc.uIrrScale, this.irrScale);
-    gl.uniform1f(this.loc.uErrScale, this.errScale);
+    gl.uniform4fv(this.loc.uFineBounds, this.fineBounds);
+    gl.uniform4fv(this.loc.uCoarseBounds, this.coarseBounds);
+    gl.uniform4fv(this.loc.uClipScales, this.clipScales);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  /**
-   * Projects a 3D world point onto 2D overlay pixel coordinates matching the exact WebGL camera ray!
-   */
   project(cam, wx, wy, wz) {
     const w = this.overlayCanvas.width;
     const h = this.overlayCanvas.height;
@@ -500,20 +584,13 @@ export class LightViewportRenderer {
     if (z <= 0.1) return null;
     const x = rx * cam.right[0] + ry * cam.right[1] + rz * cam.right[2];
     const y = rx * cam.up[0] + ry * cam.up[1] + rz * cam.up[2];
-    const ndcX = x / (z * aspect * cam.tanHalfFov);
-    const ndcY = y / (z * cam.tanHalfFov);
-    return [(ndcX * 0.5 + 0.5) * w, (1.0 - (ndcY * 0.5 + 0.5)) * h, z];
+    return [((x / (z * aspect * cam.tanHalfFov)) * 0.5 + 0.5) * w, (1.0 - ((y / (z * cam.tanHalfFov)) * 0.5 + 0.5)) * h, z];
   }
 
-  /**
-   * Unprojects a 2D mouse click on the overlay canvas to the world floor plane (y = 0).
-   */
   unprojectToFloor(cam, clientX, clientY) {
     const rect = this.overlayCanvas.getBoundingClientRect();
-    const u = (clientX - rect.left) / Math.max(1, rect.width);
-    const v = 1.0 - (clientY - rect.top) / Math.max(1, rect.height);
-    const ndcX = u * 2.0 - 1.0;
-    const ndcY = v * 2.0 - 1.0;
+    const ndcX = ((clientX - rect.left) / Math.max(1, rect.width)) * 2.0 - 1.0;
+    const ndcY = (1.0 - (clientY - rect.top) / Math.max(1, rect.height)) * 2.0 - 1.0;
     const aspect = rect.width / Math.max(1, rect.height);
     const rdx = cam.fwd[0] + cam.right[0] * ndcX * aspect * cam.tanHalfFov + cam.up[0] * ndcY * cam.tanHalfFov;
     const rdy = cam.fwd[1] + cam.right[1] * ndcX * aspect * cam.tanHalfFov + cam.up[1] * ndcY * cam.tanHalfFov;
@@ -526,168 +603,98 @@ export class LightViewportRenderer {
     return [wx, wz];
   }
 
-  /**
-   * Draws crisp 3D-projected Light Debug Markers, Merge-Tree Links, Baked Directional Grid Arrows,
-   * and the Interactive Receiver Probe directly over the WebGL viewport!
-   */
   drawDebugOverlay(cam, opts) {
     const ctx = this.overlayCtx;
-    const w = this.overlayCanvas.width;
-    const h = this.overlayCanvas.height;
-    ctx.clearRect(0, 0, w, h);
+    ctx.clearRect(0, 0, this.overlayCanvas.width, this.overlayCanvas.height);
 
-    // 1) Visible Baked Directional Light Grid Arrows & Error Indicators
-    if (opts.showGrid && opts.bakedGrid) {
-      const g = opts.bakedGrid;
-      const step = g.gridRes > 16 ? 2 : 1;
-      for (let gz = 0; gz < g.gridRes; gz += step) {
-        for (let gx = 0; gx < g.gridRes; gx += step) {
-          const cell = g.cells[gz * g.gridRes + gx];
+    // 1) Toroidal Clipmap Fine-Cascade Dominant Direction Arrows
+    if ((opts.showGrid || opts.debugView === 2) && opts.clipmap) {
+      const fine = opts.clipmap.fine;
+      const step = fine.res > 14 ? 2 : 1;
+      for (let gz = 0; gz < fine.res; gz += step) {
+        for (let gx = 0; gx < fine.res; gx += step) {
+          const cell = fine.cells[gz * fine.res + gx];
           const p0 = this.project(cam, cell.cx, 0.08, cell.cz);
           if (!p0) continue;
-          const errNorm = Math.min(1.0, cell.cellError / Math.max(0.05, g.maxCellErr));
-          const len = (0.35 + cell.directionality * 0.72) * (g.cellSize * 0.45);
-          const p1 = this.project(
-            cam,
-            cell.cx + cell.domDir[0] * len,
-            0.08 + cell.domDir[1] * len * 0.5,
-            cell.cz + cell.domDir[2] * len
-          );
-
-          // Highlight high-error cells in coral/red, low-error cells in emerald/cyan
-          const r = Math.round(70 + errNorm * 185);
-          const gr = Math.round(215 - errNorm * 140);
-          const b = Math.round(145 - errNorm * 95);
-          ctx.strokeStyle = `rgba(${r},${gr},${b},0.78)`;
-          ctx.fillStyle = `rgba(${r},${gr},${b},0.85)`;
-          ctx.lineWidth = errNorm > 0.45 ? 1.7 : 1.1;
-
+          const errNorm = Math.min(1.0, cell.cellError / Math.max(0.05, fine.maxErr));
+          const len = (0.30 + cell.directionality * 0.65) * (fine.cellSize * 0.45);
+          const p1 = this.project(cam, cell.cx + cell.domDir[0] * len, 0.08 + cell.domDir[1] * len * 0.5, cell.cz + cell.domDir[2] * len);
+          ctx.strokeStyle = `rgba(${Math.round(55 + errNorm * 195)},${Math.round(220 - errNorm * 135)},${Math.round(235 - errNorm * 165)},0.75)`;
+          ctx.lineWidth = 1.25;
           if (p1) {
-            ctx.beginPath();
-            ctx.moveTo(p0[0], p0[1]);
-            ctx.lineTo(p1[0], p1[1]);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.arc(p1[0], p1[1], 2.0, 0, Math.PI * 2);
-            ctx.fill();
+            ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); ctx.stroke();
           }
         }
       }
     }
 
-    // 2) Light Debug Positions, Directions & Merge Tree Brackets
+    // 2) Light Positions, Static(Cyan) vs Dynamic(Gold) Badges, Cube-Grid Pods & Merge Lines
     if (opts.showLights) {
       if (opts.panelRole === 'truth') {
-        // Show all 32 raw emitters + emission direction ticks
         for (const l of opts.rawLights) {
           const p = this.project(cam, l.pos[0], l.pos[1], l.pos[2]);
           if (!p) continue;
-          const rgb = `rgb(${Math.round(l.color[0] * 255)},${Math.round(l.color[1] * 255)},${Math.round(l.color[2] * 255)})`;
-          ctx.fillStyle = rgb;
-          ctx.beginPath();
-          ctx.arc(p[0], p[1], 3.2, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-          ctx.lineWidth = 1;
-          ctx.stroke();
-
-          if (l.cosCone > -0.9) {
-            const pTip = this.project(cam, l.pos[0] + l.dir[0] * 1.1, l.pos[1] + l.dir[1] * 1.1, l.pos[2] + l.dir[2] * 1.1);
-            if (pTip) {
-              ctx.strokeStyle = rgb;
-              ctx.globalAlpha = 0.6;
-              ctx.beginPath();
-              ctx.moveTo(p[0], p[1]);
-              ctx.lineTo(pTip[0], pTip[1]);
-              ctx.stroke();
-              ctx.globalAlpha = 1.0;
-            }
-          }
+          const isStatic = l.mobility === 'static';
+          ctx.fillStyle = isStatic ? '#38d9f5' : '#ffb454';
+          ctx.beginPath(); ctx.arc(p[0], p[1], 3.0, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = '#000'; ctx.lineWidth = 0.8; ctx.stroke();
         }
       } else if (opts.panelRole === 'approx') {
-        // Show merged light nodes + dashed lines from each merged child emitter to its parent centroid!
         for (const node of opts.approxLights) {
           const pc = this.project(cam, node.pos[0], node.pos[1], node.pos[2]);
           if (!pc) continue;
-          const isBadMerge = Boolean(node.isNaiveWarning);
-          const strokeCol = isBadMerge ? '#ff5f56' : node.memberCount > 1 ? '#5bdb87' : '#ffb454';
+          const isBad = Boolean(node.isNaiveWarning);
+          const isPod = Boolean(node.isCubePod);
+          const ringCol = isBad ? '#ff5f56' : isPod ? '#38d9f5' : node.mobility === 'static' ? '#5bdb87' : '#ffb454';
 
-          // Draw merge lines to member emitters
-          const members = node.members || (node.memberIds ? node.memberIds.map((id) => opts.rawLights[id]).filter(Boolean) : []);
-          if (members.length > 1) {
+          if (node.members && node.members.length > 1) {
             ctx.save();
             ctx.setLineDash([3, 3]);
-            ctx.strokeStyle = isBadMerge ? 'rgba(255,95,86,0.75)' : 'rgba(91,219,135,0.58)';
-            ctx.lineWidth = 1.2;
-            for (const m of members) {
+            ctx.strokeStyle = isBad ? 'rgba(255,95,86,0.72)' : 'rgba(91,219,135,0.52)';
+            ctx.lineWidth = 1.1;
+            for (const m of node.members) {
               const pm = this.project(cam, m.pos[0], m.pos[1], m.pos[2]);
               if (!pm) continue;
-              ctx.beginPath();
-              ctx.moveTo(pm[0], pm[1]);
-              ctx.lineTo(pc[0], pc[1]);
-              ctx.stroke();
-              ctx.fillStyle = 'rgba(255,255,255,0.45)';
-              ctx.beginPath();
-              ctx.arc(pm[0], pm[1], 2.0, 0, Math.PI * 2);
-              ctx.fill();
+              ctx.beginPath(); ctx.moveTo(pm[0], pm[1]); ctx.lineTo(pc[0], pc[1]); ctx.stroke();
             }
             ctx.restore();
           }
 
-          // Merged node halo + core badge
-          ctx.strokeStyle = strokeCol;
-          ctx.lineWidth = 2.0;
-          ctx.beginPath();
-          ctx.arc(pc[0], pc[1], 6.5, 0, Math.PI * 2);
-          ctx.stroke();
-
+          ctx.strokeStyle = ringCol;
+          ctx.lineWidth = 1.8;
+          ctx.beginPath(); ctx.arc(pc[0], pc[1], isPod ? 7.5 : 6.0, 0, Math.PI * 2); ctx.stroke();
           ctx.fillStyle = `rgb(${Math.round(node.color[0] * 255)},${Math.round(node.color[1] * 255)},${Math.round(node.color[2] * 255)})`;
-          ctx.beginPath();
-          ctx.arc(pc[0], pc[1], 3.8, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.beginPath(); ctx.arc(pc[0], pc[1], 3.4, 0, Math.PI * 2); ctx.fill();
 
-          // Explicit label showing merge count (e.g. "10→1 CENTER BAD!" or "5→1")
           if (node.memberCount > 1) {
-            const label = isBadMerge ? `${node.memberCount}→1 MERGED @ CENTER!` : `${node.memberCount}→1`;
-            ctx.font = '600 9.5px "DM Sans", sans-serif';
-            const tw = ctx.measureText(label).width + 8;
-            ctx.fillStyle = isBadMerge ? 'rgba(120,22,22,0.88)' : 'rgba(16,24,20,0.84)';
-            ctx.fillRect(pc[0] - tw * 0.5, pc[1] - 22, tw, 14);
-            ctx.fillStyle = isBadMerge ? '#ffb4ae' : '#8ef0b0';
-            ctx.fillText(label, pc[0] - tw * 0.5 + 4, pc[1] - 12);
+            const tag = isBad
+              ? `${node.memberCount}→1 CENTER!`
+              : isPod
+                ? `POD ${node.memberCount}→1`
+                : `${node.mobility === 'dynamic' ? 'DYN' : 'STC'} ${node.memberCount}→1`;
+            ctx.font = '600 9px "DM Sans", sans-serif';
+            const tw = ctx.measureText(tag).width + 8;
+            ctx.fillStyle = isBad ? 'rgba(128,22,22,0.88)' : 'rgba(14,18,22,0.86)';
+            ctx.fillRect(pc[0] - tw * 0.5, pc[1] - 21, tw, 13);
+            ctx.fillStyle = isBad ? '#ffb4ae' : ringCol;
+            ctx.fillText(tag, pc[0] - tw * 0.5 + 4, pc[1] - 11.5);
           }
         }
       }
     }
 
-    // 3) Interactive Receiver Probe (shows live distance-LOD rays from clicked floor point!)
+    // 3) Interactive Receiver & Toroidal Clipmap Focus Probe
     if (opts.probePos) {
       const pp = this.project(cam, opts.probePos[0], 0.05, opts.probePos[1]);
       if (pp) {
-        if (opts.panelRole === 'approx' && (opts.approxMode === 'nanite' || opts.approxMode === 'hybrid')) {
-          ctx.strokeStyle = 'rgba(255,180,84,0.34)';
-          ctx.lineWidth = 1.0;
-          for (const node of opts.approxLights) {
-            const pc = this.project(cam, node.pos[0], node.pos[1], node.pos[2]);
-            if (!pc) continue;
-            ctx.beginPath();
-            ctx.moveTo(pp[0], pp[1]);
-            ctx.lineTo(pc[0], pc[1]);
-            ctx.stroke();
-          }
-        }
         ctx.strokeStyle = '#ffb454';
         ctx.lineWidth = 2.0;
-        ctx.beginPath();
-        ctx.arc(pp[0], pp[1], 8.5, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.beginPath(); ctx.arc(pp[0], pp[1], 8.0, 0, Math.PI * 2); ctx.stroke();
         ctx.fillStyle = '#ffb454';
-        ctx.beginPath();
-        ctx.arc(pp[0], pp[1], 2.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.font = '600 9.5px "DM Sans", sans-serif';
-        ctx.fillStyle = '#ffd599';
-        ctx.fillText(`PROBE (${opts.probePos[0].toFixed(1)}, ${opts.probePos[1].toFixed(1)})`, pp[0] + 11, pp[1] + 3);
+        ctx.beginPath(); ctx.arc(pp[0], pp[1], 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.font = '600 9px "DM Sans", sans-serif';
+        ctx.fillStyle = '#ffd699';
+        ctx.fillText(`CLIPMAP FOCUS (${opts.probePos[0].toFixed(1)}, ${opts.probePos[1].toFixed(1)})`, pp[0] + 10, pp[1] + 3);
       }
     }
   }

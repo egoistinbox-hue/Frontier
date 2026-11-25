@@ -293,9 +293,9 @@ export function buildStaticEnvironmentGeometry(envPreset) {
 
   // Environment architectural walls / calibration cutoff screen
   if (envPreset === 0) {
-    // Lobby 1: Dark Cyclorama walls + front calibration wall
+    // Lobby 1: Dark Cyclorama walls + front calibration wall (seamless corner join)
     b.addBox(0.0, 1.9, 7.6, 6.8, 1.9, 0.18, 2.0);
-    b.addBox(-6.8, 2.0, 1.0, 0.2, 2.0, 6.8, 2.0);
+    b.addBox(-6.8, 2.0, 0.4, 0.2, 2.0, 7.3, 2.0);
     b.addBox(0.0, 2.0, -6.8, 6.8, 2.0, 0.2, 2.0);
   } else if (envPreset === 1) {
     // Lobby 2: Sunlit Forest Stage + sculpted tree trunks casting crisp solar/GDF shadows

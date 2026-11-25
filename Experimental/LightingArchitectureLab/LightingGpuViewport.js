@@ -707,15 +707,27 @@ const REALTIME_FRAGMENT_SRC =
   SURFACE_GLSL_COMMON +
   `
 vec3 evalClusterTailApprox(
-  vec3 center, vec3 rgbPow, vec3 P, vec3 N, vec3 albedo, float metallic
+  vec4 n0, vec4 n1, vec4 n2, vec4 n3, vec3 P, vec3 N, vec3 albedo, float metallic
 ) {
   if (uDebugLens == 5) return vec3(0.0);
-  vec3 toC = center - P;
-  float d2 = max(dot(toC, toC), 0.75);
+  vec3 center = 0.5 * (n0.xyz + n1.xyz);
+  vec3 delta = P - center;
+  float d2 = max(dot(delta, delta), 0.75);
   float dist = sqrt(d2);
-  vec3 cDir = toC / dist;
-  float nDotC = clamp(dot(N, cDir), 0.0, 1.0);
-  return (albedo * (1.0 - metallic) / PI) * (rgbPow / (4.0 * PI * d2)) * nDotC * 0.78;
+  vec3 dirFromCluster = delta / dist;
+  float nDotC = clamp(dot(N, -dirFromCluster), 0.0, 1.0);
+
+  // Respect directional beam/emission cone (n2.xyz = axis, n2.w = cosSpread, n3.w = cosCutoff)
+  // so spotlights/softboxes fading into the tail never emit fake backward/sideways light onto walls!
+  float thetaO = acos(clamp(n2.w, -0.99999, 0.99999));
+  float thetaCut = acos(clamp(n3.w, -0.99999, 0.99999));
+  float theta = acos(clamp(dot(n2.xyz, dirFromCluster), -0.99999, 0.99999));
+  float coneAtten = (thetaCut >= 3.05)
+    ? 1.0
+    : (1.0 - smoothstep(max(0.0, thetaO * 0.4), min(PI, thetaCut + thetaO + 0.15), theta));
+  float rangeRoll = 1.0 / (1.0 + d2 * 0.025);
+
+  return (albedo * (1.0 - metallic) / PI) * (n3.rgb / (4.0 * PI * d2)) * nDotC * coneAtten * rangeRoll * 0.55;
 }
 
 vec3 shadePointRealTime(
@@ -741,11 +753,11 @@ vec3 shadePointRealTime(
 
   if (uLuminaireCount <= 0) return total;
 
-  const int MAX_CAND = 14;
-  int candIds[14] = int[14](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-  int candCells[14] = int[14](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-  float candScores[14] = float[14](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-  float candWeights[14] = float[14](1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+  const int MAX_CAND = 16;
+  int candIds[16] = int[16](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  int candCells[16] = int[16](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  float candScores[16] = float[16](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  float candWeights[16] = float[16](1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
   int candCount = 0;
   int evalCount = 0;
   float candMult = 1.0;
@@ -787,7 +799,7 @@ vec3 shadePointRealTime(
     total += vec3(1.6, 0.14, 0.08) * exp(-dot(ghostDelta, ghostDelta) * 0.55) * length(uCarPos - uPrevCarPos) * 14.0;
   } else {
     int targetBudget = (uSchedulerMode == 1 || uRenderEngine == 1) ? 6 : 10;
-    int collectGoal = min(targetBudget + 2, MAX_CAND);
+    int collectGoal = min(targetBudget + 4, MAX_CAND);
     const int QMAX = 24;
     int qCells[24] = int[24](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     float qScores[24] = float[24](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -801,7 +813,7 @@ vec3 shadePointRealTime(
       qSize = 1;
     }
 
-    for (int iter = 0; iter < 40; ++iter) {
+    for (int iter = 0; iter < 48; ++iter) {
       if (qSize <= 0 || candCount >= collectGoal) break;
       int bestSlot = 0;
       float bestScore = qScores[0];
@@ -836,7 +848,7 @@ vec3 shadePointRealTime(
         qScores[qSize] = partitionCellImportance(evalP, N, rn0, rn1, rn2, rn3);
         qSize++;
       } else {
-        tailApprox += evalClusterTailApprox(0.5 * (n0.xyz + n1.xyz), n3.rgb, evalP, N, albedo, metallic);
+        tailApprox += evalClusterTailApprox(n0, n1, n2, n3, evalP, N, albedo, metallic);
       }
     }
 
@@ -859,7 +871,7 @@ vec3 shadePointRealTime(
       maxQScore = max(maxQScore, qScores[r]);
       vec4 n0, n1, n2, n3;
       fetchPartitionCell(qCells[r], n0, n1, n2, n3);
-      tailApprox += evalClusterTailApprox(0.5 * (n0.xyz + n1.xyz), n3.rgb, evalP, N, albedo, metallic);
+      tailApprox += evalClusterTailApprox(n0, n1, n2, n3, evalP, N, albedo, metallic);
     }
 
     evalCount = min(candCount, targetBudget);
@@ -870,20 +882,20 @@ vec3 shadePointRealTime(
       if (extra < evalCount || extra >= candCount) continue;
       vec4 cn0, cn1, cn2, cn3;
       fetchPartitionCell(candCells[extra], cn0, cn1, cn2, cn3);
-      tailApprox += evalClusterTailApprox(0.5 * (cn0.xyz + cn1.xyz), cn3.rgb, evalP, N, albedo, metallic);
+      tailApprox += evalClusterTailApprox(cn0, cn1, cn2, cn3, evalP, N, albedo, metallic);
     }
 
-    // Smooth C0/C1 rank weight across cutoff threshold so ZERO Voronoi seams can occur!
+    // Narrow C0/C1 feather ONLY near the cutoff boundary so active high-priority lights retain 100% weight!
     for (int i = 0; i < MAX_CAND; ++i) {
       if (i >= evalCount) break;
       float w = (cutFloor > 1e-6)
-        ? smoothstep(cutFloor, cutFloor * 1.65, candScores[i])
+        ? smoothstep(cutFloor * 0.96, cutFloor * 1.14, candScores[i])
         : 1.0;
       candWeights[i] = w;
       if (w < 0.999) {
         vec4 cn0, cn1, cn2, cn3;
         fetchPartitionCell(candCells[i], cn0, cn1, cn2, cn3);
-        tailApprox += (1.0 - w) * evalClusterTailApprox(0.5 * (cn0.xyz + cn1.xyz), cn3.rgb, evalP, N, albedo, metallic);
+        tailApprox += (1.0 - w) * evalClusterTailApprox(cn0, cn1, cn2, cn3, evalP, N, albedo, metallic);
       }
     }
   }

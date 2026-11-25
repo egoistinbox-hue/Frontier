@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frontier · Botanical Workbench (Project Zero Editor UI)</title>
+  <link rel="stylesheet" href="./BotanicalWorkbench.css" />
+</head>
+<body>
+  <div id="Editor">
+    <!-- Trapezoidal Tab Strip matching Frontier PatchA-PatchG + Project Zero Notch -->
+    <div class="tab-strip">
+      <div class="document-tab active" data-tab="botany">
+        <span class="tab-dot"></span>
+        <span>Untitled · MainWorld</span>
+      </div>
+      <div class="document-tab" data-tab="wind">
+        <span class="tab-dot amber"></span>
+        <span>Global WindField</span>
+      </div>
+      <div class="document-tab" data-tab="cluster">
+        <span>Cluster · UV</span>
+      </div>
+      <div class="document-tab" data-tab="sdf">
+        <span>SDF · GDF</span>
+      </div>
+
+      <div class="top-notch">
+        <span class="tab-dot"></span>
+        <span>Frontier</span>
+        <b>Botanical Workbench</b>
+        <span id="NotchSpeciesLabel">English Oak</span>
+      </div>
+
+      <div class="tab-strip-right">
+        <span>37 Slate Species · 1 Shared WindField · 128-Tri Clusters</span>
+      </div>
+    </div>
+
+    <!-- 3-Column Project Zero Workspace Split -->
+    <div class="workspace-body">
+      <!-- LEFT DOCK: Redesigned Frontier Editor Outliner -->
+      <aside class="dock left">
+        <div class="outliner-heading">
+          <h1>Outliner</h1>
+          <small id="OutlinerCountLabel">9 items</small>
+          <button id="BtnRandomizeSeed" title="Generate new specimen seed">+</button>
+        </div>
+
+        <div class="stats">
+          <div class="stat-tile green-accent">
+            <small>Instances</small>
+            <b id="StatInstances">1</b>
+          </div>
+          <div class="stat-tile">
+            <small>Clusters</small>
+            <b id="StatClusters">0</b>
+          </div>
+          <div class="stat-tile">
+            <small>SDF Proxies</small>
+            <b id="StatSdfProxies">0</b>
+          </div>
+        </div>
+
+        <div class="outliner-search">
+          <label>
+            <span>&#128269;</span>
+            <input id="OutlinerSearchInput" type="text" placeholder="Filter Untitled world..." />
+          </label>
+        </div>
+
+        <div class="filter-chips" id="OutlinerFilters">
+          <button class="active" data-filter="all">All</button>
+          <button data-filter="wood">Wood</button>
+          <button data-filter="foliage">Foliage</button>
+          <button data-filter="wind">Wind</button>
+          <button data-filter="sdf">SDF</button>
+        </div>
+
+        <div class="outliner-rows" id="OutlinerRows"></div>
+
+        <div class="outliner-footer">
+          <span>
+            <small>WORLD</small>
+            <b>LIVE</b>
+          </span>
+          <span>
+            <small>FPS</small>
+            <b id="FooterFps">60</b>
+          </span>
+          <span>
+            <small>DRAW CALLS</small>
+            <b id="FooterDrawCalls">4</b>
+          </span>
+          <span>
+            <small>LEAF MODE</small>
+            <b id="FooterLeafMode">Analytic</b>
+          </span>
+        </div>
+      </aside>
+
+      <!-- CENTER DOCK: 3D WebGL Viewport -->
+      <main class="viewport-dock">
+        <div class="viewport-toolbar">
+          <div class="seg-group" id="RenderModeGroup">
+            <button class="active" data-mode="pbr">OpenPBR</button>
+            <button data-mode="clusters">Clusters</button>
+            <button data-mode="uv">UV Checker</button>
+            <button data-mode="sdf">SDF Proxies</button>
+            <button data-mode="wind">Wind Vectors</button>
+            <button data-mode="fracture">Fracture</button>
+          </div>
+
+          <div class="seg-group" id="ForestScaleGroup">
+            <button class="active" data-forest="1">Hero (1)</button>
+            <button data-forest="64">Grove (64)</button>
+            <button data-forest="10240">Forest (10,240)</button>
+          </div>
+        </div>
+
+        <div class="viewport-canvas-wrap">
+          <canvas id="ViewportCanvas"></canvas>
+
+          <div class="viewport-hud">
+            <div class="hud-chip">
+              <span>WindField</span>
+              <b id="HudWindReadout">6.5 m/s · 35°</b>
+              <span class="ok" id="HudWindSync">Wood + Leaves + SDF Locked</span>
+            </div>
+            <div class="hud-chip" id="HudFractureChip" style="display: none;">
+              <span>Fracture</span>
+              <b id="HudFractureStatus">Intact</b>
+            </div>
+          </div>
+
+          <!-- Live 2D Global Distance Field (GDF) XY Section -->
+          <div class="gdf-overlay-box" id="GdfOverlayBox">
+            <header>
+              <span>Live GDF Section</span>
+              <span style="color:#34c759;">Wind-Synced</span>
+            </header>
+            <canvas id="GdfSectionCanvas" width="168" height="120"></canvas>
+            <footer>
+              <span id="GdfCapsuleTag">Capsules: 0</span>
+              <span id="GdfLobeTag">Lobes: 0</span>
+            </footer>
+          </div>
+        </div>
+
+        <div class="viewport-footer">
+          <span>MODE <b class="green" id="VpFooterMode">OpenPBR</b></span>
+          <span>TRIANGLES <b id="VpFooterTris">0</b></span>
+          <span>128-TRI CLUSTERS <b id="VpFooterClusters">0</b></span>
+          <span>LEAVES <b id="VpFooterLeaves">0</b></span>
+          <span>FOREST <b id="VpFooterForest">1</b></span>
+          <span>GEN <b id="VpFooterGenMs">0.0 ms</b></span>
+        </div>
+      </main>
+
+      <!-- RIGHT DOCK: Redesigned Project Zero Inspector -->
+      <aside class="dock right">
+        <div class="inspector-header">
+          <div class="inspector-title-row">
+            <h2 id="InspectorTitle">Botanical Specimen</h2>
+            <small id="InspectorBadge">Weber-Penn</small>
+          </div>
+          <div class="inspector-tabs" id="InspectorTabs">
+            <button class="active" data-pane="botany">Botany</button>
+            <button data-pane="wind">Wind</button>
+            <button data-pane="cluster">Cluster·UV</button>
+            <button data-pane="fracture">Fracture</button>
+            <button data-pane="sdf">SDF·GDF</button>
+          </div>
+        </div>
+
+        <div class="inspector-scroll">
+          <!-- PANE 1: BOTANY & 37 SLATE PRESETS -->
+          <div class="insp-pane active" id="Pane-botany">
+            <section class="insp-section">
+              <h4>Species Preset <span>37 Slate</span></h4>
+              <div class="field-row">
+                <div class="field-label">
+                  <span>Botanical Species</span>
+                  <output id="OutSpeciesGroup">Oaks</output>
+                </div>
+                <select id="SelectSpecies"></select>
+              </div>
+              <div class="button-row">
+                <button id="BtnPrevSpecies">&larr; Prev</button>
+                <button id="BtnNextSpecies">Next &rarr;</button>
+                <button id="BtnNewSeed" class="primary">New Seed</button>
+              </div>
+            </section>
+
+            <section class="insp-section">
+              <h4>Leaf Shuffle Solver <span>1 WindField</span></h4>
+              <div class="seg-group" id="LeafModeGroup" style="width:100%;">
+                <button class="active" data-leafmode="0" style="flex:1;">Analytic</button>
+                <button data-leafmode="1" style="flex:1;">VAT Sheet</button>
+                <button data-leafmode="2" style="flex:1;">Hero XPBD</button>
+              </div>
+              <div class="metric-grid">
+                <div class="metric-box">
+                  <small>Best For</small>
+                  <b id="LeafModeScope">10,000+ Forest</b>
+                </div>
+                <div class="metric-box">
+                  <small>GPU Cost / 10k</small>
+                  <b id="LeafModeCost">~0.4 ms</b>
+                </div>
+              </div>
+            </section>
+
+            <section class="insp-section">
+              <h4>Morphology Overrides</h4>
+              <div class="field-row">
+                <div class="field-label"><span>Scale Multiplier</span><output id="OutScaleMul">1.00x</output></div>
+                <input id="RangeScaleMul" type="range" min="0.5" max="1.6" step="0.05" value="1.0" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Branching Depth</span><output id="OutLevels">4</output></div>
+                <input id="RangeLevels" type="range" min="1" max="4" step="1" value="4" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Leaf Scale</span><output id="OutLeafScale">1.00x</output></div>
+                <input id="RangeLeafScale" type="range" min="0.4" max="2.0" step="0.05" value="1.0" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Trunk Flare</span><output id="OutFlare">1.10</output></div>
+                <input id="RangeFlare" type="range" min="0.0" max="2.5" step="0.05" value="1.1" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Vertical Tropism</span><output id="OutTropism">0.35</output></div>
+                <input id="RangeTropism" type="range" min="-1.5" max="1.5" step="0.05" value="0.35" />
+              </div>
+            </section>
+          </div>
+
+          <!-- PANE 2: SINGLE SHARED WINDFIELD -->
+          <div class="insp-pane" id="Pane-wind">
+            <section class="insp-section">
+              <h4>Unified WindField <span>Shared</span></h4>
+              <div class="wind-compass-wrap">
+                <canvas id="WindCompassCanvas" width="82" height="82"></canvas>
+                <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
+                  <div class="field-row">
+                    <div class="field-label"><span>Azimuth</span><output id="OutWindDir">35°</output></div>
+                    <input id="RangeWindDir" type="range" min="0" max="360" step="1" value="35" />
+                  </div>
+                  <div class="field-row">
+                    <div class="field-label"><span>Speed</span><output id="OutWindSpeed">6.5 m/s</output></div>
+                    <input id="RangeWindSpeed" type="range" min="0" max="24" step="0.5" value="6.5" />
+                  </div>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Gust Strength</span><output id="OutWindGust">0.45</output></div>
+                <input id="RangeWindGust" type="range" min="0" max="1.5" step="0.05" value="0.45" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Wave Frequency</span><output id="OutWindFreq">0.55 Hz</output></div>
+                <input id="RangeWindFreq" type="range" min="0.1" max="2.0" step="0.05" value="0.55" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Forest Wavelength</span><output id="OutWindWave">28 m</output></div>
+                <input id="RangeWindWave" type="range" min="8" max="80" step="2" value="28" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Turbulence</span><output id="OutWindTurb">0.35</output></div>
+                <input id="RangeWindTurb" type="range" min="0" max="1.2" step="0.05" value="0.35" />
+              </div>
+              <label class="toggle-row">
+                <span>Traveling Vortex Swirl</span>
+                <input id="ToggleVortex" type="checkbox" />
+              </label>
+              <label class="toggle-row">
+                <span>Show 3D Wind Vector Grid</span>
+                <input id="ToggleWindArrows" type="checkbox" />
+              </label>
+            </section>
+
+            <section class="insp-section">
+              <h4>Structural Flex Weights</h4>
+              <div class="field-row">
+                <div class="field-label"><span>Trunk Cantilever Flex</span><output id="OutTrunkFlex">1.00</output></div>
+                <input id="RangeTrunkFlex" type="range" min="0" max="2.5" step="0.05" value="1.0" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Limb Pivot Flex</span><output id="OutLimbFlex">1.00</output></div>
+                <input id="RangeLimbFlex" type="range" min="0" max="2.5" step="0.05" value="1.0" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Twig & Leaf Flutter</span><output id="OutDetailFlex">1.00</output></div>
+                <input id="RangeDetailFlex" type="range" min="0" max="2.5" step="0.05" value="1.0" />
+              </div>
+            </section>
+          </div>
+
+          <!-- PANE 3: LOD CLUSTER & UV UNWRAP -->
+          <div class="insp-pane" id="Pane-cluster">
+            <section class="insp-section">
+              <h4>128-Tri Cluster Pyramid <span>VisBuffer</span></h4>
+              <div class="field-row">
+                <div class="field-label"><span>Active LOD Cut</span><output id="OutLodTier">LOD 0 (Hero)</output></div>
+                <input id="RangeLodTier" type="range" min="0" max="3" step="1" value="0" />
+              </div>
+              <div class="metric-grid">
+                <div class="metric-box"><small>Bark Clusters</small><b id="MetricBarkClusters">0</b></div>
+                <div class="metric-box"><small>Foliage Clusters</small><b id="MetricLeafClusters">0</b></div>
+                <div class="metric-box"><small>Bark Triangles</small><b id="MetricBarkTris">0</b></div>
+                <div class="metric-box"><small>Foliage Triangles</small><b id="MetricLeafTris">0</b></div>
+              </div>
+              <label class="toggle-row">
+                <span>Show Cluster Bounding Spheres</span>
+                <input id="ToggleClusterSpheres" type="checkbox" />
+              </label>
+            </section>
+
+            <section class="insp-section">
+              <h4>UV Unwrap & PBR Materials</h4>
+              <div class="field-row">
+                <div class="field-label"><span>Bark Cylindrical UV Scale</span><output id="OutUvScale">1.00x</output></div>
+                <input id="RangeUvScale" type="range" min="0.4" max="3.0" step="0.1" value="1.0" />
+              </div>
+              <div class="swatch-strip">
+                <div class="swatch-box">
+                  <canvas id="SwatchBark" width="128" height="128"></canvas>
+                  <small>Bark Cylindrical UV</small>
+                </div>
+                <div class="swatch-box">
+                  <canvas id="SwatchLeaf" width="128" height="128"></canvas>
+                  <small>Foliage Alpha Sheet</small>
+                </div>
+              </div>
+              <button id="BtnToggleUvMode" style="width:100%;">Toggle UV Checker View</button>
+            </section>
+          </div>
+
+          <!-- PANE 4: TRUNK & LIMB FRACTURE -->
+          <div class="insp-pane" id="Pane-fracture">
+            <section class="insp-section">
+              <h4>Voronoi Trunk Fracture <span>Physics</span></h4>
+              <div class="field-row">
+                <div class="field-label"><span>Break Height</span><output id="OutCutHeight">28%</output></div>
+                <input id="RangeCutHeight" type="range" min="0.12" max="0.72" step="0.02" value="0.28" />
+              </div>
+              <div class="field-row">
+                <div class="field-label"><span>Snap Impulse</span><output id="OutSnapImpulse">1.00x</output></div>
+                <input id="RangeSnapImpulse" type="range" min="0.4" max="2.5" step="0.1" value="1.0" />
+              </div>
+              <div class="button-row">
+                <button id="BtnTriggerFracture" class="danger">Snap Trunk</button>
+                <button id="BtnResetFracture">Restore</button>
+              </div>
+              <div class="metric-grid">
+                <div class="metric-box"><small>Lower Stump Tris</small><b id="MetricStumpTris">-</b></div>
+                <div class="metric-box"><small>Falling Crown Tris</small><b id="MetricCrownTris">-</b></div>
+                <div class="metric-box"><small>Splinter Shards</small><b id="MetricSplinters">0</b></div>
+                <div class="metric-box"><small>Crown Tilt</small><b id="MetricCrownTilt">0.0°</b></div>
+              </div>
+            </section>
+          </div>
+
+          <!-- PANE 5: ANALYTICAL SDF & GLOBAL DISTANCE FIELD -->
+          <div class="insp-pane" id="Pane-sdf">
+            <section class="insp-section">
+              <h4>Analytical SDF Proxies <span>Wind-Driven</span></h4>
+              <label class="toggle-row">
+                <span>Show 3D Capsules & Canopy Lobes</span>
+                <input id="ToggleSdfGizmos" type="checkbox" />
+              </label>
+              <label class="toggle-row">
+                <span>Show Live GDF Cross-Section</span>
+                <input id="ToggleGdfPanel" type="checkbox" checked />
+              </label>
+              <div class="field-row">
+                <div class="field-label"><span>Canopy Smooth-Union k</span><output id="OutSmoothK">0.65 m</output></div>
+                <input id="RangeSmoothK" type="range" min="0.1" max="1.6" step="0.05" value="0.65" />
+              </div>
+              <div class="metric-grid">
+                <div class="metric-box"><small>Wood Capsules</small><b id="MetricCapsules">0</b></div>
+                <div class="metric-box"><small>Canopy Lobes</small><b id="MetricLobes">0</b></div>
+                <div class="metric-box"><small>Proxy Buffer / Tree</small><b>1.76 KB</b></div>
+                <div class="metric-box"><small>Voxel Grid Avoided</small><b>48.0 MB</b></div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div class="inspector-footer">
+          <span id="InspectorFooterSel">Selected: <b>English Oak</b></span>
+          <span id="InspectorFooterMem">GDF Proxy: <b>1.76 KB</b></span>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../UVEditor/Vendor/three.esm.min.js",
+        "three/addons/controls/OrbitControls.js": "../UVEditor/Vendor/orbit-controls.esm.min.js"
+      }
+    }
+  </script>
+  <script type="module" src="./BotanicalWorkbench.js"></script>
+</body>
+</html>

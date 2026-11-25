@@ -9,6 +9,7 @@
 | Directory | Prototype Scope | Native C++20 / `.slang` Target |
 | :--- | :--- | :--- |
 | **`ProjectZeroEditor/`** | Primary Project-Zero HTML/JS UI specification uniting trapezoidal dock tabs, top Notch, Outliner tree, Construct drawer, and Light/Fog/Wind/Material inspectors. | `Engine/Components/` + `Engine/Lifecycle/EditorLifecycle.*` |
+| **`BotanicalWorkbench/`** | Project-Zero UI interactive botanical authoring workbench: all 37 Slate Weber & Penn species, 1 shared WindField, 128-tri LOD clusters, UV checker, Voronoi trunk fracture, 10,240-instance GPU forest, and live wind-synced analytical SDF/GDF section. | `Engine/GeometrySpace/Botanical/` + `Projects/Untitled/` |
 | **`FrontierWorldMirror/`** | Bidirectional 1:1 HTML mirror of the C++20 World Editor rendering the Cornell-Studio Gallery with interactive `EditorCamera` + Outliner/Inspector sync. | `Engine/GeometricRaster/GlobalIllumination/ShowcaseGalleryScene.{h,cpp}` + `TieredWorldRenderSequence.{h,cpp}` |
 | **`ProjectBrowser/`** | Reference HTML launcher for `.ProjectSpace` filtering, sorting, revision display, and workspace launch. | `Engine/Editor/Explorer/ProjectBrowser.{h,cpp}` |
 | **`FrontierEditor/`** | Initial HTML/Vite scene inspector (`index.html`), CAD workbench (`cad.html`), and SVG icon sheet (`icons.html`). | `Engine/Components/` + `Engine/Workspaces/` |

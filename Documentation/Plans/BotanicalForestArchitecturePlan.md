@@ -1,176 +1,111 @@
-# 🧩 Botanical Forest Architecture Plan — Slate Port, Unified WindField, Clusters, Fracture, UV & Wind-SDF
+# 🧩 Botanical Procedural Geometry & 3-Tier Forest Plan (`Engine/GeometrySpace/Procedural/`)
 
-> **TL;DR**: Port all **37 Weber & Penn botanical presets** from `unassignedinbox/Slate` (`arena/01a096c9-slate`) into `Engine/GeometrySpace/Botanical/` and wire them into `Projects/Untitled/` reusing Frontier's **existing** `OutlinerPanel`, `InspectorPanel`, `ForceFieldRegister` (1 shared WindField), `ClusterPyramid` + `VisibilityClusterRasterization` (128-tri HW/SW VisBuffer — no separate Nanite rewrite needed), `UVWorkspace`, `FractureWorkspace`, `VertexAtlasFleetTable`, and `VulkanWorldRenderSequence` 3D Global Distance Field (`GdfFineImage3D` / `GdfCoarseImage3D`). Drive **all** wood sway, leaf shuffle, VAT playback, hero XPBD impulses, and **wind-displaced analytical SDF capsules + canopy sphere lobes** from the **exact same 1 WindField**.
+> **TL;DR**: Upgrade the existing starter `ProceduralTreeGenerator` (`"procedural.tree"`) inside **`Engine/GeometrySpace/Procedural/`** into a Weber & Penn botanical generator (ported from `unassignedinbox/Slate`, converted to Frontier Right-Hand `+Z` Up) scoped to **3 representative species (`English Oak`, `Scots Pine`, `Quaking Aspen`)** across **3 distance tiers (`Tier 0 · Tier 1 · Tier 2`)**. Drive **all** sway, leaf rustle, fracture wind-torque, and analytical SDF proxies from **1 shared WindField (`ForceFieldRegister`)**, using **1 canonical `+X` Wind-Direction Sway VAT LUT** (azimuth-rotated at runtime) + **1 seamless Rustle VAT** (multi-scale, multi-phase, 2-octave self-blended) occupying **`~4.2 MB` total VRAM** across `6 / 16` slots of the existing `VertexAtlasFleetTable`.
 
-**Interactive HTML Reference Workbench (Project Zero Editor UI):** [`Experimental/BotanicalWorkbench/index.html`](../../Experimental/BotanicalWorkbench/index.html) (`37` Slate species · `1` shared WindField · `128`-tri Clusters · UV Checker · Interactive Voronoi Fracture · `10,240`-instance GPU Forest · Live Wind-Synced GDF Section).
-
----
-
-## 🏷️ 1. End-to-End Frontier Integration Layout
-
-```
-                        ┌──────────────────────────────────────────────────────┐
-                        │   1 SHARED WINDFIELD (ForceFieldRegister + Uploader) │
-                        │   Prevailing Vector · Traveling Gust Wave · Vortex   │
-                        └──────┬───────────────┬──────────────┬───────────┬────┘
-                               │               │              │           │
-           ┌───────────────────▼───┐   ┌───────▼────────┐  ┌──▼────────┐ ┌▼────────────────────────┐
-           │ WeberPennBotanical    │   │ Leaf Shuffle   │  │ Fracture  │ │ Analytical Wind-SDF     │
-           │ (37 Slate Presets)    │   │ Tiered Solver  │  │ Coupling  │ │ 12 Wood Capsules +      │
-           │ · Cylindrical Bark UV │   │ · Hero: XPBD   │  │ · Voronoi │ │ 16 Canopy Sphere Lobes  │
-           │ · Foliage Alpha Sheet │   │ · Mid:  VAT    │  │   Collar  │ │ (1.76 KB / specimen)    │
-           │ · aWind + aPivot      │   │ · Far:  Analyt │  │ · Jolt RB │ │ Displaced by WindField  │
-           └──────────┬────────────┘   └───────┬────────┘  └──┬────────┘ └┬────────────────────────┘
-                      │                        │              │           │
-                      ▼                        ▼              ▼           ▼
-           ┌────────────────────────────────────────────────────────┐  ┌───────────────────────────┐
-           │ Existing Frontier ClusterPyramid (128-Tri Clusters)    │  │ Existing GDF 64³ Clipmap  │
-           │ + ClusterCullEncoder (Hi-Z) + VisibilityClusterRaster  │  │ (GdfFine3D / GdfCoarse3D) │
-           │ + VisibilityMaterialResolve (Zero G-Buffer OpenPBR)    │  │ Splat Capsules + smin     │
-           └───────────────────────────┬────────────────────────────┘  └───────────────────────────┘
-                                       │
-                                       ▼
-           ┌────────────────────────────────────────────────────────┐
-           │ Projects/Untitled/MainWorld.WorldSpace                 │
-           │ · Existing Engine/Components/Panes/OutlinerPanel       │
-           │ · Existing Engine/Components/Panes/InspectorPanel      │
-           └────────────────────────────────────────────────────────┘
-```
+**Interactive HTML Reference Workbench (Project Zero Editor UI):** [`Experimental/BotanicalWorkbench/index.html`](../../Experimental/BotanicalWorkbench/index.html) (`:8081`) · **Markdown Studio:** (`:8080`)
 
 ---
 
-## 🏆 2. Decision 1 — Leaf Shuffle & Sway for 10,000+ Forest Specimens (`VAT` vs. `XPBD` vs. `Analytic`)
+## 🏷️ 1. Exact Repository Placement & Existing Engine Reuse
 
-Legend: **GPU Cost / Memory:** `✔️` = Lowest (best), `🚩` = Medium, `🔴` = Highest · **Visual Fidelity / Wind Coupling:** `🔴` = Highest (best) · **Overall Quality:** `⭐` (more = better).
+Frontier **already** owns `Engine/GeometrySpace/Procedural/ProceduralGeometry.{h,cpp}` with `ProceduralGeometryDomain::Botanical = 2u`, `IProceduralGeometryGenerator`, `ProceduralGeometryRegistry::Global()`, `ProceduralGeometryAsset::EnsureUpToDate(BuildClusterPyramid = true)`, an existing `EvaluateAnalyticSdf(...)` virtual hook, and starter slot `5` (`"procedural.tree"`).
 
-| Option | GPU Cost (`10,000` Specimens) | VRAM Footprint | WindField Coupling | Physical Collision | Overall |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **A. Pure GPU XPBD Everywhere** (`XpbdConstraintSolver`) | 🔴 `> 45 ms` (unusable) | 🔴 `~1.8 GB` | 🔴 Exact force intake | 🔴 Full branch/leaf | `⭐⭐` |
-| **B. Pure Baked VAT Everywhere** (`VertexAtlasFleetTable`) | 🚩 `~1.8 ms` | 🚩 `~120–360 MB` | 🚩 Phase/blend only (cannot change wind direction freely) | ✔️ None | `⭐⭐⭐` |
-| **C. Pure Analytic 3-Tier Wind Shader** (Cantilever + Pivot + Flutter) | ✔️ `~0.4 ms` | ✔️ `0 MB` extra (per-vertex `aWind` + `aPivot`) | 🔴 Exact 3D vector, traveling gusts & vortex | ✔️ None | `⭐⭐⭐⭐` |
-| **🥇 D. Distance-Tiered Combo Driven by 1 WindField** *(Recommended)* | ✔️ `~1.1 ms` total | ✔️ `< 24 MB` total | 🔴 **100% unified 1 WindField across all 3 tiers** | 🔴 On nearby heroes (`0–25 m`) | `⭐⭐⭐⭐⭐` 🏆 |
-
-### 💡 Recommended Tier Assignment (`Projects/Untitled/` Forest Budget)
-
-| Distance Band | Instance Count | Trunk & Limb Motion | Leaf Shuffle Mechanism | Existing Frontier C++ Unit |
-| :--- | :---: | :--- | :--- | :--- |
-| **Tier 0 · Hero (`0–25 m`)** | `1 – 16` | Cantilever + Pivot Wind + optional Jolt/XPBD vehicle/character push | **GPU XPBD Elastic Whip** (or spring-damped twig bend + high-freq flutter) | `XpbdConstraintSolver` + `ParticleXpbdNetworkBuilder` |
-| **Tier 1 · Midground (`25–120 m`)** | `16 – 1,500` | Exact `ForceFieldGpuUploader` 3-tier cantilever + limb bend | **VAT Loop Sheet (`VertexAtlasFleetTable`)** time-warped by local WindField speed & gust phase | `VertexMotionAtlasGpuBaker` + `VertexAtlasFleetTable` |
-| **Tier 2 · Deep Forest (`120 m+`)** | `1,500 – 10,000+` | Exact `ForceFieldGpuUploader` traveling spatial wave front | **Zero-VRAM Analytic Multi-Harmonic Flutter** (`aWind.w` + world-origin phase) | `ForceFieldGpuUploader` + `WorldViewportRadiometricCompute.slang` |
-
-📝 **Why not pure VAT for 10,000 trees?** A baked VAT clip locks in one wind direction and one gust profile. Modulating VAT playback rate with the shared WindField works well for secondary leaf flutter at `25–120 m`, while the macro trunk sway and limb bend stay **100% analytic** so a rotating wind or traveling vortex bends all `10,000` trees smoothly in any direction with zero popping!
-
----
-
-## 🏆 3. Decision 2 — Should You Build Nanite From Scratch for 10,000+ Trees?
-
-Legend: **Engineering Cost:** `✔️` = Lowest (best) · **10k Forest Performance / Visual Parity:** `🔴` = Highest (best).
-
-| Option | Engineering Cost | 10,000+ Forest Perf | Alpha-Foliage Fidelity | Reuses Frontier Code | Overall |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **A. Traditional 4-Mesh Discrete LODs** | ✔️ Low | 🚩 High overdraw + LOD pop | 🚩 Thinning crowns | 🚩 Partial | `⭐⭐⭐` |
-| **B. Brand-New Full Nanite Rewrite** (SW virtual streaming + foliage assemblies) | 🔴 Months | 🔴 Excellent | 🔴 High | 🔴 Duplicates VisBuffer | `⭐⭐⭐` |
-| **🥇 C. Extend Existing `ClusterPyramid` + `VisibilityClusterRasterization`** *(Recommended)* | ✔️ **Focused** | 🔴 **Nanite-class (`>= 4 px` HW / `< 4 px` SW)** | 🔴 **Area-preserving clusters** | 🔴 **100% reuse** | `⭐⭐⭐⭐⭐` 🏆 |
-
-### 💡 Frontier Already Has the Nanite Foundation Built
-
-Do **not** build a second virtualized geometry architecture. Frontier already ships:
-- `Engine/SpatialAcceleration/ClusterPyramid.{h,cpp}` — 128-triangle (`MaxTrianglesPerCluster = 128u`) hierarchical cluster pyramid with quadric error metrics (`SymmetricQuadric10`) preserving UVs, normals, and materials.
-- `Engine/GeometricRaster/Visibility/ClusterCullEncoder.{h,cpp}` — Two-phase GPU/CPU cluster frustum + normal-cone + continuous screen-space LOD cut + Hi-Z occlusion culling.
-- `Engine/GeometricRaster/Visibility/DepthPyramidSequence.{h,cpp}` — Conservative Reversed-Z Hi-Z pyramid.
-- `Engine/GeometricRaster/Visibility/VisibilityClusterRasterization.{h,cpp}` — Exact 64-bit Visibility Buffer splitting `>= 4 px` clusters to HW raster and `< 4 px` micro-triangles to SW compute raster.
-- `Engine/GeometricRaster/Visibility/VisibilityMaterialResolve.{h,cpp}` — Zero-G-Buffer analytic ray-differential UV Jacobian + 10-lobe OpenPBR resolve.
-
-### 🔧 Exact 3 Additions Required for 10,000+ Botanical Forests
-
-1. **Wind-Padded Conservative Cluster Bounds**: Expand each cluster bounding sphere in `ClusterCullEncoder` by `MaxTrunkSwayRadius = 0.042 * TrunkFlex * PeakWindStrength * Height` so swaying crowns are never falsely occluded by Hi-Z.
-2. **Area-Preserving Foliage Cluster Simplification + Cutout Mask**: During `ClusterPyramid` decimation of foliage clusters, preserve total projected leaf cross-sectional area (scale surviving leaf quads up by `sqrt(N_before / N_after)`) so distant forests keep rich silhouette density instead of turning sparse, and route foliage clusters through an alpha-tested VisBuffer path (switching to octahedral impostor clusters beyond `250 m`).
-3. **Instanced Cluster Indirect Compaction**: Add a per-instance `BotanicalInstanceGpuRecord` (`64 B`: `WorldPosScale`, `YawSeedPhase`, `SpeciesClusterOffset`, `FractureMask`) so `10,240` forest specimens cull into one GPU indirect draw buffer in `< 0.35 ms`.
-
----
-
-## 🏆 4. Decision 3 — Wind-Deformed SDF & Global Distance Field (`Analytical Primitives` vs. `VAT/Warped 3D SDF` vs. `Re-Bake`)
-
-Legend: **GPU Cost / VRAM:** `✔️` = Lowest (best) · **Metric SDF Exactness (`|∇d| = 1`) / Wind Sync:** `🔴` = Highest (best).
-
-| Approach | Per-Frame GPU Cost | Memory (`10k` Forest) | WindField Sync | Metric SDF Validity (`|∇d| = 1`) | Overall |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **A. Re-Bake 3D Voxel SDF Per Frame** (`GpuSdfBaker`) | 🔴 `> 25 ms` (unusable) | 🔴 `48 MB × N` | 🔴 Exact | 🔴 Exact | `⭐` |
-| **B. Domain-Warped / VAT-Deformed 3D Local SDF Texture** | 🚩 `~2.5 ms` | 🔴 `~16–48 MB` per species | 🚩 Inverse warp error on big bends | 🚩 **Breaks Lipschitz (`|∇d| ≠ 1`)** -> cone/ray banding | `⭐⭐⭐` |
-| **🥇 C. Wind-Displaced Analytical Primitives Composited into GDF** *(Recommended)* | ✔️ **`~0.15 ms`** (`64³` Fine+Coarse) | ✔️ **`1.76 KB / specimen`** | 🔴 **100% exact 1 WindField** | 🔴 **Guaranteed `|∇d| <= 1`** (analytic capsules + `smin` spheres) | `⭐⭐⭐⭐⭐` 🏆 |
-
-### 💡 How Wind-Driven Analytical SDF Integrates into Frontier's GDF (`VulkanWorldRenderSequence`)
-
-Instead of baking a static 3D voxel brick per tree or warping a 3D texture (which breaks signed distance Lipschitz bounds under nonlinear limb rotation), extract **two ultra-compact analytical primitive lists directly from the Weber & Penn skeleton at generation time**:
-
-| Primitive Layer | Count / Specimen | GPU Struct Size | Wind Update Formula | GDF Composition Role |
-| :--- | :---: | :---: | :--- | :--- |
-| **Tapered Wood Capsules** (`Trunk` + `Level-1 Boughs`) | `10 – 16` | `64 B` each (`a, b, rA, rB, windA, windB, pivot`) | Displace endpoints `A` and `B` using the **exact same `frontierApplyUnifiedWind()`** | Hard shadow / contact AO / trunk GI occlusion |
-| **Soft-Union Canopy Lobes** (Ellipsoids / Spheres) | `8 – 16` | `48 B` each (`center, radius, windAttr, pivot, porosity`) | Displace lobe center `C` using the **exact same `frontierApplyUnifiedWind()`** | Soft sky AO, indirect bounce GI, dappled volumetric fog occlusion |
-
-- **Total Proxy Memory:** `~28` primitives × `~60 B` = **`1.76 KB` per specimen** (versus `48 MB` for a `256³` voxel grid — a **`27,000×` memory reduction**!).
-- **Single Compute Pass into Existing GDF:** Every frame (or whenever WindField delta exceeds threshold), dispatch a lightweight compute pass over the active `GdfFineImage3D` (`64³`, `3.5 m`–`16 m` span) and `GdfCoarseImage3D` (`64³`, `48 m`–`96 m` span) in `VulkanWorldRenderSequence`:
-  1. Transform only the `~8–32` specimens intersecting the clipmap AABB using the **exact same `ForceFieldGpuUploader` WindField buffer**.
-  2. Evaluate `min(dStaticWorld, smin(dWoodCapsules, dCanopyLobes, k))` directly into the `VK_IMAGE_TYPE_3D` clipmap.
-  3. On **HighEnd** GPUs, pair this wind-synced GDF (for diffuse GI & sky occlusion) with **exact `BVH4` / `RayQuery`** (or VisBuffer contact shadows) for razor-sharp close-range leaf-silhouette shadows!
-
----
-
-## 🧩 5. UV Unwrapping & PBR Texturing (`UVWorkspace` + `OpenPbrDirect`)
-
-Slate's welded quad branch-collar geometry solves the hardest part of procedural bark texturing automatically:
-1. **Continuous Cylindrical Trunk & Limb UVs**:
-   - `U = (RingColumn / RadialSegments) * round(2 * pi * BaseRadius * BarkScale)` — guaranteed integer wrap count so bark textures tile seamlessly with **zero seam stretch**.
-   - `V = CumulativeArcLengthMeters * VerticalBarkScale` — constant world-space texel density from buttress roots through level-3 twigs, so a single `2K` tileable bark PBR material (`BaseColor`, `Normal`, `Roughness`, `AO`) works across all 37 species.
-2. **Branch Collar UV Blending**: Blend seam transition weights over `collarRings` (`2–3` rings around each branch fork) and expose the generated `PolygonNetwork` directly to `Engine/Workspaces/UV/` (`UVWorkspace`) if an artist wants to paint custom moss/scar decals or pack unique UDIM hero bark charts.
-3. **Foliage Spray Alpha Sheet**: Each terminal leaf quad carries exact `[0,1] × [0,1]` UV coordinates mapped to a species-matched PBR botanical spray sheet (`BaseColor`, `AlphaCutout`, `Normal`, `SubsurfaceTranslucency`, `Roughness`), plus a per-leaf `TintVariation` attribute for natural crown color variance.
-
----
-
-## 🧩 6. Fracture Integration (`FractureWorkspace` + `SimulationFractureCouplingBridge`)
-
-Making procedural botanical specimens destructible (vehicle crash, storm wind-snap, felling) plugs directly into Frontier's existing fracture architecture:
-
-| Stage | Mechanism | Existing Frontier C++ Module |
-| :--- | :--- | :--- |
-| **1. Pre-Authored Weak Seams** | Tag fracture collars at trunk base (`15–35%` H) and major Level-1 limb forks using Voronoi-jagged interior cross-section rings with a dedicated `HeartwoodSplinter` material slot. | `Engine/GeometrySpace/Fracture/EngineeringBakedFracture.{h,cpp}` |
-| **2. Runtime Impact / Wind-Snap Trigger** | When vehicle impulse (Jolt `PhysicsExtension`) or WindField drag torque exceeds species `BreakMomentNm`, split the `ClusterPyramid` range into `RootedStump` + `DetachedCrown` + `16–32` convex splinter debris pieces. | `Engine/GeometrySpace/Fracture/FastRuntimeFracture.{h,cpp}` + `ConvexPartitioning.{h,cpp}` |
-| **3. Rigid-Body Fall & Wind Torque** | Hand `DetachedCrown` (plus its compound convex hull from trunk+bough capsules!) to `RigidBodyDynamics` so it falls downwind, bounces on terrain, and sheds leaf particles via `ParticleGpuSimulation`. | `Engine/SimulationSpace/SimulationFractureCouplingBridge.{h,cpp}` + `RigidBodyDynamics.{h,cpp}` |
-| **4. Live SDF / GDF Sync** | Clear the snapped upper-trunk capsules and canopy lobes from the standing proxy list and attach them to the falling rigid-body transform — so the GDF shadow and sky AO fall **with** the tree! | `VulkanWorldRenderSequence` GDF proxy uploader |
-
----
-
-## 🧩 7. Porting All 37 Slate Presets & Reusing C++ Outliner + Inspector in `Projects/Untitled/`
-
-### 7.1 Target C++20 Module Layout (100% Compliant with `FolderStructure.md`)
-
-| New / Extended File | Responsibility |
-| :--- | :--- |
-| `Engine/GeometrySpace/Botanical/BotanicalParameters.h` | ISO C++20 structs mirroring Slate's `BotanyParams`, `SurfaceParams`, `RootParams`, `CrownEnvelope` enum (`8` shapes). |
-| `Engine/GeometrySpace/Botanical/SpeciesPresetRegistry.{h,cpp}` | All **37 Slate botanical presets** (`8` Oaks · `7` Broadleaf · `4` Conifers · `3` Jungle · `4` Savanna · `9` Desert · `2` Rocky) + grass presets, serializable as canonical TOML `.BotanicalPreset`. |
-| `Engine/GeometrySpace/Botanical/WeberPennSkeleton.{h,cpp}` | Deterministic C++20 port of Slate's `skeleton.ts` + `roots.ts` (multi-level stems, forks, collar emergence, tropism, buttress roots). |
-| `Engine/GeometrySpace/Botanical/WeldedBarkBuilder.{h,cpp}` | Port of `mesher.ts` emitting Frontier `PolygonNetwork` (cylindrical UVs, `aWind`, `aPivot`, foliage quads) + `BotanicalSdfProxyList` (capsules + canopy lobes). |
-| `Engine/Shaders/Botanical/BotanicalWindDeform.slang` | Shared `.slang` module imported by VisBuffer rasterization, shadow depth, and GDF proxy compute — reads `ForceFieldGpuUploader` WindField buffer directly. |
-| `Projects/Untitled/Content/Worlds/MainWorld.WorldSpace` | Registers a `GlobalWindField` instance, `BotanicalSpecimen` hero entries, and an `InstancedForestField` entry discovered automatically by `WorldSpaceCodec`. |
-
-### 7.2 Reusing Existing C++ `OutlinerPanel` & `InspectorPanel` (Project Zero Editor Parity)
-
-- **Zero Custom Outliner Rewrite**: Register `BotanicalSpecimen`, `GlobalWindField`, and `InstancedForestField` as standard `WorldInstanceRegister` categories (`CategoryInstances`). `Engine/Components/Panes/OutlinerPanel.{h,cpp}` immediately renders them with Frontier's Project Zero obsidian styling, search pill, filter chips, `#ffb454` selection bar, `#34c759` live status indicator, and eye visibility toggles.
-- **Inspector Section Extensions**: Extend `Engine/Components/Panes/InspectorPanel.{h,cpp}` with five Project Zero collapsible inspector sections matching `Experimental/BotanicalWorkbench/` (`Botany`, `Wind`, `Cluster · UV`, `Fracture`, `SDF · GDF`), reusing existing `CapsuleButton`, `ExclusiveSelector`, `DropdownSelector`, and `ScalarSlider`.
-
----
-
-## 🏁 8. Interactive HTML Reference Workbench (`Experimental/BotanicalWorkbench/`)
-
-Verified live interactive prototype built with **Project Zero Editor UI** (`#090909` obsidian shell, `#121212` docks, trapezoidal tab strip, top Notch, Frontier Outliner, and rounded-capsule Inspector):
-
-| Feature | Verification Status | Where to Test in Workbench |
+| File Path | Action | Responsibility |
 | :--- | :---: | :--- |
-| **All 37 Slate Botanical Presets** (7 groups) | 🟢 Verified (`avg 37 ms`) | Right Inspector → **Botany** → `Botanical Species` dropdown / `Prev` / `Next` |
-| **1 Shared WindField** (Direction, Speed, Gusts, Wavelength, Vortex) | 🟢 Verified | Right Inspector → **Wind** tab + `Wind Vectors` viewport mode |
-| **Leaf Shuffle Modes** (`Analytic` · `VAT Sheet` · `Hero XPBD`) | 🟢 Verified | Right Inspector → **Botany** → `Leaf Shuffle Solver` selector |
-| **128-Tri LOD Clusters + Bounding Spheres + LOD 0–3** | 🟢 Verified | Top Viewport Bar → **`Clusters`** + Right Inspector → **Cluster·UV** |
-| **Cylindrical Bark UV + Leaf Alpha Sheet + UV Checker** | 🟢 Verified | Top Viewport Bar → **`UV Checker`** + Swatch previews in **Cluster·UV** |
-| **Interactive Voronoi Trunk Fracture + Falling Crown + Splinters** | 🟢 Verified | Top Viewport Bar → **`Fracture`** → **`Snap Trunk`** / **`Restore`** |
-| **Wind-Deformed Analytical SDF Capsules & Canopy Lobes + Live GDF Section** | 🟢 Verified | Top Viewport Bar → **`SDF Proxies`** + Bottom-Right **Live GDF Section** canvas |
-| **10,240-Instance GPU Forest Driven by Traveling WindField Waves** | 🟢 Verified | Top Viewport Bar → **`Grove (64)`** / **`Forest (10,240)`** |
+| `Engine/GeometrySpace/Procedural/ProceduralGeometry.{h,cpp}` | **Extend in place** | Replace starter `ProceduralTreeGenerator` body (`"procedural.tree"`) with the Weber & Penn botanical generator; keep `IProceduralGeometryGenerator` & `EvaluateAnalyticSdf` contract intact. |
+| `Engine/GeometrySpace/Procedural/BotanicalParameters.h` | **New** | ISO C++20 `BotanicalParameters`, `CrownEnvelope` (`8` shapes), `BotanicalSdfProxyList` (capsules + canopy lobes), and `BotanicalVertexWindChannel` (`aWind`, `aPivot`). |
+| `Engine/GeometrySpace/Procedural/BotanicalSpeciesPresets.{h,cpp}` | **New** | Phase-1 **3 canonical presets** (`English Oak`, `Scots Pine`, `Quaking Aspen`) with exact Slate Weber & Penn numbers; table-driven so the remaining `34` Slate presets plug in with zero code changes. |
+| `Engine/GeometrySpace/Procedural/WeberPennBotanicalBuilder.{h,cpp}` | **New** | Deterministic C++20 port of Slate `skeleton.ts` + `roots.ts` + `mesher.ts` (converted from Slate `+Y` Up to Frontier Right-Hand **`+Z` Up**), emitting `PolygonNetwork` (`UDIM 1001` cylindrical bark UV + `UDIM 1002` leaf sheet UV), `FacePartitionRegister`, `ClusterPyramid`, and analytical SDF proxies. |
+| `Engine/GeometrySpace/Procedural/BotanicalWindVatBaker.{h,cpp}` | **New** | Offline/setup-time baker built on `VertexMotionAtlasGpuBaker` producing **2 VAT clips per species**: (1) `DirectionalSwayLut` (`+X` canonical wind), (2) `LeafRustleVat` (seamless loop). |
+| `Engine/Shaders/Botanical/BotanicalWindDeform.slang` | **New** | Shared `.slang` unit reading the **1 `ForceFieldGpuUploader` WindField** + rotated `DirectionalSwayLut` + scaled `LeafRustleVat`, imported by VisBuffer rasterization, shadow depth, and GDF proxy compute. |
+| `Projects/Untitled/Content/Worlds/MainWorld.WorldSpace` | **Wire** | Instantiates `GlobalWindField` + the 3 species across `Tier 0 / Tier 1 / Tier 2` using the existing `WorldInstanceRegister`, `OutlinerPanel`, and `InspectorPanel`. |
+
+---
+
+## 🧩 2. Phase-1 Scope — 3 Canonical Species × 3 Distance Tiers
+
+### 2.1 The 3 Starter Species (Full Morphological Coverage)
+
+| Slot | Species (Slate Exact Preset) | Crown & Bark Role | Foliage Morphology | Validation Stress Test |
+| :---: | :--- | :--- | :--- | :--- |
+| **0** | **`English Oak`** | Hemispherical gnarled `4`-level limbs, thick buttress roots (`16 m`) | Dense broadleaf sprays | Limb pivot bend, cylindrical collar UV, Voronoi trunk fracture |
+| **1** | **`Scots Pine`** | Tapered conical trunk, reddish upper bark plates (`18 m`) | Conifer needle sprays | Area-preserving cluster decimation, needle translucency |
+| **2** | **`Quaking Aspen`** | `TendFlame` tall slender trunk, white lenticel bark (`13 m`) | High-count trembling leaves (`30 / twig`) | Multi-scale Rustle VAT & seamless `Tier 0 → Tier 1 → Tier 2` transition |
+
+### 2.2 The 3 Distance Tiers (`Tier 0` · `Tier 1` · `Tier 2`) Driven by 1 WindField
+
+| Tier | Range & Budget | Geometry & Cluster Path | Trunk / Limb Sway | Leaf Rustle / Shuffle | Analytical SDF → GDF |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Tier 0 · Hero** | `0 – 25 m`<br>(`1 – 16` trees) | Full `4`-level Weber & Penn `PolygonNetwork` + roots + `ClusterPyramid` LOD0 + Fracture seams | **1 Rotated `+X` Sway VAT LUT** + optional Jolt/XPBD vehicle/character push | **1 Scaled Rustle VAT** + optional Hero XPBD gust whip (`XpbdConstraintSolver`) | `12` wood capsules + `16` canopy lobes → `GdfFineImage3D` (`64³`) + exact `BVH4` shadows |
+| **Tier 1 · Midground** | `25 – 120 m`<br>(`16 – 1,500` trees) | `ClusterPyramid` continuous screen-space LOD (`ClusterCullEncoder` + Hi-Z `DepthPyramidSequence`) | **1 Rotated `+X` Sway VAT LUT** sampled at instance WindField speed & gust | **1 Scaled Rustle VAT** (phase-offset + 2-octave self-blend via `VertexAtlasFleetTable`) | `6` wood capsules + `8` canopy lobes → `GdfCoarseImage3D` (`64³`) |
+| **Tier 2 · Forest** | `120 m+`<br>(`1,500 – 10,000+` trees) | Area-preserving coarse `128`-tri clusters (`LOD2/3`) + octahedral impostors (`> 250 m`) via 1 indirect draw | **1 Rotated `+X` Sway VAT LUT** (or 1-instruction cantilever fallback on impostors) driven by traveling spatial wave | **Scaled Rustle VAT** (distance-attenuated amplitude -> `0` at horizon) | `1 – 3` merged canopy ellipsoid lobes → `GdfCoarseImage3D` (`64³`) |
+
+---
+
+## 🏆 3. Refined Two-Channel VAT Architecture (`1 Direction LUT` + `1 Scaled Rustle VAT`)
+
+### 3.1 Channel A — Wind-Direction Sway LUT (Decision Table)
+
+Legend: **VRAM / Bake Cost:** `✔️` = Lowest (best) · **Asymmetric Limb Accuracy / Direction Freedom:** `🔴` = Highest (best).
+
+| Option | Clips / Species | Total VRAM (`3` Species) | Any 360° Wind Direction | Asymmetric Limb Stiffness | Overall |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **A. 8-Direction Baked Ring** (every `45°`) | `8` clips | 🔴 `~19 MB` | 🚩 Interpolated sectors | 🔴 Exact | `⭐⭐⭐` |
+| **🥇 B. 1 Canonical `+X` Direction LUT + Runtime Azimuth Rotation** *(Recommended Phase 1)* | **`1` clip** | ✔️ **`~2.4 MB`** | 🔴 **Continuous `360°` + Vortex** | 🚩 **95% natural** (with limb-alignment factor) | `⭐⭐⭐⭐⭐` 🏆 |
+| **C. 2 Orthogonal Basis LUTs (`+X` & `+Y`, blended `cos θ, sin θ`)** *(Optional Phase 2)* | `2` clips | 🚩 `~4.8 MB` | 🔴 Continuous `360°` + Vortex | 🔴 Exact anisotropic boughs | `⭐⭐⭐⭐` |
+
+#### 💡 Exact GPU Math for 1 Canonical Wind-Direction LUT (`BotanicalWindDeform.slang`)
+
+1. **Bake once along `+X`** (`32` rows = wind speed `[0 .. 24 m/s]` with nonlinear gust cantilever + limb drag; columns = vertices; `RGBA16F`: `xyz = ΔP_local(+X)`, `w = normalized strain`).
+2. **At runtime for every vertex of every instance**:
+   - Evaluate the **1 shared WindField** at instance origin: `W = SampleUnifiedWind(InstanceOrigin, Time)` → speed `s = length(W.xy)` (in Frontier `+Z` Up), azimuth `θ = atan2(W.y, W.x)`.
+   - Compute LUT row `v = saturate(s / 24.0)` (linearly filtered in hardware `VK_FILTER_LINEAR`!).
+   - Fetch `ΔP_canon = SampleDirectionalSwayLut(VertexIdx, v).xyz`.
+   - **Rotate `ΔP_canon` horizontally by `R_z(θ)`** into the live wind direction:
+     ```
+     ΔP_sway.x =  ΔP_canon.x * cos(θ) - ΔP_canon.y * sin(θ)
+     ΔP_sway.y =  ΔP_canon.x * sin(θ) + ΔP_canon.y * cos(θ)
+     ΔP_sway.z =  ΔP_canon.z   // arc-length vertical droop stays invariant under azimuth rotation!
+     ```
+   - ⚠️ **Why this works so well**: Trunk cantilever bending and arc-length vertical droop (`ΔP_canon.z`) are rotationally invariant around `+Z`, and scaling lateral limb lag by `abs(dot(normalize(LocalPos.xy), WindDirXY))` keeps cross-wind limbs stiffer than downwind limbs using **only 1 LUT**!
+
+### 3.2 Channel B — Leaf Rustle VAT (`1` Seamless VAT vs. Multiple Rustle VATs)
+
+Legend: **VRAM / Authoring Cost:** `✔️` = Lowest (best) · **Anti-Repetition & Gust Realism:** `🔴` = Highest (best).
+
+| Option | Clips / Species | Total VRAM (`3` Species) | Anti-Repetition (`10k` Trees) | Calm-to-Gale Dynamic Range | Overall |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **🥇 A. 1 Seamless Rustle VAT + Dynamic Scale, Rate & 2-Octave Self-Blend** *(Recommended)* | **`1` clip** (`64` loop slices) | ✔️ **`~1.8 MB`** | 🔴 **Zero visible sync** | 🔴 **Continuous `0..24 m/s`** | `⭐⭐⭐⭐⭐` 🏆 |
+| **B. 3 Separate Rustle VATs** (`Calm` · `Breeze` · `Gale`) | `3` clips | 🚩 `~5.4 MB` | 🔴 Zero sync | 🔴 Explicit flutter modes | `⭐⭐⭐` |
+
+#### 💡 Why 1 Rustle VAT per Species Is Sufficient
+
+- **Dynamic Amplitude Scaling**: `Amp = RustleScale * smoothstep(0.4, 16.0, WindSpeed) * LeafFlex` turns the exact same 1 VAT from gentle idle shimmer at `1.5 m/s` into energetic thrashing at `18 m/s`.
+- **Speed-Modulated Phase + Per-Instance & Per-Leaf Desync**:
+  `u0 = fract(Time * (0.55 + 0.14 * WindSpeed) + InstancePhase + LeafPhase)`
+- **Zero-Cost 2-Octave Self-Blend** (breaks any 64-frame loop periodicity completely):
+  `ΔP_rustle = Amp * (0.72 * SampleRustleVat(v, u0) + 0.28 * SampleRustleVat(v, fract(u0 * 1.61803 + 0.37)))`
+- **Fits Existing `VertexAtlasFleetTable` Budget With Room to Spare**:
+  - `3` species × `2` VAT clips (`1` Directional Sway LUT + `1` Rustle VAT) = **`6 / 16` slots used** (`~4.2 MB` total VRAM for `10,000+` forest trees!).
+
+---
+
+## 🏆 4. Cluster Pyramid (Nanite-Class VisBuffer), UV Unwrap, Fracture & Wind-SDF Contracts
+
+| Subsystem | Existing Frontier Unit Reused | Exact Phase-1 Extension for the 3 Trees |
+| :--- | :--- | :--- |
+| **LOD Clusters (No Separate Nanite Rewrite)** | `ClusterPyramid` (`128`-tri) · `ClusterCullEncoder` · `DepthPyramidSequence` · `VisibilityClusterRasterization` · `VisibilityMaterialResolve` | (1) Expand cluster sphere radius by `MaxSwayRadius` in `ClusterCullEncoder`; (2) area-preserving leaf quad scale (`sqrt(N_before / N_after)`) during LOD1–LOD3 decimation; (3) `64 B` `BotanicalInstanceGpuRecord` indirect compaction for `10,000+` instances. |
+| **UV Unwrap & OpenPBR Materials** | `UVWorkspace` · `UVWorkspaceRasterizer` · `OpenPbrDirect` | Cylindrical `UDIM 1001` bark UV (`U = integer circumference wrap`, `V = arcLengthMeters`) + `UDIM 1002` `[0,1]²` species foliage spray sheet (`BaseColor`, `AlphaCutout`, `Normal`, `SubsurfaceTranslucency`). |
+| **Fracture & Falling Crown** | `EngineeringBakedFracture` · `FastRuntimeFracture` · `ConvexPartitioning` · `SimulationFractureCouplingBridge` | Pre-authored Voronoi break collar at trunk base (`15–35%` H) with `HeartwoodSplinter` slot; on Jolt crash or WindField torque `> BreakMomentNm`, splits into `RootedStump` + falling `DetachedCrown` rigid body + `16–32` splinter shards and detaches upper SDF capsules to follow the falling body. |
+| **Wind-Deformed Analytical SDF → GDF** | `IProceduralGeometryGenerator::EvaluateAnalyticSdf` · `VulkanWorldRenderSequence` (`GdfFineImage3D` / `GdfCoarseImage3D`) | Extract `~12` tapered wood capsules + `~16` canopy sphere lobes (`1.76 KB / tree`) at generation time; displace endpoints/centers by the **exact same rotated Directional Sway LUT / WindField** and splat `smin(dWood, dCanopy, k)` into the `64³` GDF clipmaps in `~0.15 ms` (`|∇d| <= 1` guaranteed, avoiding `48 MB` per-species voxel bricks!). |
+| **Outliner & Inspector UI (`Projects/Untitled`)** | `OutlinerPanel` · `InspectorPanel` · `WorldInstanceRegister` | Reuse Frontier's Project Zero C++ `OutlinerPanel` directly via `WorldInstanceRegister`; add 5 Project Zero collapsible sections (`Botany`, `Wind`, `Cluster·UV`, `Fracture`, `SDF·GDF`) matching `Experimental/BotanicalWorkbench/`. |
+
+---
+
+## 🚧 5. Ordered Execution Milestones (Ready to Implement)
+
+| Phase | Deliverable | Verification Gate |
+| :---: | :--- | :--- |
+| **Phase 1** | Port Weber & Penn core + **3 presets (`English Oak`, `Scots Pine`, `Quaking Aspen`)** into `Engine/GeometrySpace/Procedural/` (`+Z` Up), replacing starter `ProceduralTreeGenerator` (`"procedural.tree"`). | `Exhibits/BotanicalProceduralValidation` emits deterministic `.png` proofs of all 3 species (OpenPBR, Cylindrical UV Checker, 128-Tri Clusters, SDF Capsules+Lobes). |
+| **Phase 2** | Implement `BotanicalWindVatBaker` (**1 `+X` Direction Sway LUT + 1 Rustle VAT** per species = `6` clips in `VertexAtlasFleetTable`) + `BotanicalWindDeform.slang` driven by `ForceFieldGpuUploader`. | Multi-azimuth (`0°`, `90°`, `180°`, `270°`) + Calm-vs-Gale `.png` contact sheet verifying identical sway direction across wood, leaves, and analytical SDF proxies. |
+| **Phase 3** | Wire `ClusterPyramid` wind-padded bounds + area-preserving foliage LOD (`Tier 0 / Tier 1 / Tier 2`) + `GdfFineImage3D` / `GdfCoarseImage3D` analytical proxy compute splat + `Projects/Untitled/` `MainWorld.WorldSpace` Outliner/Inspector integration. | `10,000`-instance forest benchmark (`< 2 ms` cull + wind + GDF proxy splat) + interactive `Frontier` Editor & Voronoi trunk fracture verification. |

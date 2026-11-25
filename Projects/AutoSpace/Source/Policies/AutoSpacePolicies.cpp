@@ -7,20 +7,16 @@
 //                                                        INCLUDES
 //------------------------------------------------------------------------------------------------------------------------
 
-#include "Source/AutoSpacePolicies.h"
+#include "Source/Policies/AutoSpacePolicies.h"
 
 namespace AutoSpace
 {
-
-//------------------------------------------------------------------------------------------------------------------------
-//                                                 POLICY BUILDER DEFINITIONS
-//------------------------------------------------------------------------------------------------------------------------
 
 Frontier::Lifecycle::ProjectExecutionPolicy BuildAutoSpaceExecutionPolicy() noexcept
 {
     using namespace Frontier::Lifecycle;
 
-    ProjectExecutionPolicy Policy{};
+    ProjectExecutionPolicy Policy {};
     Policy.ProjectTitle           = "AutoSpace";
     Policy.FixedStepSeconds       = 1.0 / 60.0;
     Policy.MaximumStepSeconds     = 0.100;
@@ -41,7 +37,7 @@ Frontier::Lifecycle::ProjectExecutionPolicy BuildAutoSpaceExecutionPolicy() noex
 
 Frontier::SimulationSpace::Policies::GameplayRulePolicy BuildAutoSpaceGameplayPolicy() noexcept
 {
-    Frontier::SimulationSpace::Policies::GameplayRulePolicy Policy{};
+    Frontier::SimulationSpace::Policies::GameplayRulePolicy Policy {};
     Policy.SchemaVersion               = 1u;
     Policy.FixedSimulationHz           = 60u;
     Policy.AlignmentHashIntervalTicks  = 10u;
@@ -59,18 +55,21 @@ Frontier::SimulationSpace::Policies::GameplayRulePolicy BuildAutoSpaceGameplayPo
 
 Frontier::SimulationSpace::Policies::DeterministicDrivingPolicy BuildAutoSpaceDrivingPolicy(uint64_t Seed) noexcept
 {
-    Frontier::SimulationSpace::Policies::DeterministicDrivingPolicy Policy{};
+    Frontier::SimulationSpace::Policies::DeterministicDrivingPolicy Policy {};
     Policy.SeedInitialize(Seed);
     return Policy;
 }
 
-AutoSpacePolicyBundle BuildAutoSpacePolicyBundle(uint64_t DrivingSeed) noexcept
+AutoSpacePolicyBundle BuildAutoSpacePolicyBundle(
+    uint64_t      DrivingSeed,
+    StudioLobbyId InitialLobby) noexcept
 {
-    AutoSpacePolicyBundle Bundle{};
+    AutoSpacePolicyBundle Bundle {};
     Bundle.ExecutionPolicy = BuildAutoSpaceExecutionPolicy();
     Bundle.GameplayPolicy  = BuildAutoSpaceGameplayPolicy();
     Bundle.DrivingPolicy   = BuildAutoSpaceDrivingPolicy(DrivingSeed);
     Bundle.VehicleContract = Frontier::NetworkingSpace::BuildRealtimeKinematicContract(2001u, 30.0f);
+    Bundle.Lobby           = LobbyPolicyEngine::BuildDefault(InitialLobby);
 
     Bundle.TransportInput.AccessTier = Frontier::NetworkingSpace::EntitlementAccessTier::StandardAccess;
     Bundle.TransportInput.AvailabilityMask =

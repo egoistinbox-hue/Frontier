@@ -1,11 +1,18 @@
 # ============================================================================================================================================
 #                                                     PROJECTS/AUTOSPACE/CMAKELISTS.TXT
 # ============================================================================================================================================
-# 🧩 Standalone project build target for AutoSpace (isolated from Engine/; links FrontierEngine with zero Editor UI)
+# 🧩 Standalone project build target for AutoSpace (isolated from Engine/; domain-organized single-level Studio Lobbies)
 
 add_library(AutoSpaceProject STATIC
-    Source/AutoSpacePolicies.cpp
-    Source/AutoSpaceLifecycle.cpp
+    Source/Policies/LobbyPolicy.cpp
+    Source/Policies/AutoSpacePolicies.cpp
+    Source/Geometry/StudioProceduralSurface.cpp
+    Source/Utility/StudioRenderUtility.cpp
+    Source/Levels/Lobby1CycloramaLevel.cpp
+    Source/Levels/Lobby2ForestStageLevel.cpp
+    Source/Levels/Lobby3RacingGarageLevel.cpp
+    Source/Gameplay/LobbyLifecycle.cpp
+    Source/Gameplay/AutoSpaceLifecycle.cpp
 )
 target_include_directories(AutoSpaceProject PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"

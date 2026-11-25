@@ -68,8 +68,14 @@ struct WorldRenderConfiguration
     SpecularReflectionSource              ReflectionSource    = SpecularReflectionSource::WideTreeRaytrace;
     RealTimeGiCandidate                   GiCandidate         = RealTimeGiCandidate::SurfelRadiosity;
     DirectLighting::SdfShadowPenumbraMode SdfPenumbraMode     = DirectLighting::SdfShadowPenumbraMode::AnalyticSdfConePenumbra;
-    uint32_t                              DebugChannel           = 0u;   // [0..22] - 0=Lit, 1..16=Modular channels, 17=NaniteLodLevel, 18=NaniteClusters, 19=NaniteGroups, 20=NaniteTriangles, 21=NaniteError, 22=NaniteUvSeams
-    bool                                  ReflectionsEnabled     = true; // [-]     - Specular reflection toggle
+    uint32_t                              DebugChannel           = 0u;   // [0..27] - 0=Lit, 1..16=Modular, 17..22=Nanite, 23=LightErrorX8, 24=ToroidalClipmap, 25=StaticVsDynamic, 26=CubeGridPodsLod, 27=SplitCompare
+    UnifiedLightingMode                   LightingMode           = UnifiedLightingMode::UnifiedAll3;
+    LightClipmapScalePreset               LightClipmapScale      = LightClipmapScalePreset::Auto;
+    bool                                  AutoBakeStaticClipmap  = true;  // [-]    - Automatically re-bake dirty static clipmap slabs on static edit or toroidal scroll
+    float                                 NaniteLightErrorBudget = 0.24f; // [rad]  - Dynamic agglomerative light BVH split budget
+    float                                 StaticClipmapErrorGate = 0.18f; // [-]    - Static toroidal clipmap high-error cell promotion gate
+    float                                 LightErrorHeatmapGain  = 8.0f;  // [x]    - Amplification factor for DebugChannel 23 (Error x8)
+    bool                                  ReflectionsEnabled     = true;  // [-]    - Specular reflection toggle
     bool                                  RaytracingEnabled      = true; // [-]     - Hardware/BVH raytracing toggle
     bool                                  XeGtaoEnabled          = false; // [-]    - XeGTAO screen-space AO for direct PBR (no GI contribution)
     float                                 XeGtaoStrength         = 1.0f;  // [x]    - XeGTAO occlusion strength multiplier [0..2]
@@ -123,6 +129,8 @@ struct WorldSceneSpecification
     std::vector<Codecs::ResampledPhotometricProfile>            PhotometricProfiles {};
     SolarDirectionalSource                                      Sun                 {};
     std::vector<PolygonalAreaQuadLight>                         AreaLights          {};
+    uint64_t                                                    StaticLightGeneration  = 1ull; // [gen] - Incremented ONLY when static lights change (triggers toroidal clipmap re-bake)
+    uint64_t                                                    DynamicLightGeneration = 1ull; // [gen] - Incremented on dynamic light edits/motion (0 static clipmap invalidation)
     Mathematics::LinearRGB                                      SkyRadiance         { 0.15f, 0.21f, 0.32f };
     WorldAtmosphereConfiguration                                Atmosphere          {};
 

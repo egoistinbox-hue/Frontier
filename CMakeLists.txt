@@ -870,6 +870,7 @@ function(frontier_compile_world_module_slang_shader SLANG_REL_PATH ENTRY_NAME SH
         DEPENDS
             "${IN_SLANG}"
             "${CMAKE_SOURCE_DIR}/Engine/Shaders/DirectLighting/WideTreeRayQuery.slang"
+            "${CMAKE_SOURCE_DIR}/Engine/Shaders/DirectLighting/UnifiedLightEvaluation.slang"
             "${CMAKE_SOURCE_DIR}/Engine/Shaders/GlobalIllumination/QuadratureSequence.slang"
         COMMENT "[Slang] Compiling ${SLANG_REL_PATH} (${SHADER_UNIT}:${ENTRY_NAME}) -> ${OUT_SPV_NAME}"
         VERBATIM
@@ -880,6 +881,7 @@ endfunction()
 frontier_compile_world_module_slang_shader(DirectLighting/RefitWideBoundingTreeCompute.slang            ComputeEntry           compute  RefitWideBoundingTreeCompute.comp.spv)
 frontier_compile_world_module_slang_shader(DirectLighting/HybridConeShadowCompute.slang                 ComputeEntry           compute  HybridConeShadowCompute.comp.spv)
 frontier_compile_world_module_slang_shader(DirectLighting/SdfEmissivePenumbraCompute.slang              ComputeEntry           compute  SdfEmissivePenumbraCompute.comp.spv)
+frontier_compile_world_module_slang_shader(DirectLighting/BakeStaticLightClipmapCompute.slang           ComputeEntry           compute  BakeStaticLightClipmapCompute.comp.spv)
 frontier_compile_world_module_slang_shader(GlobalIllumination/StokesContourIrradianceCompute.slang      ComputeEntry           compute  StokesContourIrradianceCompute.comp.spv)
 frontier_compile_world_module_slang_shader(GlobalIllumination/SurfelRadiosityLatticeCompute.slang       ComputeEntry           compute  SurfelRadiosityLatticeCompute.comp.spv)
 frontier_compile_world_module_slang_shader(GlobalIllumination/DeterministicRadianceIntegration.slang    IntegrateRadiance      compute  DeterministicRadianceIntegration.comp.spv)
@@ -921,6 +923,9 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/GeometricRaster/DirectLighting/HybridConeShadowSequence.cpp
     Engine/GeometricRaster/DirectLighting/SdfEmissivePenumbraSequence.cpp
     Engine/GeometricRaster/DirectLighting/PhotometricLightTree.cpp
+    Engine/GeometricRaster/DirectLighting/CubeGridPodAtlas.cpp
+    Engine/GeometricRaster/DirectLighting/StaticToroidalLightClipmap.cpp
+    Engine/GeometricRaster/DirectLighting/UnifiedLightHierarchy.cpp
     Engine/GeometricRaster/GlobalIllumination/SpecularReflectionSequence.cpp
     Engine/GeometricRaster/GlobalIllumination/StokesContourIrradianceSequence.cpp
     Engine/GeometricRaster/GlobalIllumination/SurfelRadiosityLatticeSequence.cpp

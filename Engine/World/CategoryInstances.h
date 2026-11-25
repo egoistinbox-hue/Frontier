@@ -69,13 +69,15 @@ struct CloudInstanceParameters
 // Creation parameters for LuminaireInstance
 struct LuminaireInstanceParameters
 {
-    uint8_t LuminaireFormOrdinal = 0u;     // [idx] - 0=Point, 1=Spot, 2=Area, 3=IES
-    float   PeakLuminanceR       = 800.0f; // [cd]  - Linear red intensity
-    float   PeakLuminanceG       = 740.0f; // [cd]  - Linear green intensity
-    float   PeakLuminanceB       = 620.0f; // [cd]  - Linear blue intensity
-    float   RangeMeters          = 18.0f;  // [m]   - Attenuation radius
-    float   OuterConeDegrees     = 45.0f;  // [deg] - Outer spot cone angle
-    bool    VisibilityEnabled    = true;   // [-]   - Active luminaire
+    uint8_t  LuminaireFormOrdinal = 0u;     // [idx] - 0=Point, 1=Spot, 2=Area, 3=IES
+    float    PeakLuminanceR       = 800.0f; // [cd]  - Linear red intensity
+    float    PeakLuminanceG       = 740.0f; // [cd]  - Linear green intensity
+    float    PeakLuminanceB       = 620.0f; // [cd]  - Linear blue intensity
+    float    RangeMeters          = 18.0f;  // [m]   - Attenuation radius
+    float    OuterConeDegrees     = 45.0f;  // [deg] - Outer spot cone angle
+    bool     VisibilityEnabled    = true;   // [-]   - Active luminaire
+    uint8_t  MobilityOrdinal      = 0u;     // [idx] - 0=Static (Toroidal Clipmap), 1=Dynamic (Cube-Grid Pod + Nanite BVH)
+    uint32_t LightRigGroupId      = 0u;     // [idx] - Optional multi-lamp fixture pod group ID (0=standalone)
 };
 
 // Creation parameters for SurfaceInstance

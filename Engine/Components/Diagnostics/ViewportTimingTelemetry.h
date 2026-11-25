@@ -63,6 +63,14 @@ struct ViewportTimingBreakdown
     float GpuDenoiseMs              = 0.0f;  // [ms] - Spatial shadow denoise & composite passes
     float GpuReadbackCopyMs         = 0.0f;  // [ms] - VRAM -> host-cached staging copy
     float GpuHostSubmitWaitMs       = 0.0f;  // [ms] - CPU uniform pack, cmd encode, timeline wait & memcpy
+
+    // Unified 3-System Lighting telemetry (Static Toroidal Clipmap + Dynamic Cube-Grid Pods + Nanite Light BVH)
+    float GpuStaticClipmapBakeMs    = 0.0f;  // [ms] - Automatic dirty-slab static toroidal clipmap bake time
+    float GpuUnifiedDirectLightMs   = 0.0f;  // [ms] - Active unified lighting evaluation pass time
+    float LightClipmapVramKb        = 0.0f;  // [KB] - Fine + Coarse static toroidal clipmap VRAM footprint
+    float CubeGridPodAtlasVramKb    = 0.0f;  // [KB] - Dynamic/static sparse 8x4x4 Cube-Grid Pod atlas VRAM
+    float AvgLightEvalsPerPixel     = 0.0f;  // [cnt]- Average light evaluations per pixel for active lighting mode
+    float LightRelativeRmsePct      = 0.0f;  // [%]  - Measured relative RMSE vs ExactReference
 };
 
 struct PhysicsTelemetryReading

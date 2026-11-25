@@ -57,19 +57,23 @@ struct StudioCameraPresetView
 [[nodiscard]] uint64_t                         HashStableId64(std::string_view Text) noexcept;
 
 [[nodiscard]] Frontier::GeometricRaster::PolygonalAreaQuadLight MakeAimedAreaQuadLight(
-    Frontier::Mathematics::Axis3D    CenterWorld,
-    Frontier::Mathematics::Axis3D    AimTargetWorld,
-    float                            WidthMeters,
-    float                            HeightMeters,
-    Frontier::Mathematics::LinearRGB Radiance,
-    bool                             TwoSided = false) noexcept;
+    Frontier::Mathematics::Axis3D          CenterWorld,
+    Frontier::Mathematics::Axis3D          AimTargetWorld,
+    float                                  WidthMeters,
+    float                                  HeightMeters,
+    Frontier::Mathematics::LinearRGB       Radiance,
+    bool                                   TwoSided        = false,
+    Frontier::GeometricRaster::LightMobility Mobility      = Frontier::GeometricRaster::LightMobility::Static,
+    uint32_t                               LightRigGroupId = 0u) noexcept;
 
 [[nodiscard]] Frontier::GeometricRaster::PhotometricPointRadiator MakeAimedPhotometricSpotLight(
-    Frontier::Mathematics::Axis3D    PosWorld,
-    Frontier::Mathematics::Axis3D    TargetWorld,
-    Frontier::Mathematics::LinearRGB PeakRgb,
-    float                            RangeMeters,
-    uint32_t                         ProfileOrdinal = 2u) noexcept;
+    Frontier::Mathematics::Axis3D          PosWorld,
+    Frontier::Mathematics::Axis3D          TargetWorld,
+    Frontier::Mathematics::LinearRGB       PeakRgb,
+    float                                  RangeMeters,
+    uint32_t                               ProfileOrdinal  = 2u,
+    Frontier::GeometricRaster::LightMobility Mobility      = Frontier::GeometricRaster::LightMobility::Static,
+    uint32_t                               LightRigGroupId = 0u) noexcept;
 
 [[nodiscard]] bool SaveRgba8ImageToPngFile(
     const std::filesystem::path& FilePath,

@@ -287,4 +287,22 @@ bool WorldSceneSyncBridge::SynchronizeAtmosphereToScene(
     return SceneMutated;
 }
 
+void WorldSceneSyncBridge::NotifyLightModified(GeometricRaster::LightMobility Mobility) noexcept
+{
+    if (Mobility == GeometricRaster::LightMobility::Static)
+    {
+        ++StaticLightGeneration;
+    }
+    else
+    {
+        ++DynamicLightGeneration;
+    }
+}
+
+void WorldSceneSyncBridge::SynchronizeLightGenerationsToScene(GeometricRaster::WorldSceneSpecification& TargetScene) const noexcept
+{
+    TargetScene.StaticLightGeneration  = StaticLightGeneration;
+    TargetScene.DynamicLightGeneration = DynamicLightGeneration;
+}
+
 } // namespace Frontier::World

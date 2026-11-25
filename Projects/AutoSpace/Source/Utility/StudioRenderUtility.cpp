@@ -206,12 +206,14 @@ uint64_t HashStableId64(std::string_view Text) noexcept
 }
 
 PolygonalAreaQuadLight MakeAimedAreaQuadLight(
-    Axis3D    CenterWorld,
-    Axis3D    AimTargetWorld,
-    float     WidthMeters,
-    float     HeightMeters,
-    LinearRGB Radiance,
-    bool      TwoSided) noexcept
+    Axis3D        CenterWorld,
+    Axis3D        AimTargetWorld,
+    float         WidthMeters,
+    float         HeightMeters,
+    LinearRGB     Radiance,
+    bool          TwoSided,
+    LightMobility Mobility,
+    uint32_t      LightRigGroupId) noexcept
 {
     const Axis3D AimDir = NormalizeVectorSafe(AimTargetWorld - CenterWorld, { 0.0f, 0.0f, -1.0f });
     const Axis3D RefUp  = (std::fabs(AimDir.Z) < 0.96f) ? Axis3D{ 0.0f, 0.0f, 1.0f } : Axis3D{ 0.0f, 1.0f, 0.0f };
@@ -230,15 +232,19 @@ PolygonalAreaQuadLight MakeAimedAreaQuadLight(
     Quad.HalfHeightMeters = HeightMeters * 0.5f;
     Quad.EmittedRadiance  = Radiance;
     Quad.TwoSidedEmission = TwoSided;
+    Quad.Mobility         = Mobility;
+    Quad.LightRigGroupId  = LightRigGroupId;
     return Quad;
 }
 
 PhotometricPointRadiator MakeAimedPhotometricSpotLight(
-    Axis3D    PosWorld,
-    Axis3D    TargetWorld,
-    LinearRGB PeakRgb,
-    float     RangeMeters,
-    uint32_t  ProfileOrdinal) noexcept
+    Axis3D        PosWorld,
+    Axis3D        TargetWorld,
+    LinearRGB     PeakRgb,
+    float         RangeMeters,
+    uint32_t      ProfileOrdinal,
+    LightMobility Mobility,
+    uint32_t      LightRigGroupId) noexcept
 {
     const Axis3D BeamAxis = NormalizeVectorSafe(TargetWorld - PosWorld, { 0.0f, 0.0f, -1.0f });
     const Axis3D RefUp    = (std::fabs(BeamAxis.Z) < 0.96f) ? Axis3D{ 0.0f, 0.0f, 1.0f } : Axis3D{ 1.0f, 0.0f, 0.0f };
@@ -252,6 +258,8 @@ PhotometricPointRadiator MakeAimedPhotometricSpotLight(
     Lamp.RangeMeters      = RangeMeters;
     Lamp.RadiusMeters     = 0.12f;
     Lamp.ProfileOrdinal   = ProfileOrdinal;
+    Lamp.Mobility         = Mobility;
+    Lamp.LightRigGroupId  = LightRigGroupId;
     return Lamp;
 }
 
@@ -529,13 +537,15 @@ bool RenderWorldVisualProof(
     {
         {
             WorldRenderConfiguration Cfg {};
-            Cfg.Engine             = WorldRenderEngine::RealTimeGiGtxLowEnd;
-            Cfg.ShadowAlgorithm    = SolarShadowAlgorithm::WideTreeRayQuery;
-            Cfg.ReflectionSource   = SpecularReflectionSource::WideTreeRaytrace;
-            Cfg.ReflectionsEnabled = true;
-            Cfg.RaytracingEnabled  = true;
-            Cfg.SdfGiIntensity     = 1.05f;
-            Cfg.ExposureGain       = 1.05f;
+            Cfg.Engine                = WorldRenderEngine::RealTimeGiGtxLowEnd;
+            Cfg.ShadowAlgorithm       = SolarShadowAlgorithm::WideTreeRayQuery;
+            Cfg.ReflectionSource      = SpecularReflectionSource::WideTreeRaytrace;
+            Cfg.LightingMode          = UnifiedLightingMode::ExactReference; // Simple studio lobby: direct lights, no clustering/baking
+            Cfg.AutoBakeStaticClipmap = false;
+            Cfg.ReflectionsEnabled    = true;
+            Cfg.RaytracingEnabled     = true;
+            Cfg.SdfGiIntensity        = 1.05f;
+            Cfg.ExposureGain          = 1.05f;
 
             std::vector<uint8_t> Rgba {};
             if (!GpuSequence.RenderWorldViewportWithEngine(Cfg, 0u, HeroCam, Scene, Rgba))
@@ -562,13 +572,15 @@ bool RenderWorldVisualProof(
         {
             const PerspectiveCameraBasis CrewCam = ResolveProofCamera(CameraPresets, 5u, W, H);
             WorldRenderConfiguration Cfg {};
-            Cfg.Engine             = WorldRenderEngine::RealTimeGiGtxLowEnd;
-            Cfg.ShadowAlgorithm    = SolarShadowAlgorithm::WideTreeRayQuery;
-            Cfg.ReflectionSource   = SpecularReflectionSource::WideTreeRaytrace;
-            Cfg.ReflectionsEnabled = true;
-            Cfg.RaytracingEnabled  = true;
-            Cfg.SdfGiIntensity     = 1.05f;
-            Cfg.ExposureGain       = 1.15f;
+            Cfg.Engine                = WorldRenderEngine::RealTimeGiGtxLowEnd;
+            Cfg.ShadowAlgorithm       = SolarShadowAlgorithm::WideTreeRayQuery;
+            Cfg.ReflectionSource      = SpecularReflectionSource::WideTreeRaytrace;
+            Cfg.LightingMode          = UnifiedLightingMode::ExactReference; // Simple studio lobby: direct lights, no clustering/baking
+            Cfg.AutoBakeStaticClipmap = false;
+            Cfg.ReflectionsEnabled    = true;
+            Cfg.RaytracingEnabled     = true;
+            Cfg.SdfGiIntensity        = 1.05f;
+            Cfg.ExposureGain          = 1.15f;
 
             std::vector<uint8_t> Rgba {};
             if (GpuSequence.RenderWorldViewportWithEngine(Cfg, 1u, CrewCam, Scene, Rgba))
@@ -587,12 +599,14 @@ bool RenderWorldVisualProof(
     else
     {
         WorldRenderConfiguration CpuCfg {};
-        CpuCfg.Engine             = WorldRenderEngine::OpenPbrDirect;
-        CpuCfg.ShadowAlgorithm    = SolarShadowAlgorithm::WideTreeRayQuery;
-        CpuCfg.ReflectionSource   = SpecularReflectionSource::WideTreeRaytrace;
-        CpuCfg.ReflectionsEnabled = true;
-        CpuCfg.RaytracingEnabled  = true;
-        CpuCfg.ExposureGain       = 1.25f;
+        CpuCfg.Engine                = WorldRenderEngine::OpenPbrDirect;
+        CpuCfg.ShadowAlgorithm       = SolarShadowAlgorithm::WideTreeRayQuery;
+        CpuCfg.ReflectionSource      = SpecularReflectionSource::WideTreeRaytrace;
+        CpuCfg.LightingMode          = UnifiedLightingMode::ExactReference; // Simple studio lobby: direct lights, no clustering/baking
+        CpuCfg.AutoBakeStaticClipmap = false;
+        CpuCfg.ReflectionsEnabled    = true;
+        CpuCfg.RaytracingEnabled     = true;
+        CpuCfg.ExposureGain          = 1.25f;
 
         auto Out = CpuSequence.RenderWorldFrameWithEngine(CpuCfg, HeroCam, HeroCam, Scene);
         if (EnableParticles)

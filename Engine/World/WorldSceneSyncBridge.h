@@ -52,9 +52,17 @@ public:
         GeometricRaster::WorldSceneSpecification& TargetScene,
         float                                     Δt) noexcept;
 
+    // Mobility-isolated light dirty tracking: Static edits trigger Toroidal Clipmap re-bake; Dynamic edits never do
+    void NotifyLightModified(GeometricRaster::LightMobility Mobility) noexcept;
+    [[nodiscard]] uint64_t QueryStaticLightGeneration() const noexcept { return StaticLightGeneration; }
+    [[nodiscard]] uint64_t QueryDynamicLightGeneration() const noexcept { return DynamicLightGeneration; }
+    void SynchronizeLightGenerationsToScene(GeometricRaster::WorldSceneSpecification& TargetScene) const noexcept;
+
 private:
     std::vector<uint32_t> ClusterIndexBySlot {}; // [idx]   - Direct O(1) lookup: SlotIndex -> ClusterInstances index
     uint32_t              ActiveBindingCount = 0u; // [count] - Count of active bound SurfaceInstance slots
+    uint64_t              StaticLightGeneration  = 1ull; // [gen] - Monotonic counter for Static lights only
+    uint64_t              DynamicLightGeneration = 1ull; // [gen] - Monotonic counter for Dynamic lights only
 };
 
 } // namespace Frontier::World

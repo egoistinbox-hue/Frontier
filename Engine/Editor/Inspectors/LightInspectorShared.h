@@ -197,4 +197,48 @@ inline void ConstructMinimalOpticGrid(
     WorkspaceAppearance::ConstructWeightedText(Surface, FontWeightClass::Regular, { Plot.Right() - RW, Plot.Bottom() - 12.0f }, 9.6f, InspectorMetrics::DimInk, RightAxis);
 }
 
+// Shared Project Zero Mobility Toggle Card (Static -> Auto-Baked Toroidal Clipmap | Dynamic -> Cube-Grid Pod + Nanite BVH)
+inline float ConstructMobilityToggleCard(
+    PixelSpace& Surface,
+    float       X,
+    float       Y,
+    float       Width,
+    bool        IsStatic,
+    Rectangle2D* OutStaticButtonRect  = nullptr,
+    Rectangle2D* OutDynamicButtonRect = nullptr) noexcept
+{
+    const Rectangle2D Card { X, Y, Width, 86.0f };
+    ConstructDarkLuminaireCard(Surface, Card);
+
+    const float PadX = 14.0f;
+    const float BodyX = X + PadX;
+    const float BodyW = Width - 2.0f * PadX;
+    WorkspaceAppearance::ConstructWeightedText(
+        Surface, FontWeightClass::Regular, { BodyX, Y + 11.0f }, 10.6f, InspectorMetrics::DimInk, "LIGHTING PIPELINE MOBILITY");
+
+    const float Gap = 8.0f;
+    const float BtnW = std::floor((BodyW - Gap) * 0.5f);
+    const Rectangle2D StaticRect  { BodyX, Y + 30.0f, BtnW, 44.0f };
+    const Rectangle2D DynamicRect { BodyX + BtnW + Gap, Y + 30.0f, BtnW, 44.0f };
+    if (OutStaticButtonRect)  *OutStaticButtonRect  = StaticRect;
+    if (OutDynamicButtonRect) *OutDynamicButtonRect = DynamicRect;
+
+    const ColorRgba StaticFill    = IsStatic  ? ColorRgba{ 22u, 48u, 56u, 255u }  : TileFill;
+    const ColorRgba StaticBorder  = IsStatic  ? ColorRgba{ 56u, 217u, 245u, 180u } : TileBorder;
+    const ColorRgba DynamicFill   = !IsStatic ? ColorRgba{ 56u, 42u, 22u, 255u }  : TileFill;
+    const ColorRgba DynamicBorder = !IsStatic ? ColorRgba{ 255u, 180u, 84u, 180u } : TileBorder;
+
+    Surface.FillRectangle(StaticRect, StaticFill, 11.0f);
+    Surface.StrokeRectangle(StaticRect, StaticBorder, 11.0f, 1.0f);
+    WorkspaceAppearance::ConstructWeightedText(Surface, FontWeightClass::Medium, { StaticRect.X + 10.0f, StaticRect.Y + 8.0f }, 11.2f, IsStatic ? ColorRgba{ 143u, 240u, 255u, 255u } : InspectorMetrics::HeadingInk, "Static");
+    WorkspaceAppearance::ConstructWeightedText(Surface, FontWeightClass::Regular, { StaticRect.X + 10.0f, StaticRect.Y + 24.0f }, 9.2f, InspectorMetrics::MutedInk, "Toroidal Clipmap");
+
+    Surface.FillRectangle(DynamicRect, DynamicFill, 11.0f);
+    Surface.StrokeRectangle(DynamicRect, DynamicBorder, 11.0f, 1.0f);
+    WorkspaceAppearance::ConstructWeightedText(Surface, FontWeightClass::Medium, { DynamicRect.X + 10.0f, DynamicRect.Y + 8.0f }, 11.2f, !IsStatic ? ColorRgba{ 255u, 211u, 150u, 255u } : InspectorMetrics::HeadingInk, "Dynamic");
+    WorkspaceAppearance::ConstructWeightedText(Surface, FontWeightClass::Regular, { DynamicRect.X + 10.0f, DynamicRect.Y + 24.0f }, 9.2f, InspectorMetrics::MutedInk, "Pod + Nanite BVH");
+
+    return Card.Bottom() + InspectorMetrics::SectionGap;
+}
+
 } // namespace Frontier::LightUi

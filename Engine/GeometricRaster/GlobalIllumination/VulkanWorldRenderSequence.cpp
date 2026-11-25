@@ -6014,6 +6014,33 @@ bool VulkanWorldRenderSequence::ExecuteWorldRenderDispatch(
     LastViewportTiming.SceneSyncGpuMs += static_cast<float>(
         std::chrono::duration<double, std::milli>(LodSyncEnd - LodSyncStart).count());
 
+    // Synchronize Unified 3-System Lighting (Static Toroidal Clipmap + Dynamic Cube-Grid Pods + Nanite Light BVH).
+    // Simple direct-lit scenes (LightingMode == ExactReference, e.g. AutoSpace lobbies) incur zero clustering or bake overhead.
+    if (Config.LightingMode != UnifiedLightingMode::ExactReference)
+    {
+        const auto SceneLights = ExtractSceneUnifiedLights(Scene.PointLights, Scene.PhotometricRadiators, Scene.AreaLights);
+        if (!SceneLights.empty())
+        {
+            UnifiedLightingSyncOptions LightSyncOpts {};
+            LightSyncOpts.Mode                   = Config.LightingMode;
+            LightSyncOpts.ScalePreset            = Config.LightClipmapScale;
+            LightSyncOpts.AutoBakeStaticClipmap  = Config.AutoBakeStaticClipmap;
+            LightSyncOpts.NaniteErrorBudget      = Config.NaniteLightErrorBudget;
+            LightSyncOpts.StaticClipmapErrorGate = Config.StaticClipmapErrorGate;
+            UnifiedLights.Synchronize(
+                SceneLights,
+                Scene.StaticLightGeneration,
+                Scene.DynamicLightGeneration,
+                { Camera.OriginWorld.X, Camera.OriginWorld.Y, Camera.OriginWorld.Z },
+                LightSyncOpts);
+
+            const StaticClipmapTelemetry& ClipTel = UnifiedLights.InspectStaticClipmap().QueryTelemetry();
+            LastViewportTiming.GpuStaticClipmapBakeMs = ClipTel.LastBakeMilliseconds;
+            LastViewportTiming.LightClipmapVramKb     = ClipTel.TotalVramKilobytes;
+            LastViewportTiming.CubeGridPodAtlasVramKb = static_cast<float>(UnifiedLights.InspectAllPods().size()) * OneCubeGridPodVramKilobytes;
+        }
+    }
+
     const uint32_t WidthPx    = std::max(1u, Camera.ViewportWidthPx);
     const uint32_t HeightPx   = std::max(1u, Camera.ViewportHeightPx);
     const bool     IsHwGpu    = QueryHardwareGpuActive();

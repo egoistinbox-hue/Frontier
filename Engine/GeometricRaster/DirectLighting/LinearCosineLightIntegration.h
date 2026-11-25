@@ -11,6 +11,7 @@
 
 #include "Engine/Codecs/PhotometricProfile.h"
 #include "Engine/GeometricRaster/DirectLighting/SolarShadowSequence.h"
+#include "Engine/GeometricRaster/DirectLighting/UnifiedLightTypes.h"
 #include "Engine/MaterialSpace/CompactMaterialRegister.h"
 
 #include <array>
@@ -27,13 +28,15 @@ namespace Frontier::GeometricRaster
 
 struct PolygonalAreaQuadLight
 {
-    Mathematics::Axis3D    CenterWorld       { 0.0f, 0.0f, 2.5f };  // [m]     - Quad center in world space
-    Mathematics::Axis3D    RightTangent      { 1.0f, 0.0f, 0.0f };  // [-]     - Unit horizontal edge axis
-    Mathematics::Axis3D    UpBitangent       { 0.0f, 1.0f, 0.0f };  // [-]     - Unit vertical edge axis
-    float                  HalfWidthMeters   = 0.85f;               // [m]     - Half-width along RightTangent
-    float                  HalfHeightMeters  = 0.45f;               // [m]     - Half-height along UpBitangent
-    Mathematics::LinearRGB EmittedRadiance   { 5.5f, 4.8f, 4.1f };  // [W/sr/m2]- Emitted uniform diffuse area radiance
-    bool                   TwoSidedEmission  = false;               // [-]     - Emit from both front & back faces
+    Mathematics::Axis3D    CenterWorld       { 0.0f, 0.0f, 2.5f };      // [m]       - Quad center in world space
+    Mathematics::Axis3D    RightTangent      { 1.0f, 0.0f, 0.0f };      // [-]       - Unit horizontal edge axis
+    Mathematics::Axis3D    UpBitangent       { 0.0f, 1.0f, 0.0f };      // [-]       - Unit vertical edge axis
+    float                  HalfWidthMeters   = 0.85f;                   // [m]       - Half-width along RightTangent
+    float                  HalfHeightMeters  = 0.45f;                   // [m]       - Half-height along UpBitangent
+    Mathematics::LinearRGB EmittedRadiance   { 5.5f, 4.8f, 4.1f };      // [W/sr/m2] - Emitted uniform diffuse area radiance
+    bool                   TwoSidedEmission  = false;                   // [-]       - Emit from both front & back faces
+    LightMobility          Mobility          = LightMobility::Static;   // [-]       - Static (Toroidal Clipmap) vs Dynamic
+    uint32_t               LightRigGroupId   = 0u;                      // [idx]     - Multi-lamp fixture pod group ID
 };
 
 struct AmbientOcclusionSettings
@@ -45,22 +48,26 @@ struct AmbientOcclusionSettings
 
 struct DirectPointLightSpec
 {
-    Mathematics::Axis3D    PositionWorld {};                 // [m]   - World point light position
-    float                  RangeMeters   = 8.0f;             // [m]   - Smooth attenuation cutoff radius
-    Mathematics::LinearRGB Color         { 1.0f, 1.0f, 1.0f }; // [-] - Linear RGB tint
-    float                  Intensity     = 1.0f;             // [cd]  - Luminous intensity multiplier
-    float                  RadiusMeters  = 0.10f;            // [m]   - Source sphere radius
+    Mathematics::Axis3D    PositionWorld   {};                        // [m]   - World point light position
+    float                  RangeMeters     = 8.0f;                    // [m]   - Smooth attenuation cutoff radius
+    Mathematics::LinearRGB Color           { 1.0f, 1.0f, 1.0f };      // [-]   - Linear RGB tint
+    float                  Intensity       = 1.0f;                    // [cd]  - Luminous intensity multiplier
+    float                  RadiusMeters    = 0.10f;                   // [m]   - Source sphere radius
+    LightMobility          Mobility        = LightMobility::Dynamic;  // [-]   - Static (Toroidal Clipmap) vs Dynamic
+    uint32_t               LightRigGroupId = 0u;                      // [idx] - Multi-lamp fixture pod group ID
 };
 
 struct PhotometricPointRadiator
 {
-    Mathematics::Axis3D    PositionWorld    { 0.0f, 0.0f, 3.0f };   // [m]    - Emitter apex in world space
-    Mathematics::Axis3D    BeamAxis         { 0.0f, 0.0f, -1.0f };  // [-]    - Unit polar theta=0 emission axis
-    Mathematics::Axis3D    ZeroAzimuthAxis  { 1.0f, 0.0f, 0.0f };   // [-]    - Unit orthogonal phi=0 reference axis
-    Mathematics::LinearRGB PeakIntensityRgb { 1.0f, 1.0f, 1.0f };   // [W/sr] - Radiometric intensity at normalized candela = 1
-    float                  RangeMeters      = 24.0f;                // [m]    - Smooth quartic distance cutoff
-    float                  RadiusMeters     = 0.06f;                // [m]    - Non-singular denominator clamp
-    uint32_t               ProfileOrdinal   = 0u;                   // [idx]  - Index into PhotometricProfiles array
+    Mathematics::Axis3D    PositionWorld    { 0.0f, 0.0f, 3.0f };     // [m]    - Emitter apex in world space
+    Mathematics::Axis3D    BeamAxis         { 0.0f, 0.0f, -1.0f };    // [-]    - Unit polar theta=0 emission axis
+    Mathematics::Axis3D    ZeroAzimuthAxis  { 1.0f, 0.0f, 0.0f };     // [-]    - Unit orthogonal phi=0 reference axis
+    Mathematics::LinearRGB PeakIntensityRgb { 1.0f, 1.0f, 1.0f };     // [W/sr] - Radiometric intensity at normalized candela = 1
+    float                  RangeMeters      = 24.0f;                  // [m]    - Smooth quartic distance cutoff
+    float                  RadiusMeters     = 0.06f;                  // [m]    - Non-singular denominator clamp
+    uint32_t               ProfileOrdinal   = 0u;                     // [idx]  - Index into PhotometricProfiles array
+    LightMobility          Mobility         = LightMobility::Dynamic; // [-]    - Static (Toroidal Clipmap) vs Dynamic
+    uint32_t               LightRigGroupId  = 0u;                     // [idx]  - Multi-lamp fixture pod group ID
 };
 
 struct DirectLightingOutput

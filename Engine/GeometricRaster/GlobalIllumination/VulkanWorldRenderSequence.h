@@ -11,6 +11,7 @@
 
 #include "Engine/Components/Diagnostics/ViewportTimingTelemetry.h"
 #include "Engine/GeometricRaster/Compute/ComputeDispatchEncoder.h"
+#include "Engine/GeometricRaster/DirectLighting/UnifiedLightHierarchy.h"
 #include "Engine/GeometricRaster/GlobalIllumination/TieredWorldRenderSequence.h"
 
 #include <array>
@@ -85,6 +86,8 @@ public:
     [[nodiscard]] const NaniteViewportLodStats&   QueryNaniteLodStats() const noexcept { return NaniteLodStats; }
     [[nodiscard]] const GlobalDistanceFieldStats& QueryGlobalDistanceFieldStats() const noexcept { return DistanceFieldStats; }
     [[nodiscard]] const ViewportTimingBreakdown&  QueryLastTimingBreakdown() const noexcept { return LastViewportTiming; }
+    [[nodiscard]] const UnifiedLightingSystem&    QueryUnifiedLightingSystem() const noexcept { return UnifiedLights; }
+    [[nodiscard]] const std::array<UnifiedLightModeMetrics, 5u>& QueryUnifiedLightMetrics() const noexcept { return CachedLightModeMetrics; }
 
     void SynchronizeSceneResources(
         const WorldSceneSpecification& Scene,
@@ -121,9 +124,10 @@ private:
         kPrecomputeFineGdf       = 1u << 2u,
         kPrecomputeCoarseGdf     = 1u << 3u,
         kPrecomputeRadiosity     = 1u << 4u,
-        kPrecomputeSecondBounce  = 1u << 5u,
-        kPrecomputeRadiosityFull = 1u << 6u,
-        kPrecomputeFullMask      = 0x7Fu,
+        kPrecomputeSecondBounce       = 1u << 5u,
+        kPrecomputeRadiosityFull      = 1u << 6u,
+        kPrecomputeStaticLightClipmap = 1u << 7u,
+        kPrecomputeFullMask           = 0xFFu,
     };
 
     struct CachedLocalLevelSubtree
@@ -458,6 +462,8 @@ private:
     float                  LastDispatchMilliseconds      = 0.0f;
     float                  LastSceneSyncMilliseconds     = 0.0f;
     ViewportTimingBreakdown LastViewportTiming           {};
+    UnifiedLightingSystem  UnifiedLights                 {};
+    std::array<UnifiedLightModeMetrics, 5u> CachedLightModeMetrics {};
 };
 
 } // namespace Frontier::GeometricRaster

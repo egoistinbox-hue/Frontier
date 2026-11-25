@@ -500,3 +500,113 @@ input[type="range"]::-webkit-slider-thumb {
   line-height: 1.45;
   color: #888894;
 }
+
+/* Live FPS / ms & Error Comparison Box */
+.bench-box {
+  padding: 13px 14px 12px;
+  border-radius: 18px;
+  border: 1px solid #2e2e38;
+  background: linear-gradient(135deg, #1d1e24, #15161b);
+  margin-bottom: 12px;
+}
+.bench-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 9px;
+}
+.bench-head h3 {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #e8e8f0;
+}
+.bench-head button {
+  height: 22px;
+  min-height: 22px;
+  padding: 0 9px;
+  font-size: 9.5px;
+  border-radius: 11px;
+  background: #272832;
+  color: #cfd4e0;
+}
+.bench-head button:hover {
+  background: #363846;
+  color: #fff;
+}
+.bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.bench-table th {
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: #6e7280;
+  text-align: right;
+  padding: 0 4px 6px;
+  border-bottom: 1px solid #ffffff0e;
+}
+.bench-table th:first-child { text-align: left; }
+.bench-table tr.bench-row {
+  cursor: pointer;
+  transition: background 100ms ease;
+}
+.bench-table tr.bench-row:hover {
+  background: #ffffff08;
+}
+.bench-table tr.bench-row.active {
+  background: #ffb4541a;
+}
+.bench-table td {
+  padding: 6px 4px;
+  font-size: 10.5px;
+  color: #d4d6e0;
+  text-align: right;
+  border-bottom: 1px solid #ffffff06;
+  white-space: nowrap;
+}
+.bench-table td:first-child {
+  text-align: left;
+  font-weight: 400;
+  color: #eceef4;
+}
+.bench-table tr.bench-row.active td:first-child {
+  color: #ffb454;
+  font-weight: 500;
+}
+.bench-ms { color: #8ef0b0 !important; font-weight: 500; }
+.bench-ms.slow { color: #ff8e86 !important; }
+.bench-err { color: #ffb454 !important; }
+.bench-err.good { color: #5bdb87 !important; }
+.bench-err.bad { color: #ff5f56 !important; }
+.bench-bar-wrap {
+  width: 100%;
+  height: 3px;
+  background: #ffffff0e;
+  border-radius: 3px;
+  margin-top: 3px;
+  overflow: hidden;
+}
+.bench-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: #5bdb87;
+}
+.bench-delta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid #ffffff0c;
+  font-size: 10px;
+  color: #8c90a0;
+}
+.bench-delta-row b {
+  color: #5bdb87;
+  font-weight: 500;
+}
+

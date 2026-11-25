@@ -39,7 +39,7 @@
               <small>32 individual emitters + real shadows + GGX</small>
             </div>
           </div>
-          <div class="vp-sub-legend">32 evals / pixel</div>
+          <div class="vp-sub-legend" id="TruthPerfBadge">32 evals/px &middot; -- ms (-- fps)</div>
         </div>
 
         <!-- VIEWPORT 2: SELECTED LIGHT-MERGING ALGORITHM -->
@@ -53,7 +53,7 @@
               <small id="ApproxSub">Averages headlights at car center (watch the error!)</small>
             </div>
           </div>
-          <div class="vp-sub-legend" id="ApproxEvalBadge">6 evals / pixel</div>
+          <div class="vp-sub-legend" id="ApproxEvalBadge">6 evals/px &middot; -- ms (-- fps)</div>
         </div>
 
         <!-- VIEWPORT 3: REAL-TIME PER-PIXEL ERROR HEATMAP |TRUTH - APPROX| -->
@@ -111,6 +111,30 @@
           <div class="metric-tile">
             <b id="MetricSpeedup">5.3<small>&times;</small></b>
             <span>LIGHT SPEEDUP</span>
+          </div>
+        </div>
+
+        <!-- LIVE GPU FPS / MS & ERROR COMPARISON BOX -->
+        <div class="bench-box">
+          <div class="bench-head">
+            <h3>GPU Frame Time (ms / FPS) &amp; Error Box</h3>
+            <button id="BtnRunGpuBench" title="Measure real WebGL GPU render time for all 5 modes">&#8635; Re-Measure</button>
+          </div>
+          <table class="bench-table">
+            <thead>
+              <tr>
+                <th>Pipeline</th>
+                <th>GPU ms</th>
+                <th>FPS</th>
+                <th>RMSE</th>
+                <th>PSNR</th>
+              </tr>
+            </thead>
+            <tbody id="BenchTableBody"></tbody>
+          </table>
+          <div class="bench-delta-row">
+            <span>Selected vs Truth GPU Gain</span>
+            <b id="BenchGainSummary">Measuring GPU...</b>
           </div>
         </div>
 

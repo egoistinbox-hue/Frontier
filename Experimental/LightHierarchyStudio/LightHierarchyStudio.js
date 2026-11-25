@@ -79,6 +79,9 @@ let lastBakeTime = -10;
 let lastStatsTime = -10;
 let fpsSmooth = 60;
 let lastFrameMs = performance.now();
+let gpuBenchRows = [];
+let benchPending = true;
+let benchDebounceTimer = null;
 
 function BuildCameraFrame() {
   const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
@@ -187,6 +190,123 @@ function UpdateHeadlightDiagnostic() {
   }
 }
 
+function ScheduleGpuBenchmark(delayMs = 220) {
+  if (benchDebounceTimer) clearTimeout(benchDebounceTimer);
+  benchDebounceTimer = setTimeout(() => {
+    benchPending = true;
+  }, delayMs);
+}
+
+/**
+ * Measures REAL isolated WebGL GPU render time (ms & equivalent FPS) across all 5 lighting pipelines
+ * using gl.finish()-bracketed multi-iteration passes on the live viewport resolution, paired with exact RMSE & PSNR!
+ */
+function RunGpuComparisonBenchmark(cam, commonParams) {
+  const gl = vpApprox.gl;
+  const benchSpecs = [
+    { key: 'truth',  label: 'Truth (32L)',     viewMode: 0, list: rawLights },
+    { key: 'naive',  label: '01 Naive Merge',  viewMode: 1, list: naiveLights },
+    { key: 'grid',   label: '02 Baked Grid',   viewMode: 2, list: activeCut },
+    { key: 'nanite', label: '03 Nanite BVH',   viewMode: 3, list: activeCut },
+    { key: 'hybrid', label: '04 Error Hybrid', viewMode: 4, list: activeCut },
+  ];
+
+  const evalOpts = {
+    errorThreshold: state.lodThreshold,
+    maxActiveLights: state.maxActiveLights,
+    hybridErrorGate: state.hybridErrorGate,
+  };
+
+  const rows = [];
+  const iters = 6;
+
+  for (const spec of benchSpecs) {
+    // 1 warm-up pass so shader pipeline & GPU clocks settle
+    vpApprox.render(cam, rawLights, spec.list, { ...commonParams, viewMode: spec.viewMode });
+    gl.finish();
+
+    const t0 = performance.now();
+    for (let k = 0; k < iters; k++) {
+      vpApprox.render(cam, rawLights, spec.list, { ...commonParams, viewMode: spec.viewMode });
+    }
+    gl.finish();
+    const avgMs = Math.max(0.05, (performance.now() - t0) / iters);
+    const eqFps = Math.min(9999, Math.round(1000.0 / avgMs));
+
+    let rmse = 0.0;
+    let psnr = 99.9;
+    let avgEvals = rawLights.length;
+    if (spec.key !== 'truth') {
+      const s = EvaluateModeErrorStats(spec.key, rawLights, naiveLights, bvhRoot, bakedGrid, evalOpts);
+      rmse = s.rmse;
+      psnr = s.psnr;
+      avgEvals = s.avgEvals;
+    }
+
+    rows.push({
+      key: spec.key,
+      label: spec.label,
+      ms: avgMs,
+      fps: eqFps,
+      rmse,
+      psnr,
+      avgEvals,
+    });
+  }
+
+  gpuBenchRows = rows;
+  RenderBenchmarkBox();
+}
+
+function RenderBenchmarkBox() {
+  const tbody = document.getElementById('BenchTableBody');
+  if (!tbody || gpuBenchRows.length === 0) return;
+
+  const truthRow = gpuBenchRows.find((r) => r.key === 'truth') || gpuBenchRows[0];
+  const maxMs = Math.max(0.1, ...gpuBenchRows.map((r) => r.ms));
+
+  tbody.innerHTML = '';
+  for (const r of gpuBenchRows) {
+    const isSelected = r.key === state.mode;
+    const isTruth = r.key === 'truth';
+    const msClass = r.ms >= truthRow.ms * 0.85 ? 'bench-ms slow' : 'bench-ms';
+    const errClass = isTruth ? 'bench-err good' : r.rmse > 0.04 ? 'bench-err bad' : r.rmse < 0.022 ? 'bench-err good' : 'bench-err';
+    const barPct = Math.min(100, Math.round((r.ms / maxMs) * 100));
+    const barCol = isTruth ? '#ff8e86' : r.rmse > 0.04 ? '#ff5f56' : '#5bdb87';
+
+    const tr = document.createElement('tr');
+    tr.className = `bench-row${isSelected ? ' active' : ''}`;
+    tr.innerHTML = `
+      <td>
+        ${r.label}
+        <div class="bench-bar-wrap"><div class="bench-bar-fill" style="width:${barPct}%;background:${barCol};"></div></div>
+      </td>
+      <td class="${msClass}">${r.ms.toFixed(2)} ms</td>
+      <td>${r.fps >= 1000 ? `${(r.fps / 1000).toFixed(1)}k` : r.fps}</td>
+      <td class="${errClass}">${isTruth ? '0.0000' : r.rmse.toFixed(4)}</td>
+      <td>${isTruth ? 'REF' : `${r.psnr.toFixed(1)}dB`}</td>
+    `;
+    if (!isTruth) {
+      tr.addEventListener('click', () => SelectMode(r.key));
+    }
+    tbody.appendChild(tr);
+  }
+
+  // Update viewport corner performance pills + summary delta row
+  const curRow = gpuBenchRows.find((r) => r.key === state.mode) || truthRow;
+  const truthBadge = document.getElementById('TruthPerfBadge');
+  if (truthBadge) truthBadge.textContent = `32 evals/px · ${truthRow.ms.toFixed(2)} ms (${truthRow.fps} fps)`;
+  const approxBadge = document.getElementById('ApproxEvalBadge');
+  if (approxBadge) approxBadge.textContent = `${curRow.avgEvals.toFixed(1)} evals/px · ${curRow.ms.toFixed(2)} ms (${curRow.fps} fps)`;
+
+  const gainEl = document.getElementById('BenchGainSummary');
+  if (gainEl) {
+    const ratio = truthRow.ms / Math.max(0.05, curRow.ms);
+    const savedMs = truthRow.ms - curRow.ms;
+    gainEl.textContent = `${ratio.toFixed(2)}× GPU · ${savedMs >= 0 ? '-' : '+'}${Math.abs(savedMs).toFixed(2)} ms · RMSE ${curRow.rmse.toFixed(4)}`;
+  }
+}
+
 function UpdateErrorMetrics(recordPoint = false) {
   const stats = EvaluateModeErrorStats(state.mode, rawLights, naiveLights, bvhRoot, bakedGrid, {
     errorThreshold: state.lodThreshold,
@@ -198,7 +318,6 @@ function UpdateErrorMetrics(recordPoint = false) {
   document.getElementById('MetricPsnr').innerHTML = `${stats.psnr.toFixed(1)}<small>dB</small>`;
   document.getElementById('MetricEvals').innerHTML = `${stats.avgEvals.toFixed(1)}<small>/px</small>`;
   document.getElementById('MetricSpeedup').innerHTML = `${stats.speedup.toFixed(1)}<small>&times;</small>`;
-  document.getElementById('ApproxEvalBadge').textContent = `${stats.avgEvals.toFixed(1)} avg evals / px`;
   document.getElementById('FootGrid').textContent = `${state.gridRes}×${state.gridRes}`;
   document.getElementById('FootCut').textContent = `${GetActiveApproxLightList().length} active lights`;
 
@@ -208,6 +327,7 @@ function UpdateErrorMetrics(recordPoint = false) {
     DrawErrorChart();
   }
   UpdateHeadlightDiagnostic();
+  RenderBenchmarkBox();
 }
 
 function DrawErrorChart() {
@@ -328,7 +448,14 @@ function InitUI() {
     b.addEventListener('click', () => SelectMode(b.dataset.mode));
   });
 
-  document.getElementById('BtnAutoRefine').addEventListener('click', RunErrorGuidedRefinementStep);
+  document.getElementById('BtnRunGpuBench').addEventListener('click', () => {
+    benchPending = true;
+  });
+
+  document.getElementById('BtnAutoRefine').addEventListener('click', () => {
+    RunErrorGuidedRefinementStep();
+    ScheduleGpuBenchmark(150);
+  });
   document.getElementById('BtnResetRefine').addEventListener('click', () => {
     state.refineStep = 0;
     state.errorHistory = [];
@@ -377,9 +504,9 @@ function InitUI() {
       fn(v);
     });
   };
-  bindRange('RangeGridRes', 'OutGridRes', (v) => `${Math.round(v)}×${Math.round(v)}`, (v) => { state.gridRes = Math.round(v); RecomputeLightingData(true); });
-  bindRange('RangeLodThreshold', 'OutLodThreshold', (v) => v.toFixed(2), (v) => { state.lodThreshold = v; RecomputeLightingData(true); });
-  bindRange('RangeHybridGate', 'OutHybridGate', (v) => v.toFixed(2), (v) => { state.hybridErrorGate = v; RecomputeLightingData(true); });
+  bindRange('RangeGridRes', 'OutGridRes', (v) => `${Math.round(v)}×${Math.round(v)}`, (v) => { state.gridRes = Math.round(v); RecomputeLightingData(true); ScheduleGpuBenchmark(); });
+  bindRange('RangeLodThreshold', 'OutLodThreshold', (v) => v.toFixed(2), (v) => { state.lodThreshold = v; RecomputeLightingData(true); ScheduleGpuBenchmark(); });
+  bindRange('RangeHybridGate', 'OutHybridGate', (v) => v.toFixed(2), (v) => { state.hybridErrorGate = v; RecomputeLightingData(true); ScheduleGpuBenchmark(); });
   bindRange('RangeErrorGain', 'OutErrorGain', (v) => v.toFixed(1), (v) => { state.errorGain = v; });
   bindRange('RangeRoughness', 'OutRoughness', (v) => v.toFixed(2), (v) => { state.floorRoughness = v; });
 
@@ -440,6 +567,12 @@ function Tick(nowMs) {
     showGrid: state.showGrid,
     showHybridMask: state.showHybridMask,
   };
+
+  // Run isolated GPU timing benchmark across all 5 pipelines when requested (startup / slider change / Re-Measure)
+  if (benchPending) {
+    benchPending = false;
+    RunGpuComparisonBenchmark(cam, commonParams);
+  }
 
   // Render all 3 synchronized WebGL viewports
   vpTruth.render(cam, rawLights, approxList, { ...commonParams, viewMode: 0 });

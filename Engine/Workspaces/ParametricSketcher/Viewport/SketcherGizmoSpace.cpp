@@ -32,26 +32,28 @@ namespace
 //                                                    CONSTANTS
 //------------------------------------------------------------------------------------------------------------------------
 
-// 📝 Slate References/Gizmo.html (L = 1): colours, and the handle geometry in units of L.
+// 📝 Unified with Frontier Editor's TransformGizmo (Slate GizmoPRO palette & proportions, L = 1).
 constexpr uint32_t AxisColours[3]  = { 0xe01414u, 0x12d40au, 0x1560e0u };                    // [-]   - X red, Y green, Z blue (0xRRGGBB)
 constexpr uint32_t PlaneColours[3] = { 0x1fc7c7u, 0xc81ec8u, 0xe0cd12u };                    // [-]   - YZ cyan, XZ magenta, XY yellow
-constexpr uint32_t RingColour      = 0xffffffu;                                              // [-]   - Centre ring
+constexpr uint32_t RingColour      = 0xffffffu;                                              // [-]   - Centre ring & axis stems
 constexpr uint32_t GlowColour      = 0x555555u;                                              // [-]   - Hover emissive
 
-constexpr double Tip         = 0.95;                                                         // [L]   - Cone centre along its axis
-constexpr double ConeRadius  = 0.06;                                                         // [L]   - Cone base radius
-constexpr double ConeHeight  = 0.18;                                                         // [L]   - Cone height (centred on Tip)
-constexpr double ScaleRadius = 0.06;                                                         // [L]   - Scale cylinder radius
-constexpr double ScaleHeight = 0.14;                                                         // [L]   - Scale cylinder length
-constexpr double ScaleCentre = Tip - 0.28;                                                   // [L]   - Scale cylinder centre
-constexpr double PlaneHalf   = 0.08;                                                         // [L]   - Plane quad half side
-constexpr double PlaneCentre = Tip - PlaneHalf;                                              // [L]   - Quad centre along u and v
-constexpr double ArcRadius   = 0.62 * Tip;                                                   // [L]   - Rotate arc centre line
-constexpr double ArcBand     = 0.038;                                                        // [L]   - Arc half width
+constexpr double Tip          = 0.95;                                                        // [L]   - Cone centre along its axis
+constexpr double ConeRadius   = 0.055;                                                       // [L]   - Cone base radius (matches TransformGizmo)
+constexpr double ConeHeight   = 0.18;                                                        // [L]   - Cone height (centred on Tip)
+constexpr double ScaleRadius  = 0.048;                                                       // [L]   - Scale cylinder radius (matches TransformGizmo)
+constexpr double ScaleHeight  = 0.12;                                                        // [L]   - Scale cylinder length (matches TransformGizmo)
+constexpr double ScaleCentre  = Tip - 0.28;                                                  // [L]   - Scale cylinder centre (0.67 L)
+constexpr double StemRadius   = 0.0105;                                                      // [L]   - Pure white axis stem radius (matches TransformGizmo)
+constexpr double RingOuterRim = 0.168;                                                       // [L]   - Outer rim of centre ring where axis stems start
+constexpr double PlaneHalf    = 0.08;                                                        // [L]   - Plane quad half side
+constexpr double PlaneCentre  = Tip - PlaneHalf;                                             // [L]   - Quad centre along u and v
+constexpr double ArcRadius    = 0.62 * Tip;                                                  // [L]   - Rotate arc centre line
+constexpr double ArcBand      = 0.034;                                                       // [L]   - Arc half width (matches TransformGizmo)
 constexpr double DegreesToRadians(double Deg) noexcept { return Deg * (std::numbers::pi / 180.0); }
-constexpr double ArcSweep    = DegreesToRadians(31.0);                                     // [rad] - Arc span
-constexpr double RingRadius  = 0.16;                                                         // [L]   - Centre ring radius
-constexpr double RingTube    = 0.008;                                                        // [L]   - Ring tube radius
+constexpr double ArcSweep     = DegreesToRadians(31.0);                                      // [rad] - Arc span
+constexpr double RingRadius   = 0.16;                                                        // [L]   - Centre ring radius
+constexpr double RingTube     = 0.008;                                                       // [L]   - Ring tube radius
 constexpr double StrokePixels = 1.6;                                                         // [px]  - Quad edge stroke width
 constexpr int    RoundSegments = 24;                                                         // [-]   - Cone / cylinder facets
 constexpr int    ArcSegments   = 24;                                                         // [-]   - Arc pieces
@@ -59,6 +61,8 @@ constexpr int    RingSegments  = 64;                                            
 
 constexpr uint8_t QuadAlpha      = 71;                                                       // [-] - Opacity 0.28
 constexpr uint8_t QuadHoverAlpha = 140;                                                      // [-] - Opacity 0.55 on hover
+constexpr uint8_t SweepAlpha     = 76;                                                       // [-] - Opacity 0.30 (matches TransformGizmo sweep wedge)
+constexpr uint8_t GuideLineAlpha = 153;                                                      // [-] - Opacity 0.60 (matches TransformGizmo travel guide)
 
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    INTERNAL FUNCTIONS
@@ -108,7 +112,8 @@ public:
     }
 
     // A round solid along Axis (local unit vector): radius tapering from BaseRadius at Start to TopRadius at End.
-    void Round(Vector3 Axis, double Start, double End, double BaseRadius, double TopRadius, uint32_t Colour, GizmoHandle Handle)
+    // Pass LitCondition = false for Frontier-style flat unlit white axis stems and drag travel guides.
+    void Round(Vector3 Axis, double Start, double End, double BaseRadius, double TopRadius, uint32_t Colour, GizmoHandle Handle, bool LitCondition = true)
     {
         const Vector3 First  = Perpendicular(Axis);
         const Vector3 Second = Cross(Axis, First);
@@ -125,12 +130,51 @@ public:
                 Low[Side]   = Place(Axis * Start + Spoke[Side] * BaseRadius);
                 High[Side]  = Place(Axis * End + Spoke[Side] * TopRadius);
             }
-            const Vector3 Middle = Normalize(Turn(Spoke[0] + Spoke[1]) + Up * Slope);
+            const Vector3 Middle = LitCondition ? Normalize(Turn(Spoke[0] + Spoke[1]) + Up * Slope) : Vector3{};
+            const Vector3 BotN   = LitCondition ? Up * -1.0 : Vector3{};
+            const Vector3 TopN   = LitCondition ? Up : Vector3{};
             Triangle(Low[0], Low[1], High[1], Middle, Colour, Handle);
             if (TopRadius > 0.0) Triangle(Low[0], High[1], High[0], Middle, Colour, Handle);
             else                 Triangle(Low[0], High[1], Top, Middle, Colour, Handle);
-            Triangle(Bottom, Low[1], Low[0], Up * -1.0, Colour, Handle);
-            if (TopRadius > 0.0) Triangle(Top, High[0], High[1], Up, Colour, Handle);
+            Triangle(Bottom, Low[1], Low[0], BotN, Colour, Handle);
+            if (TopRadius > 0.0) Triangle(Top, High[0], High[1], TopN, Colour, Handle);
+        }
+    }
+
+    // World-space unlit cylinder between WorldCentre - WorldAxis*(Len/2) and WorldCentre + WorldAxis*(Len/2).
+    void WorldCylinder(Vector3 WorldCentre, Vector3 WorldAxis, double RadiusWorld, double LengthWorld, uint32_t Colour, GizmoHandle Handle)
+    {
+        const Vector3 Unit   = Normalize(WorldAxis);
+        const Vector3 First  = Perpendicular(Unit);
+        const Vector3 Second = Cross(Unit, First);
+        const Vector3 Bottom = WorldCentre - Unit * (0.5 * LengthWorld);
+        const Vector3 Top    = WorldCentre + Unit * (0.5 * LengthWorld);
+        constexpr int Segs = 16;
+        for (int Index = 0; Index < Segs; ++Index)
+        {
+            const double A0 = 2.0 * std::numbers::pi * Index / Segs;
+            const double A1 = 2.0 * std::numbers::pi * (Index + 1) / Segs;
+            const Vector3 R0 = (First * std::cos(A0) + Second * std::sin(A0)) * RadiusWorld;
+            const Vector3 R1 = (First * std::cos(A1) + Second * std::sin(A1)) * RadiusWorld;
+            Triangle(Bottom + R0, Bottom + R1, Top + R1, {}, Colour, Handle);
+            Triangle(Bottom + R0, Top + R1, Top + R0, {}, Colour, Handle);
+            Triangle(Bottom, Bottom + R1, Bottom + R0, {}, Colour, Handle);
+            Triangle(Top, Top + R0, Top + R1, {}, Colour, Handle);
+        }
+    }
+
+    // World-space unlit annular band in plane (WorldU, WorldV) centred at WorldPivot.
+    void WorldBand(Vector3 WorldPivot, Vector3 WorldU, Vector3 WorldV, double InnerWorld, double OuterWorld,
+                   double LowAngle, double HighAngle, int Segments, uint32_t Colour, GizmoHandle Handle)
+    {
+        for (int Index = 0; Index < Segments; ++Index)
+        {
+            const double A0 = LowAngle + (HighAngle - LowAngle) * Index / Segments;
+            const double A1 = LowAngle + (HighAngle - LowAngle) * (Index + 1) / Segments;
+            const Vector3 D0 = WorldU * std::cos(A0) + WorldV * std::sin(A0);
+            const Vector3 D1 = WorldU * std::cos(A1) + WorldV * std::sin(A1);
+            Triangle(WorldPivot + D0 * InnerWorld, WorldPivot + D0 * OuterWorld, WorldPivot + D1 * OuterWorld, {}, Colour, Handle);
+            Triangle(WorldPivot + D0 * InnerWorld, WorldPivot + D1 * OuterWorld, WorldPivot + D1 * InnerWorld, {}, Colour, Handle);
         }
     }
 
@@ -265,6 +309,15 @@ namespace
         }
         H = Mix(H, static_cast<uint64_t>(Hover));
         H = Mix(H, static_cast<uint64_t>(Grabbed));
+        H = Mix(H, Pose.Guide.Active ? 1ull : 0ull);
+        if (Pose.Guide.Active)
+        {
+            H = Mix(H, Bits(Pose.Guide.StartOrigin.X));
+            H = Mix(H, Bits(Pose.Guide.StartOrigin.Y));
+            H = Mix(H, Bits(Pose.Guide.StartOrigin.Z));
+            H = Mix(H, Bits(Pose.Guide.StartAngleRad));
+            H = Mix(H, Bits(Pose.Guide.DeltaAngleRad));
+        }
         return H == 0ull ? 1ull : H;
     }
 } // namespace
@@ -308,14 +361,20 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
     }
 
     GlobalGizmoCacheRebuilds.fetch_add(1ull, std::memory_order_relaxed);
-    Geometry.Vertices.reserve(2048u);
+    Geometry.Vertices.reserve(4096u);
     GizmoBuilder  Builder(Pose, Geometry.Vertices);
     const Vector3 Units[3] = { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+    const Vector3 Right    = FromArray(Frame.Right);
+    const Vector3 Up       = FromArray(Frame.Up);
     const Vector3 Toward   = FromArray(Frame.Forward) * -1.0;                                 // [-] - Towards the eye
     const auto Glow = [&](GizmoHandle Handle) { return Handle == Hover || Handle == Grabbed; };
     const auto Shown = [&](GizmoHandle Handle) { return !HiddenCondition(Pose, Handle); };
 
-    // ① opaque: cones, scale cylinders, rotate arcs, quad edges, centre ring
+    // ① Frontier Editor unified opaque handles: pure white axis stems + cones + scale cylinders + rotate arcs + quad edges + centre ring
+    const bool EmitTranslate = (Pose.Modes & GizmoTranslate) != 0u;
+    const bool EmitScale     = (Pose.Modes & GizmoScale) != 0u;
+    const bool EmitRotate    = (Pose.Modes & GizmoRotate) != 0u;
+
     for (int Axis = 0; Axis < 3; ++Axis)
     {
         const Vector3 OtherU = Axis == 0 ? Units[1] : Units[0];                              // [-] - Slate OTHERS[axis].u
@@ -324,17 +383,38 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
         const auto Rotate    = GizmoHandle(uint8_t(GizmoHandle::RotateX) + Axis);
         const auto Scale     = GizmoHandle(uint8_t(GizmoHandle::ScaleX) + Axis);
         const auto Plane     = GizmoHandle(uint8_t(GizmoHandle::PlaneYZ) + Axis);
-        if ((Pose.Modes & GizmoTranslate) && Shown(Translate))
+
+        const bool ShowT = EmitTranslate && Shown(Translate);
+        const bool ShowS = EmitScale && Shown(Scale);
+
+        // Pure white axis stem matching Frontier's TransformGizmo: starts strictly at the centre ring's outer rim
+        // (never entering the circle) and stops cleanly before the scale collar (or cone base when translate-only).
+        if (ShowT || ShowS)
+        {
+            const Vector3 WorldAxis  = Builder.Turn(Units[Axis]);
+            const double  ProjX      = Dot(WorldAxis, Right);
+            const double  ProjY      = Dot(WorldAxis, Up);
+            const double  ScreenProj = std::hypot(ProjX, ProjY);
+            const double  StemFinish = ShowS ? (ScaleCentre - 0.062) : (Tip - 0.092);
+            const double  RimStart   = (ScreenProj > 0.20) ? (RingOuterRim / ScreenProj) : StemFinish;
+            if (StemFinish > RimStart + 0.015)
+            {
+                const GizmoHandle StemOwner = ShowT ? Translate : Scale;
+                Builder.Round(Units[Axis], RimStart, StemFinish, StemRadius, StemRadius, PackColour(RingColour, false), StemOwner, false);
+            }
+        }
+
+        if (ShowT)
             Builder.Round(Units[Axis], Tip - 0.5 * ConeHeight, Tip + 0.5 * ConeHeight, ConeRadius, 0.0, PackColour(AxisColours[Axis], Glow(Translate)), Translate);
-        if ((Pose.Modes & GizmoScale) && Shown(Scale))
+        if (ShowS)
             Builder.Round(Units[Axis], ScaleCentre - 0.5 * ScaleHeight, ScaleCentre + 0.5 * ScaleHeight, ScaleRadius, ScaleRadius, PackColour(AxisColours[Axis], Glow(Scale)), Scale);
-        if ((Pose.Modes & GizmoRotate) && Shown(Rotate))
+        if (EmitRotate && Shown(Rotate))
         {
             const double Centre = 0.25 * std::numbers::pi;                                   // [rad] - Bisector of u and v
             Builder.Band(OtherU, OtherV, ArcRadius - ArcBand, ArcRadius + ArcBand, Centre - 0.5 * ArcSweep, Centre + 0.5 * ArcSweep, ArcSegments,
                          PackColour(AxisColours[Axis], Glow(Rotate)), Rotate);
         }
-        if ((Pose.Modes & GizmoTranslate) && Shown(Plane))
+        if (EmitTranslate && Shown(Plane))
         {
             const double  Width = StrokePixels / GizmoPixels * Pose.Size;                    // [len]
             const Vector3 Outer = Builder.Place((OtherU + OtherV) * (PlaneCentre + PlaneHalf));
@@ -345,7 +425,6 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
     // Centre ring: a band facing the eye (Slate billboards a thin torus).
     if (Shown(GizmoHandle::Centre))
     {
-        const Vector3 Right = FromArray(Frame.Right), Up = FromArray(Frame.Up);
         const Vector3 LocalRight{ Dot(Right, Pose.Axes[0]), Dot(Right, Pose.Axes[1]), Dot(Right, Pose.Axes[2]) };
         const Vector3 LocalUp{ Dot(Up, Pose.Axes[0]), Dot(Up, Pose.Axes[1]), Dot(Up, Pose.Axes[2]) };
         const double  Tube = std::max(RingTube, 0.75 * StrokePixels / GizmoPixels);          // [L] - At least a visible stroke
@@ -355,7 +434,7 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
     Geometry.OpaqueCount = static_cast<uint32_t>(Geometry.Vertices.size());
 
     // ② translucent plane quads (drawn last, blended)
-    if (Pose.Modes & GizmoTranslate)
+    if (EmitTranslate)
     {
         for (int Axis = 0; Axis < 3; ++Axis)
         {
@@ -371,6 +450,70 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
             Builder.Triangle(Corners[0], Corners[2], Corners[3], {}, Colour, Plane);
         }
     }
+
+    // Record pickable range & tight 3D world AABB before appending visual-only Frontier drag guides.
+    Geometry.PickableCount = static_cast<uint32_t>(Geometry.Vertices.size());
+    for (uint32_t I = 0u; I < Geometry.PickableCount; ++I)
+    {
+        const float* P = Geometry.Vertices[I].Position;
+        for (int A = 0; A < 3; ++A)
+        {
+            Geometry.BoundsLow[A]  = std::min(Geometry.BoundsLow[A],  double(P[A]));
+            Geometry.BoundsHigh[A] = std::max(Geometry.BoundsHigh[A], double(P[A]));
+        }
+    }
+
+    // ③ Frontier active-drag visual guides (360° rotation circle + swept wedge + spokes, or extended axis travel line + origin tick)
+    if (Pose.Guide.Active && Grabbed != GizmoHandle::None)
+    {
+        const int DragAxis = GizmoHandleAxis(Grabbed);
+        if (DragAxis >= 0 && DragAxis < 3)
+        {
+            const double L = Pose.Size;
+            const Vector3 StartOrigin = Pose.Guide.StartOrigin;
+            if (Grabbed == GizmoHandle::RotateX || Grabbed == GizmoHandle::RotateY || Grabbed == GizmoHandle::RotateZ)
+            {
+                const Vector3 OtherU = DragAxis == 0 ? Units[1] : Units[0];
+                const Vector3 OtherV = DragAxis == 2 ? Units[1] : Units[2];
+                const Vector3 WorldU = Normalize(Builder.Turn(OtherU));
+                const Vector3 WorldV = Normalize(Builder.Turn(OtherV));
+                const double  RingR  = ArcRadius * L;
+                const double  HalfB  = 0.015 * L;
+                const double  InnerR = std::max(0.01 * L, RingR - HalfB);
+                const double  OuterR = RingR + HalfB;
+                const double  WedgeR = 0.175 * L;
+                const uint32_t SolidCol = PackColour(AxisColours[DragAxis], false, 255);
+                const uint32_t WedgeCol = PackColour(AxisColours[DragAxis], false, SweepAlpha);
+
+                Builder.WorldBand(StartOrigin, WorldU, WorldV, InnerR, OuterR, 0.0, 2.0 * std::numbers::pi, 64, SolidCol, Grabbed);
+                const double AbsRad = std::abs(Pose.Guide.DeltaAngleRad);
+                if (AbsRad > 0.005)
+                {
+                    const int SweepSegs = std::clamp(int(std::ceil(AbsRad / DegreesToRadians(5.0))), 2, 64);
+                    Builder.WorldBand(StartOrigin, WorldU, WorldV, WedgeR, InnerR,
+                                      Pose.Guide.StartAngleRad, Pose.Guide.StartAngleRad + Pose.Guide.DeltaAngleRad,
+                                      SweepSegs, WedgeCol, Grabbed);
+                }
+                const auto AddSpoke = [&](double AngleRad, uint32_t SpokeCol)
+                {
+                    const Vector3 Dir = WorldU * std::cos(AngleRad) + WorldV * std::sin(AngleRad);
+                    const double SpokeLen = std::max(0.01 * L, InnerR - WedgeR);
+                    const double SpokeMid = 0.5 * (WedgeR + InnerR);
+                    Builder.WorldCylinder(StartOrigin + Dir * SpokeMid, Dir, HalfB * 0.55, SpokeLen, SpokeCol, Grabbed);
+                };
+                AddSpoke(Pose.Guide.StartAngleRad, PackColour(RingColour, false, 255));
+                AddSpoke(Pose.Guide.StartAngleRad + Pose.Guide.DeltaAngleRad, SolidCol);
+            }
+            else if (Grabbed == GizmoHandle::TranslateX || Grabbed == GizmoHandle::TranslateY || Grabbed == GizmoHandle::TranslateZ ||
+                     Grabbed == GizmoHandle::ScaleX     || Grabbed == GizmoHandle::ScaleY     || Grabbed == GizmoHandle::ScaleZ)
+            {
+                const Vector3 WorldAxis = Normalize(Builder.Turn(Units[DragAxis]));
+                Builder.WorldCylinder(StartOrigin, WorldAxis, 0.0060 * L, 32.0 * L, PackColour(AxisColours[DragAxis], false, GuideLineAlpha), Grabbed);
+                Builder.WorldCylinder(StartOrigin, WorldAxis, 0.026 * L,  0.014 * L, PackColour(RingColour, false, 255), Grabbed);
+            }
+        }
+    }
+
     Cache[Victim].Key   = Key;
     Cache[Victim].Stamp = ++StampCounter;
     Cache[Victim].Value = Geometry;
@@ -379,21 +522,52 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
 
 GizmoHandle PickGizmoHandle(const GizmoGeometry& Geometry, const OrbitCameraBasis& Frame, double PixelX, double PixelY, double Reach)
 {
-    if (Geometry.Vertices.size() < 3u) return GizmoHandle::None;
+    const size_t PickVerts = Geometry.PickableCount > 0u
+        ? std::min<size_t>(Geometry.PickableCount, Geometry.Vertices.size())
+        : Geometry.Vertices.size();
+    if (PickVerts < 3u) return GizmoHandle::None;
+
     struct Projected { double X = 0.0, Y = 0.0, Depth = 0.0; bool Valid = false; };
-    const auto Project = [&](const GizmoVertex& Vertex)
+    const auto ProjectPoint = [&](double Px, double Py, double Pz)
     {
         Projected Point;
         double Clip[4] = {};
         for (int Row = 0; Row < 4; ++Row)
-            Clip[Row] = Frame.ClipFromWorld[0 * 4 + Row] * Vertex.Position[0] + Frame.ClipFromWorld[1 * 4 + Row] * Vertex.Position[1]
-                      + Frame.ClipFromWorld[2 * 4 + Row] * Vertex.Position[2] + Frame.ClipFromWorld[3 * 4 + Row];
+            Clip[Row] = Frame.ClipFromWorld[0 * 4 + Row] * Px + Frame.ClipFromWorld[1 * 4 + Row] * Py
+                      + Frame.ClipFromWorld[2 * 4 + Row] * Pz + Frame.ClipFromWorld[3 * 4 + Row];
         if (Clip[3] <= 1.0e-12) return Point;
         Point.X = (Clip[0] / Clip[3] * 0.5 + 0.5) * Frame.Width;
         Point.Y = (Clip[1] / Clip[3] * 0.5 + 0.5) * Frame.Height;
         Point.Depth = Clip[2] / Clip[3];
         Point.Valid = true;
         return Point;
+    };
+
+    // O(1) 8-corner world-AABB projected screen reject: skips all ~3000+ triangles when cursor is outside the gizmo!
+    if (Geometry.BoundsLow[0] <= Geometry.BoundsHigh[0])
+    {
+        double BoxMinX = 1e30, BoxMaxX = -1e30, BoxMinY = 1e30, BoxMaxY = -1e30;
+        int ValidCorners = 0;
+        for (int CornerIdx = 0; CornerIdx < 8; ++CornerIdx)
+        {
+            const double X = (CornerIdx & 1) ? Geometry.BoundsHigh[0] : Geometry.BoundsLow[0];
+            const double Y = (CornerIdx & 2) ? Geometry.BoundsHigh[1] : Geometry.BoundsLow[1];
+            const double Z = (CornerIdx & 4) ? Geometry.BoundsHigh[2] : Geometry.BoundsLow[2];
+            const Projected P = ProjectPoint(X, Y, Z);
+            if (!P.Valid) { ValidCorners = -1; break; }
+            BoxMinX = std::min(BoxMinX, P.X);
+            BoxMaxX = std::max(BoxMaxX, P.X);
+            BoxMinY = std::min(BoxMinY, P.Y);
+            BoxMaxY = std::max(BoxMaxY, P.Y);
+            ++ValidCorners;
+        }
+        if (ValidCorners == 8 && (PixelX < BoxMinX - Reach || PixelX > BoxMaxX + Reach || PixelY < BoxMinY - Reach || PixelY > BoxMaxY + Reach))
+            return GizmoHandle::None;
+    }
+
+    const auto Project = [&](const GizmoVertex& Vertex)
+    {
+        return ProjectPoint(Vertex.Position[0], Vertex.Position[1], Vertex.Position[2]);
     };
     // Segment distance in pixels.
     const auto Gap = [&](const Projected& From, const Projected& To)
@@ -406,7 +580,7 @@ GizmoHandle PickGizmoHandle(const GizmoGeometry& Geometry, const OrbitCameraBasi
     double              BestGap         = Reach;
     bool                BestTranslucent = true;
     double              BestDepth       = 1e300;
-    for (size_t Index = 0; Index + 2 < Geometry.Vertices.size(); Index += 3)
+    for (size_t Index = 0; Index + 2 < PickVerts; Index += 3)
     {
         const Projected Corner[3] = { Project(Geometry.Vertices[Index]), Project(Geometry.Vertices[Index + 1]), Project(Geometry.Vertices[Index + 2]) };
         if (!Corner[0].Valid || !Corner[1].Valid || !Corner[2].Valid) continue;

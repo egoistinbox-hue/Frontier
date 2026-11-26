@@ -10,12 +10,14 @@
 
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherOutliner.h"
 
+#include "Engine/Components/RetainedCanvasCache.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherInterface.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherStyleSheet.h"
 
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherUiKit.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -237,14 +239,116 @@ std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus
     return Figures;
 }
 
+namespace
+{
+
+std::atomic<uint64_t> GlobalOutlinerFigureHits     { 0ull };
+std::atomic<uint64_t> GlobalOutlinerFigureRebuilds { 0ull };
+std::atomic<uint64_t> GlobalOutlinerCanvasReplays  { 0ull };
+std::atomic<uint64_t> GlobalOutlinerCanvasCaptures { 0ull };
+
+[[nodiscard]] uint64_t MixString(uint64_t Seed, const std::string& Text) noexcept
+{
+    uint64_t H = 14695981039346656037ull;
+    for (unsigned char Ch : Text)
+    {
+        H ^= static_cast<uint64_t>(Ch);
+        H *= 1099511628211ull;
+    }
+    return RetainedCanvasCache::MixHash(Seed, H);
+}
+
+[[nodiscard]] uint64_t HashOutlinerFiguresState(const SketcherWorkspaceStatus& State) noexcept
+{
+    const SketcherDocument& Doc = State.Document;
+    uint64_t Sig = RetainedCanvasCache::MixHash(0x5011DAC00711E401ull, reinterpret_cast<uintptr_t>(&State));
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.Revision);
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.ReferenceRevision);
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.Regeneration.Bodies.size());
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.Tree.Steps.size());
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.ImagePlanes.size());
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.ReferenceSurfaces.size());
+    Sig = RetainedCanvasCache::MixHash(Sig, State.ImagePlanesEnabled ? 1ull : 0ull);
+    Sig = MixString(Sig, State.FocusedStep);
+    Sig = MixString(Sig, State.FocusedImage);
+    Sig = MixString(Sig, State.FocusedReference);
+
+    const SketcherSelection& Sel = Doc.Selection;
+    Sig = RetainedCanvasCache::MixHash(Sig, Sel.Bodies.size());
+    for (const std::string& S : Sel.Bodies) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, Sel.Faces.size());
+    for (const std::string& S : Sel.Faces) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, Sel.Edges.size());
+    for (const std::string& S : Sel.Edges) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, Sel.Curves.size());
+    for (const std::string& S : Sel.Curves) Sig = MixString(Sig, S);
+
+    const SketcherAppearance& App = Doc.Appearance;
+    Sig = RetainedCanvasCache::MixHash(Sig, App.HiddenBodies.size());
+    for (const std::string& S : App.HiddenBodies) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, App.HiddenCurves.size());
+    for (const std::string& S : App.HiddenCurves) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, App.LockedFigures.size());
+    for (const std::string& S : App.LockedFigures) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, App.RemovedCurves.size());
+    for (const std::string& S : App.RemovedCurves) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, App.LiveCutters.size());
+    for (const std::string& S : App.LiveCutters) Sig = MixString(Sig, S);
+    Sig = RetainedCanvasCache::MixHash(Sig, Doc.Captions.size());
+    for (const auto& [K, V] : Doc.Captions) { Sig = MixString(Sig, K); Sig = MixString(Sig, V); }
+    for (const SketcherImagePlane& P : Doc.ImagePlanes)
+    {
+        Sig = MixString(Sig, P.Name);
+        Sig = RetainedCanvasCache::MixHash(Sig, (P.VisibleCondition ? 1ull : 0ull) | (P.LockCondition ? 2ull : 0ull));
+    }
+    for (const SketcherReferenceSurface& R : Doc.ReferenceSurfaces)
+    {
+        Sig = MixString(Sig, R.Name);
+        Sig = RetainedCanvasCache::MixHash(Sig, (R.VisibleCondition ? 1ull : 0ull) | (R.LockedCondition ? 2ull : 0ull));
+    }
+    return Sig == 0ull ? 1ull : Sig;
+}
+
+[[nodiscard]] const std::vector<SketcherFigure>& CollectSketcherFiguresCached(const SketcherWorkspaceStatus& State, uint64_t& OutFiguresSig)
+{
+    thread_local uint64_t                    CachedSig = 0ull;
+    thread_local std::vector<SketcherFigure> CachedFigures {};
+    const uint64_t Sig = HashOutlinerFiguresState(State);
+    OutFiguresSig = Sig;
+    if (Sig == CachedSig)
+    {
+        GlobalOutlinerFigureHits.fetch_add(1ull, std::memory_order_relaxed);
+        return CachedFigures;
+    }
+    GlobalOutlinerFigureRebuilds.fetch_add(1ull, std::memory_order_relaxed);
+    CachedFigures = CollectSketcherFigures(State);
+    CachedSig     = Sig;
+    return CachedFigures;
+}
+
+} // namespace
+
+void QuerySketcherOutlinerCacheStats(
+    uint64_t& OutFigureHits,
+    uint64_t& OutFigureRebuilds,
+    uint64_t& OutCanvasReplays,
+    uint64_t& OutCanvasCaptures) noexcept
+{
+    OutFigureHits     = GlobalOutlinerFigureHits.load(std::memory_order_relaxed);
+    OutFigureRebuilds = GlobalOutlinerFigureRebuilds.load(std::memory_order_relaxed);
+    OutCanvasReplays  = GlobalOutlinerCanvasReplays.load(std::memory_order_relaxed);
+    OutCanvasCaptures = GlobalOutlinerCanvasCaptures.load(std::memory_order_relaxed);
+}
+
 SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State, const PlaneExtent& Panel)
 {
     SketcherOutlinerIntent Intent;
     SketcherSheet          Sheet;
     State.Outliner.HoveredCondition = false;                                                 // Re-found below while drawn
     if (!Sheet.Begin()) return Intent;
-    SketcherOutlinerMode&            Outliner = State.Outliner;
-    const std::vector<SketcherFigure> Figures  = CollectSketcherFigures(State);
+    SketcherOutlinerMode& Outliner = State.Outliner;
+    uint64_t FiguresSig = 0ull;
+    const std::vector<SketcherFigure>& Figures = CollectSketcherFiguresCached(State, FiguresSig);
     const ColorQuad                   Clear    = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     // .panel — border 1 px #ffffff08, --panel, radius 23; children sit in the content box.
@@ -415,103 +519,164 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
         ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(1, 1, 1, 0.12f));
         ImGui::BeginChild("SceneRows", ImVec2(Width, RowsHeight), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-        SketcherSheet Rows;
-        Rows.Begin();
+        ImDrawList* const RowsDrawList = ImGui::GetWindowDrawList();
         const float RowsTop = ImGui::GetCursorScreenPos().y;
-        if (Shown.empty())
+        const float ScrollY = ImGui::GetScrollY();
+
+        // Mirror Frontier Editor's OutlinerPanel RetainedCanvasCache: when the cursor is outside the rows viewport
+        // and content/scroll/layout haven't changed, replay the cached ImDrawList in ~3 us with zero layout/shaping!
+        thread_local RetainedCanvasCache RowsCanvasCache {};
+        const Rectangle2D RowsBounds { Left, Y, Width, RowsHeight };
+        const ImVec2 MousePos = ImGui::GetIO().MousePos;
+        const Point2D MousePt { MousePos.x, MousePos.y };
+        const bool PointerInRows =
+            MousePos.x >= Left && MousePos.x <= (Left + Width) &&
+            MousePos.y >= Y    && MousePos.y <= (Y + RowsHeight);
+        uint64_t RowsSig = RetainedCanvasCache::MixBounds(0x5011DAC00711E402ull, RowsBounds, 1.0f);
+        RowsSig = RetainedCanvasCache::MixHash(RowsSig, FiguresSig);
+        RowsSig = RetainedCanvasCache::MixHash(RowsSig, static_cast<uint64_t>(Outliner.Filter + 16));
+        RowsSig = RetainedCanvasCache::MixHash(RowsSig, Outliner.CompactEnabled ? 1ull : 0ull);
+        RowsSig = RetainedCanvasCache::MixHash(RowsSig, static_cast<uint64_t>(std::llround(ScrollY * 4.0f)));
+        RowsSig = MixString(RowsSig, Query);
+
+        const bool ForceRowsRebuild = PointerInRows || ImGui::IsAnyMouseDown() || ImGui::GetIO().MouseWheel != 0.0f;
+        const bool ReplayedRows =
+            RowsDrawList != nullptr &&
+            RowsCanvasCache.QueryReusableStationary(RowsSig, RowsBounds, MousePt, ForceRowsRebuild) &&
+            RowsCanvasCache.ReplayInto(RowsDrawList, MousePt);
+        if (ReplayedRows)
         {
-            Rows.Text(Left + 18.0f, RowsTop + 18.0f + 9.0f, 10.0f, Ink(MutedInk), "No matching geometry.");
-            Rows.Text(Left + 18.0f, RowsTop + 18.0f + 27.0f, 10.0f, Ink(MutedInk), "Construct a shape or open a document.");
+            GlobalOutlinerCanvasReplays.fetch_add(1ull, std::memory_order_relaxed);
+            // Keep automated widget-region lookup tables in sync without re-drawing any SketcherSheet geometry.
+            const float ViewMinY = Y - Pitch;
+            const float ViewMaxY = Y + RowsHeight + Pitch;
+            for (size_t Index = 0; Index < Shown.size(); ++Index)
+            {
+                const float RowTop = RowsTop + float(Index) * Pitch;
+                if (RowTop + Pitch < ViewMinY || RowTop > ViewMaxY) continue;
+                const SketcherFigure& Figure = *Shown[Index];
+                const PlaneExtent     Row    = Spanning(Left + 10.0f, RowTop, Width - 20.0f, Pitch);
+                const float           Centre = 0.5f * (Row.MinimumY + Row.MaximumY);
+                const PlaneExtent     Eye    = Spanning(Row.MaximumX - 1.0f - 9.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
+                const PlaneExtent     Lock   = Spanning(Eye.MinimumX - 2.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
+                State.Widgets.Record("Figure:" + Figure.Key, ImVec2(Row.MinimumX, Row.MinimumY), ImVec2(Lock.MinimumX - 4.0f, Row.MaximumY));
+                State.Widgets.Record("Visibility:" + Figure.Key, ImVec2(Eye.MinimumX, Eye.MinimumY), ImVec2(Eye.MaximumX, Eye.MaximumY));
+                State.Widgets.Record("Lock:" + Figure.Key, ImVec2(Lock.MinimumX, Lock.MinimumY), ImVec2(Lock.MaximumX, Lock.MaximumY));
+            }
         }
-        for (size_t Index = 0; Index < Shown.size(); ++Index)
+        else
         {
-            const SketcherFigure& Figure  = *Shown[Index];
-            const PlaneExtent     Row     = Spanning(Left + 10.0f, RowsTop + float(Index) * Pitch, Width - 20.0f, Pitch);
-            const float           Centre  = 0.5f * (Row.MinimumY + Row.MaximumY);
-            const float           Opacity = Figure.HiddenCondition ? 0.45f : 1.0f;            // .hidden-figure
-            const PlaneExtent     Eye     = Spanning(Row.MaximumX - 1.0f - 9.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
-            const PlaneExtent     Lock    = Spanning(Eye.MinimumX - 2.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
-            const SketcherPress   Press   = PressSketcherRegion(State.Widgets, "Figure:" + Figure.Key, PlaneExtent{ Row.MinimumX, Row.MinimumY, Lock.MinimumX - 4.0f, Row.MaximumY });
-            const bool            Active  = Figure.SelectedCondition && Figure.Rank == 0;
-            const ColorQuad       Accent  = Active ? Ink(ActiveInk) : Ink(SelectedInk);
-            if (Figure.SelectedCondition)
+            const bool CaptureNow = RowsDrawList != nullptr && !PointerInRows && !ImGui::IsAnyMouseDown();
+            if (CaptureNow)
             {
-                Rows.Box(Row, ControlKit::Faded(SketcherWash(0x16), Opacity), 2.0f, ControlKit::Faded(SketcherWash(0x20), Opacity));
-                Rows.Surface().FillRectangle(Spanning(Row.MinimumX, Row.MinimumY, 3.0f, Pitch), ControlKit::Faded(Accent, Opacity));   // :before rail
+                RowsCanvasCache.BeginCapture(RowsDrawList);
             }
-            else if (Press.HoveredCondition)
+            SketcherSheet Rows;
+            Rows.Begin();
+            if (Shown.empty())
             {
-                Rows.Box(Row, SketcherWash(0x04), 2.0f);
+                Rows.Text(Left + 18.0f, RowsTop + 18.0f + 9.0f, 10.0f, Ink(MutedInk), "No matching geometry.");
+                Rows.Text(Left + 18.0f, RowsTop + 18.0f + 27.0f, 10.0f, Ink(MutedInk), "Construct a shape or open a document.");
             }
-            float RowCursor = Row.MinimumX + 1.0f + 14.0f;
-            Rows.Icon(Figure.Icon, RowCursor + 4.5f, Centre - 8.5f, 17.0f, ControlKit::Faded(Figure.SelectedCondition ? Accent : CategoryInk(Figure.Category), Opacity));
-            RowCursor += 26.0f + 9.0f;
-            char Tag[32];
-            if (Figure.Rank >= 0) std::snprintf(Tag, sizeof(Tag), "%d %s", Figure.Rank + 1, Active ? "ACTIVE" : "SELECTED");
-            else if (Figure.LiveCutterCondition) std::snprintf(Tag, sizeof(Tag), "CUTTER");
-            else std::snprintf(Tag, sizeof(Tag), "%s", CategoryTag(Figure.Category));
-            const float TagWidth = Rows.TextRight(Lock.MinimumX - 9.0f, Centre, 8.0f, ControlKit::Faded(Figure.SelectedCondition ? Accent : Ink(0x787878), Opacity), Tag,
-                                                  SketcherWeight::Light, 0.5f);
-            Rows.TextClipped(RowCursor, Centre, Lock.MinimumX - 9.0f - TagWidth - 9.0f - RowCursor, 11.0f, ControlKit::Faded(Ink(TextInk), Opacity), Figure.Name.c_str(),
-                             SketcherWeight::Regular);
-            const SketcherPress Toggle = PressSketcherRegion(State.Widgets, "Visibility:" + Figure.Key, Eye);
-            if (Toggle.HoveredCondition) Rows.Box(Eye, Ink(HoverFill), 11.5f);
-            const ColorQuad EyeInk = Toggle.HoveredCondition ? Ink(0xffffff) : Ink(0x858585);
-            Rows.Icon(Figure.HiddenCondition ? IconSymbol::SketcherHidden : IconSymbol::SketcherEye, Eye.MinimumX + 4.5f, Eye.MinimumY + 4.5f, 14.0f,
-                      ControlKit::Faded(EyeInk, Opacity));
-            const SketcherPress Latch = PressSketcherRegion(State.Widgets, "Lock:" + Figure.Key, Lock);
-            if (Latch.HoveredCondition) Rows.Box(Lock, Ink(HoverFill), 11.5f);
-            const ColorQuad LockInk = Latch.HoveredCondition ? Ink(0xffffff) : Figure.LockedCondition ? Ink(0xffd24d) : Ink(0x858585, 0.55f);
-            LockGlyph(Rows, 0.5f * (Lock.MinimumX + Lock.MaximumX), 0.5f * (Lock.MinimumY + Lock.MaximumY), Figure.LockedCondition, ControlKit::Faded(LockInk, Opacity));
-            if (Press.HoveredCondition || Toggle.HoveredCondition || Latch.HoveredCondition)
+            const float ViewMinY = Y - Pitch;
+            const float ViewMaxY = Y + RowsHeight + Pitch;
+            for (size_t Index = 0; Index < Shown.size(); ++Index)
             {
-                Outliner.HoveredCondition = true;
-                Outliner.Hovered          = Figure;
-            }
-            if (Toggle.ClickedCondition)
-            {
-                Intent.Verb   = SketcherOutlinerVerb::ToggleVisibility;
-                Intent.Figure = Figure;
-            }
-            else if (Latch.ClickedCondition)
-            {
-                Intent.Verb   = SketcherOutlinerVerb::ToggleLock;
-                Intent.Figure = Figure;
-            }
-            else if (Press.ClickedCondition)
-            {
-                Intent.Verb              = SketcherOutlinerVerb::Pick;
-                Intent.Figure            = Figure;
-                Intent.ShiftCondition    = ImGui::GetIO().KeyShift;
-                Intent.CtrlCondition     = ImGui::GetIO().KeyCtrl;
-                Intent.AdditiveCondition = Intent.ShiftCondition || Intent.CtrlCondition;
-                if (Intent.ShiftCondition && Figure.Source != SketcherFigureSource::Image)
+                const float RowTop = RowsTop + float(Index) * Pitch;
+                if (RowTop + Pitch < ViewMinY || RowTop > ViewMaxY) continue;
+                const SketcherFigure& Figure  = *Shown[Index];
+                const PlaneExtent     Row     = Spanning(Left + 10.0f, RowTop, Width - 20.0f, Pitch);
+                const float           Centre  = 0.5f * (Row.MinimumY + Row.MaximumY);
+                const float           Opacity = Figure.HiddenCondition ? 0.45f : 1.0f;            // .hidden-figure
+                const PlaneExtent     Eye     = Spanning(Row.MaximumX - 1.0f - 9.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
+                const PlaneExtent     Lock    = Spanning(Eye.MinimumX - 2.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
+                const SketcherPress   Press   = PressSketcherRegion(State.Widgets, "Figure:" + Figure.Key, PlaneExtent{ Row.MinimumX, Row.MinimumY, Lock.MinimumX - 4.0f, Row.MaximumY });
+                const bool            Active  = Figure.SelectedCondition && Figure.Rank == 0;
+                const ColorQuad       Accent  = Active ? Ink(ActiveInk) : Ink(SelectedInk);
+                if (Figure.SelectedCondition)
                 {
-                    std::string Anchor = Outliner.AnchorKey;
-                    if (Anchor.empty())
+                    Rows.Box(Row, ControlKit::Faded(SketcherWash(0x16), Opacity), 2.0f, ControlKit::Faded(SketcherWash(0x20), Opacity));
+                    Rows.Surface().FillRectangle(Spanning(Row.MinimumX, Row.MinimumY, 3.0f, Pitch), ControlKit::Faded(Accent, Opacity));   // :before rail
+                }
+                else if (Press.HoveredCondition)
+                {
+                    Rows.Box(Row, SketcherWash(0x04), 2.0f);
+                }
+                float RowCursor = Row.MinimumX + 1.0f + 14.0f;
+                Rows.Icon(Figure.Icon, RowCursor + 4.5f, Centre - 8.5f, 17.0f, ControlKit::Faded(Figure.SelectedCondition ? Accent : CategoryInk(Figure.Category), Opacity));
+                RowCursor += 26.0f + 9.0f;
+                char Tag[32];
+                if (Figure.Rank >= 0) std::snprintf(Tag, sizeof(Tag), "%d %s", Figure.Rank + 1, Active ? "ACTIVE" : "SELECTED");
+                else if (Figure.LiveCutterCondition) std::snprintf(Tag, sizeof(Tag), "CUTTER");
+                else std::snprintf(Tag, sizeof(Tag), "%s", CategoryTag(Figure.Category));
+                const float TagWidth = Rows.TextRight(Lock.MinimumX - 9.0f, Centre, 8.0f, ControlKit::Faded(Figure.SelectedCondition ? Accent : Ink(0x787878), Opacity), Tag,
+                                                      SketcherWeight::Light, 0.5f);
+                Rows.TextClipped(RowCursor, Centre, Lock.MinimumX - 9.0f - TagWidth - 9.0f - RowCursor, 11.0f, ControlKit::Faded(Ink(TextInk), Opacity), Figure.Name.c_str(),
+                                 SketcherWeight::Regular);
+                const SketcherPress Toggle = PressSketcherRegion(State.Widgets, "Visibility:" + Figure.Key, Eye);
+                if (Toggle.HoveredCondition) Rows.Box(Eye, Ink(HoverFill), 11.5f);
+                const ColorQuad EyeInk = Toggle.HoveredCondition ? Ink(0xffffff) : Ink(0x858585);
+                Rows.Icon(Figure.HiddenCondition ? IconSymbol::SketcherHidden : IconSymbol::SketcherEye, Eye.MinimumX + 4.5f, Eye.MinimumY + 4.5f, 14.0f,
+                          ControlKit::Faded(EyeInk, Opacity));
+                const SketcherPress Latch = PressSketcherRegion(State.Widgets, "Lock:" + Figure.Key, Lock);
+                if (Latch.HoveredCondition) Rows.Box(Lock, Ink(HoverFill), 11.5f);
+                const ColorQuad LockInk = Latch.HoveredCondition ? Ink(0xffffff) : Figure.LockedCondition ? Ink(0xffd24d) : Ink(0x858585, 0.55f);
+                LockGlyph(Rows, 0.5f * (Lock.MinimumX + Lock.MaximumX), 0.5f * (Lock.MinimumY + Lock.MaximumY), Figure.LockedCondition, ControlKit::Faded(LockInk, Opacity));
+                if (Press.HoveredCondition || Toggle.HoveredCondition || Latch.HoveredCondition)
+                {
+                    Outliner.HoveredCondition = true;
+                    Outliner.Hovered          = Figure;
+                }
+                if (Toggle.ClickedCondition)
+                {
+                    Intent.Verb   = SketcherOutlinerVerb::ToggleVisibility;
+                    Intent.Figure = Figure;
+                }
+                else if (Latch.ClickedCondition)
+                {
+                    Intent.Verb   = SketcherOutlinerVerb::ToggleLock;
+                    Intent.Figure = Figure;
+                }
+                else if (Press.ClickedCondition)
+                {
+                    Intent.Verb              = SketcherOutlinerVerb::Pick;
+                    Intent.Figure            = Figure;
+                    Intent.ShiftCondition    = ImGui::GetIO().KeyShift;
+                    Intent.CtrlCondition     = ImGui::GetIO().KeyCtrl;
+                    Intent.AdditiveCondition = Intent.ShiftCondition || Intent.CtrlCondition;
+                    if (Intent.ShiftCondition && Figure.Source != SketcherFigureSource::Image)
                     {
-                        for (const SketcherFigure* Candidate : Shown)
-                            if (Candidate->SelectedCondition && Candidate->Source != SketcherFigureSource::Image) { Anchor = Candidate->Key; break; }
-                    }
-                    ptrdiff_t AnchorIndex = -1;
-                    for (size_t Scan = 0; Scan < Shown.size(); ++Scan)
-                        if (Shown[Scan]->Key == Anchor) { AnchorIndex = static_cast<ptrdiff_t>(Scan); break; }
-                    if (AnchorIndex >= 0)
-                    {
-                        const ptrdiff_t ClickIndex = static_cast<ptrdiff_t>(Index);
-                        const ptrdiff_t StepDir    = AnchorIndex <= ClickIndex ? 1 : -1;
-                        for (ptrdiff_t CursorIdx = AnchorIndex; ; CursorIdx += StepDir)
+                        std::string Anchor = Outliner.AnchorKey;
+                        if (Anchor.empty())
                         {
-                            const SketcherFigure& RowFigure = *Shown[static_cast<size_t>(CursorIdx)];
-                            if (RowFigure.Source != SketcherFigureSource::Image && !RowFigure.LockedCondition
-                                && !(RowFigure.HiddenCondition && RowFigure.Source != SketcherFigureSource::Body))
+                            for (const SketcherFigure* Candidate : Shown)
+                                if (Candidate->SelectedCondition && Candidate->Source != SketcherFigureSource::Image) { Anchor = Candidate->Key; break; }
+                        }
+                        ptrdiff_t AnchorIndex = -1;
+                        for (size_t Scan = 0; Scan < Shown.size(); ++Scan)
+                            if (Shown[Scan]->Key == Anchor) { AnchorIndex = static_cast<ptrdiff_t>(Scan); break; }
+                        if (AnchorIndex >= 0)
+                        {
+                            const ptrdiff_t ClickIndex = static_cast<ptrdiff_t>(Index);
+                            const ptrdiff_t StepDir    = AnchorIndex <= ClickIndex ? 1 : -1;
+                            for (ptrdiff_t CursorIdx = AnchorIndex; ; CursorIdx += StepDir)
                             {
-                                Intent.RangeFigures.push_back(RowFigure);
+                                const SketcherFigure& RowFigure = *Shown[static_cast<size_t>(CursorIdx)];
+                                if (RowFigure.Source != SketcherFigureSource::Image && !RowFigure.LockedCondition
+                                    && !(RowFigure.HiddenCondition && RowFigure.Source != SketcherFigureSource::Body))
+                                {
+                                    Intent.RangeFigures.push_back(RowFigure);
+                                }
+                                if (CursorIdx == ClickIndex) break;
                             }
-                            if (CursorIdx == ClickIndex) break;
                         }
                     }
                 }
+            }
+            if (CaptureNow)
+            {
+                RowsCanvasCache.EndCapture(RowsDrawList, RowsSig, RowsBounds, MousePt);
+                GlobalOutlinerCanvasCaptures.fetch_add(1ull, std::memory_order_relaxed);
             }
         }
         ImGui::SetCursorScreenPos(ImVec2(Left, RowsTop));

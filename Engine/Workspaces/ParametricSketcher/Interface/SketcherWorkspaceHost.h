@@ -7,6 +7,7 @@
 
 #include "Engine/Components/ContentBrowser/ContentBrowserPanel.h"
 #include "Engine/Components/Docking/WorkspaceDockContainer.h"
+#include "Engine/GeometricRaster/Rasterization/ImGuiOverlayRasterization.h"
 #include "Engine/GeometricRaster/VulkanInterchange.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherInterface.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherOptions.h"
@@ -40,6 +41,7 @@ public:
     void Finalize() noexcept;
 
     void AttachContentBrowserPanel(ContentBrowserPanel* TargetPanel) noexcept;
+    void AttachImGuiPresenter(GeometricRaster::ImGuiOverlayRasterization* Presenter) noexcept;
     void SynchronizeHostScale(float ScaleFactor) noexcept;
 
     void RegisterDockPanes(Components::HeadlessWorkspaceDockContainer& DockContainer);
@@ -58,16 +60,21 @@ public:
 private:
     void RenderViewportTarget();
     void UploadViewportPixels(const uint32_t* Pixels, uint32_t Width, uint32_t Height);
+    [[nodiscard]] ImTextureRef QueryViewportTextureRef() const noexcept;
 
-    GeometricRaster::VulkanInterchange* Device            = nullptr;
-    Sketcher::SketcherWorkspaceStatus    State              {};
-    Sketcher::SketcherOptions           Options            {};
-    Sketcher::SketcherRasterization     Rasterizer         {};
-    ImTextureData                       ViewportTexture    {};
-    uint64_t                            UploadedMatcapGen  = 0u;
-    uint64_t                            LastViewportRenderSignature = 0ull;
-    bool                                Initialized        = false;
-    bool                                RasterReady        = false;
+    GeometricRaster::VulkanInterchange*            Device            = nullptr;
+    GeometricRaster::ImGuiOverlayRasterization*    ImGuiPresenter    = nullptr;
+    Sketcher::SketcherWorkspaceStatus              State             {};
+    Sketcher::SketcherOptions                      Options           {};
+    Sketcher::SketcherRasterization                Rasterizer        {};
+    ImTextureData                                  ViewportTexture   {};
+    uint64_t                                       DirectGpuTextureId = 0ull;
+    uint64_t                                       UploadedMatcapGen  = 0u;
+    uint64_t                                       LastViewportRenderSignature = 0ull;
+    int                                            LastProbeX         = -1;
+    int                                            LastProbeY         = -1;
+    bool                                           Initialized        = false;
+    bool                                           RasterReady        = false;
     ContentBrowserPanel*             BoundBrowser       = nullptr;
     float                            HostScaleFactor    = 1.0f;
     uint32_t                         RegisteredTabCount = 0u;

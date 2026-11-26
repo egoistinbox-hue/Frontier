@@ -36,7 +36,7 @@ struct SketcherOptions
     std::string FontPath            = {};                                                    // [-]   - UI font (empty: DM Sans from EngineContent)
     float       FontSize            = 15.0f;                                                 // [px]  - UI font size
     std::string RecoveryPath        = "_ClaudeScratch/autosave/SketcherWorkspace.solidarc"; // [-] - Autosave target
-    double      AutosaveDelay       = 0.6;                                                   // [s]   - Quiet time before an autosave
+    double      AutosaveDelay       = 2.5;                                                   // [s]   - Quiet time before async recovery autosave
     std::string DocumentPath        = "Bracket.solidarc";                               // [-]   - Default Save / Open path
     std::string CurvesPath          = "Experimental/VehicleSurfacing/Samples/SyntheticBonnet.toml"; // [-] - Default Import curves path
     std::string InsertFolder        = "Inserts";                                             // [-]   - Knife insert library (*.step)

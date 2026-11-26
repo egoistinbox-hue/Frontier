@@ -66,6 +66,14 @@ struct GizmoVertex
 };
 static_assert(sizeof(GizmoVertex) == 32, "GizmoVertex must stay 32 bytes");
 
+struct GizmoDragGuide
+{
+    bool                                Active          = false;                             // [-]   - True while dragging (shows Frontier travel line / 360° sweep)
+    GeometrySpace::Parametric::Vector3  StartOrigin     = {};                                // [len] - World pivot at drag start
+    double                              StartAngleRad   = 0.0;                               // [rad] - Initial ray angle in rotation plane
+    double                              DeltaAngleRad   = 0.0;                               // [rad] - Signed swept rotation angle
+};
+
 struct GizmoPose
 {
     GeometrySpace::Parametric::Vector3 Origin  = {};                                                // [len] - Gizmo centre (pivot)
@@ -73,13 +81,17 @@ struct GizmoPose
     double                      Size    = 1.0;                                               // [len] - World length of L (constant on screen)
     uint32_t                    Modes   = 0;                                                 // [-]   - GizmoTranslate | GizmoRotate | GizmoScale
     uint32_t                    Hidden  = 0;                                                 // [-]   - Bit (1 << handle): handle left out
+    GizmoDragGuide              Guide   = {};                                                // [-]   - Optional Frontier active-drag visual guide
 };
 
 // 📝 The CPU copy of everything the GPU draws: the same triangles serve the pick, so what is seen is what is grabbed.
 struct GizmoGeometry
 {
-    std::vector<GizmoVertex> Vertices    = {};                                               // [-] - Triangle list: opaque first, then translucent
-    uint32_t                 OpaqueCount = 0;                                                // [-] - Vertices before the translucent quads
+    std::vector<GizmoVertex> Vertices      = {};                                             // [-]   - Triangle list: opaque first, then translucent
+    uint32_t                 OpaqueCount   = 0;                                              // [-]   - Vertices before the translucent quads
+    uint32_t                 PickableCount = 0;                                              // [-]   - Pickable handle vertices (excludes visual-only drag guides)
+    std::array<double, 3>    BoundsLow     = {  1.0e30,  1.0e30,  1.0e30 };                  // [len] - World AABB min of pickable vertices for O(1) pick reject
+    std::array<double, 3>    BoundsHigh    = { -1.0e30, -1.0e30, -1.0e30 };                  // [len] - World AABB max of pickable vertices for O(1) pick reject
 };
 
 //------------------------------------------------------------------------------------------------------------------------

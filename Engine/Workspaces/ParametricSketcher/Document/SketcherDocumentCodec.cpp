@@ -1172,6 +1172,40 @@ bool SaveSketcherDocument(const SketcherDocument& Document, const std::string& P
     return static_cast<bool>(Stream);
 }
 
+bool WriteSketcherEncodedTextAtomically(const std::string& EncodedText, const std::string& Path)
+{
+    if (Path.empty()) return false;
+    const std::filesystem::path Target = GeometrySpace::Parametric::ResolveUtf8Path(Path);
+    std::error_code Failure;
+    if (Target.has_parent_path()) std::filesystem::create_directories(Target.parent_path(), Failure);
+
+    std::filesystem::path TempPath = Target;
+    TempPath += ".autosave.tmp";
+    {
+        std::ofstream Stream(TempPath, std::ios::binary | std::ios::trunc);
+        if (!Stream) return false;
+        Stream.write(EncodedText.data(), static_cast<std::streamsize>(EncodedText.size()));
+        Stream.flush();
+        if (!Stream) return false;
+    }
+
+    std::filesystem::rename(TempPath, Target, Failure);
+    if (Failure)
+    {
+        std::error_code FallbackFailure;
+        std::filesystem::copy_file(TempPath, Target, std::filesystem::copy_options::overwrite_existing, FallbackFailure);
+        std::filesystem::remove(TempPath, FallbackFailure);
+        return !FallbackFailure;
+    }
+    return true;
+}
+
+bool SaveSketcherRecoveryAutosave(const SketcherDocument& Document, const std::string& Path)
+{
+    FRONTIER_TRACE_SCOPE("File", "Autosave · " + Path);
+    return WriteSketcherEncodedTextAtomically(EncodeSketcherDocument(Document), Path);
+}
+
 SketcherDocumentFile LoadSketcherDocumentFile(const std::string& Path)
 {
     FRONTIER_TRACE_SCOPE("File", "Load · " + Path);

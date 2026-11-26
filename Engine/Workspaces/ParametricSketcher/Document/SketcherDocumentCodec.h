@@ -45,6 +45,11 @@ struct SketcherDocumentFile
 
 // File helpers: false / Refusal on an I/O or parse failure.
 bool                               SaveSketcherDocument(const SketcherDocument& Document, const std::string& Path);
+// Fast crash-recovery autosave: writes only the lightweight parametric authoring TOML (skips 65k-voxel SDF / BVH4 bake)
+// so background recovery never stalls interactive modeling after an operation.
+bool                               SaveSketcherRecoveryAutosave(const SketcherDocument& Document, const std::string& Path);
+// Atomic text flush helper suitable for background worker threads (writes .tmp then renames).
+bool                               WriteSketcherEncodedTextAtomically(const std::string& EncodedText, const std::string& Path);
 [[nodiscard]] SketcherDocumentFile LoadSketcherDocumentFile(const std::string& Path);
 
 // Lightweight header reader for Project Browser thumbnails & captions (never decompresses reference geometry).

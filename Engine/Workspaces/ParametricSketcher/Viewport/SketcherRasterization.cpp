@@ -443,6 +443,9 @@ bool SketcherRasterization::Create(
 
         SectionBuffer = CreateHostBuffer(8u * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::memset(SectionBuffer.HostAddress, 0, SectionBuffer.ByteCapacity);
+        // Pre-allocate GizmoBuffer with generous headroom (256 KB = 8192 vertices, covers 4 split panes + drag guides)
+        // so RecordPanes never stalls to grow mid-frame.
+        GizmoBuffer = CreateHostBuffer(256u * 1024u, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         const VkDescriptorBufferInfo SectionTarget { SectionBuffer.BufferHandle, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet SectionWrite { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
         SectionWrite.dstSet          = BufferSet;
@@ -750,6 +753,8 @@ void SketcherRasterization::Destroy()
     ReferenceCornersTotal     = 0u;
     ReferenceSegmentsTotal    = 0u;
     UploadedReferenceRevision = UINT64_MAX;
+    LastStatesHash            = 0ull;
+    LastSubmittedTick         = 0ull;
     ReleasePictures();
     DestroyGpuImage(MatcapArray);
     if (MatcapPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(LogicalDevice, MatcapPool, nullptr);
@@ -861,6 +866,22 @@ void SketcherRasterization::Resize(uint32_t Width, uint32_t Height)
     }
 }
 
+void SketcherRasterization::AwaitPendingWork() const noexcept
+{
+    if (!Device || !Device->Ready())
+    {
+        return;
+    }
+    if (LastSubmittedTick != 0ull)
+    {
+        (void)Device->AwaitTimelineTick(LastSubmittedTick);
+    }
+    else
+    {
+        vkDeviceWaitIdle(Device->AccessDevice());
+    }
+}
+
 void SketcherRasterization::UploadScene(const SketcherScene& Scene)
 {
     if (!Device || !Device->Ready())
@@ -869,15 +890,30 @@ void SketcherRasterization::UploadScene(const SketcherScene& Scene)
     }
     try
     {
-        vkDeviceWaitIdle(Device->AccessDevice());
-        DestroyBuffer(CornerBuffer);
-        DestroyBuffer(SegmentBuffer);
+        // Wait only on our own prior submission (not global vkDeviceWaitIdle) and reuse grow-only host buffers
+        // so post-operation scene updates do an in-place memcpy with zero Vulkan allocation churn.
+        AwaitPendingWork();
         CornerCount       = static_cast<uint32_t>(Scene.Corners.size());
         SolidCornerCount  = Scene.SolidCornerCount > 0u && Scene.SolidCornerCount <= CornerCount ? Scene.SolidCornerCount : (Scene.SolidCornerCount == 0u && !Scene.Bodies.empty() ? 0u : CornerCount);
         SegmentCount      = static_cast<uint32_t>(Scene.Segments.size());
         SolidSegmentCount = Scene.SolidSegmentCount > 0u && Scene.SolidSegmentCount <= SegmentCount ? Scene.SolidSegmentCount : (Scene.SolidSegmentCount == 0u && !Scene.Bodies.empty() ? 0u : SegmentCount);
-        CornerBuffer      = CreateHostBuffer(sizeof(SketcherSceneCorner) * std::max<size_t>(CornerCount, 1u), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        SegmentBuffer     = CreateHostBuffer(sizeof(SketcherSceneSegment) * std::max<size_t>(SegmentCount, 1u), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+
+        const VkDeviceSize CornerBytesNeeded  = sizeof(SketcherSceneCorner)  * std::max<size_t>(CornerCount, 1u);
+        const VkDeviceSize SegmentBytesNeeded = sizeof(SketcherSceneSegment) * std::max<size_t>(SegmentCount, 1u);
+
+        if (CornerBuffer.BufferHandle == VK_NULL_HANDLE || CornerBuffer.ByteCapacity < CornerBytesNeeded)
+        {
+            DestroyBuffer(CornerBuffer);
+            const VkDeviceSize AllocBytes = std::max<VkDeviceSize>(CornerBytesNeeded * 2u, 64u * 1024u);
+            CornerBuffer = CreateHostBuffer(AllocBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        }
+        if (SegmentBuffer.BufferHandle == VK_NULL_HANDLE || SegmentBuffer.ByteCapacity < SegmentBytesNeeded)
+        {
+            DestroyBuffer(SegmentBuffer);
+            const VkDeviceSize AllocBytes = std::max<VkDeviceSize>(SegmentBytesNeeded * 2u, 64u * 1024u);
+            SegmentBuffer = CreateHostBuffer(AllocBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        }
+
         if (CornerCount > 0u && CornerBuffer.HostAddress != nullptr)
         {
             std::memcpy(CornerBuffer.HostAddress, Scene.Corners.data(), sizeof(SketcherSceneCorner) * CornerCount);
@@ -887,7 +923,16 @@ void SketcherRasterization::UploadScene(const SketcherScene& Scene)
             std::memcpy(SegmentBuffer.HostAddress, Scene.Segments.data(), sizeof(SketcherSceneSegment) * SegmentCount);
         }
         UploadedGeneration = Scene.Generation;
-        AssignStates(std::vector<uint32_t>(Scene.Faces.size(), 0u), std::vector<uint32_t>(Scene.Edges.size(), 0u));
+        LastStatesHash     = 0ull;
+        // Ensure state SSBOs are bound and large enough for the new scene (grow-only, no redundant clear if already fits).
+        const VkDeviceSize FaceBytesNeeded = 4u * std::max<size_t>(Scene.Faces.size(), 1u);
+        const VkDeviceSize EdgeBytesNeeded = 4u * std::max<size_t>(Scene.Edges.size(), 1u);
+        if (FaceStateBuffer.BufferHandle == VK_NULL_HANDLE || FaceStateBuffer.ByteCapacity < FaceBytesNeeded ||
+            EdgeStateBuffer.BufferHandle == VK_NULL_HANDLE || EdgeStateBuffer.ByteCapacity < EdgeBytesNeeded)
+        {
+            AssignStates(std::vector<uint32_t>(Scene.Faces.size(), 0u), std::vector<uint32_t>(Scene.Edges.size(), 0u));
+            LastStatesHash = 0ull;
+        }
     }
     catch (const std::exception& Failure)
     {
@@ -1216,20 +1261,22 @@ void SketcherRasterization::AssignStates(const std::vector<uint32_t>& FaceStates
     for (uint32_t V : EdgeStates) StatesHash = Mix(StatesHash, V);
     if (StatesHash == 0ull) StatesHash = 1ull;
 
-    const bool ReshapeCondition = FaceStateBuffer.BufferHandle == VK_NULL_HANDLE || FaceStates.size() != FaceCount || EdgeStates.size() != EdgeCount;
-    if (!ReshapeCondition && StatesHash == LastStatesHash)
+    const VkDeviceSize FaceBytesNeeded = 4u * std::max<size_t>(FaceStates.size(), 1u);
+    const VkDeviceSize EdgeBytesNeeded = 4u * std::max<size_t>(EdgeStates.size(), 1u);
+    const bool GrowCondition =
+        FaceStateBuffer.BufferHandle == VK_NULL_HANDLE || FaceStateBuffer.ByteCapacity < FaceBytesNeeded ||
+        EdgeStateBuffer.BufferHandle == VK_NULL_HANDLE || EdgeStateBuffer.ByteCapacity < EdgeBytesNeeded;
+    if (!GrowCondition && StatesHash == LastStatesHash)
     {
         return;
     }
-    if (ReshapeCondition)
+    if (GrowCondition)
     {
-        vkDeviceWaitIdle(Device->AccessDevice());
+        AwaitPendingWork();
         DestroyBuffer(FaceStateBuffer);
         DestroyBuffer(EdgeStateBuffer);
-        FaceCount       = static_cast<uint32_t>(FaceStates.size());
-        EdgeCount       = static_cast<uint32_t>(EdgeStates.size());
-        FaceStateBuffer = CreateHostBuffer(4u * std::max<size_t>(FaceCount, 1u), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        EdgeStateBuffer = CreateHostBuffer(4u * std::max<size_t>(EdgeCount, 1u), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        FaceStateBuffer = CreateHostBuffer(std::max<VkDeviceSize>(FaceBytesNeeded * 2u, 4096u), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        EdgeStateBuffer = CreateHostBuffer(std::max<VkDeviceSize>(EdgeBytesNeeded * 2u, 4096u), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const VkDescriptorBufferInfo Targets[2] = { { FaceStateBuffer.BufferHandle, 0, VK_WHOLE_SIZE }, { EdgeStateBuffer.BufferHandle, 0, VK_WHOLE_SIZE } };
         VkWriteDescriptorSet Writes[2]{};
         for (uint32_t Binding = 0u; Binding < 2u; ++Binding)
@@ -1243,8 +1290,8 @@ void SketcherRasterization::AssignStates(const std::vector<uint32_t>& FaceStates
         }
         vkUpdateDescriptorSets(Device->AccessDevice(), 2u, Writes, 0u, nullptr);
     }
-    std::memset(FaceStateBuffer.HostAddress, 0, FaceStateBuffer.ByteCapacity);
-    std::memset(EdgeStateBuffer.HostAddress, 0, EdgeStateBuffer.ByteCapacity);
+    FaceCount = static_cast<uint32_t>(FaceStates.size());
+    EdgeCount = static_cast<uint32_t>(EdgeStates.size());
     if (!FaceStates.empty())
     {
         std::memcpy(FaceStateBuffer.HostAddress, FaceStates.data(), 4u * FaceStates.size());
@@ -1296,9 +1343,9 @@ void SketcherRasterization::RecordPanes(
         const VkDeviceSize Needed = sizeof(GizmoVertex) * TotalGizmoVerts;
         if (GizmoBuffer.ByteCapacity < Needed)
         {
-            vkDeviceWaitIdle(Device->AccessDevice());
+            AwaitPendingWork();
             DestroyBuffer(GizmoBuffer);
-            GizmoBuffer = CreateHostBuffer(std::max<VkDeviceSize>(Needed * 2u, 64u * 1024u), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            GizmoBuffer = CreateHostBuffer(std::max<VkDeviceSize>(Needed * 2u, 256u * 1024u), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         }
         auto* Dst = static_cast<GizmoVertex*>(GizmoBuffer.HostAddress);
         for (size_t Idx = 0u; Idx < Panes.size(); ++Idx)
@@ -1653,6 +1700,23 @@ void SketcherRasterization::RecordPanes(
     else
     {
         TransitionImageLayout(Commands, Colour.ImageHandle, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
+void SketcherRasterization::RecordIdentityProbe(VkCommandBuffer Commands, int ProbeX, int ProbeY)
+{
+    if (ProbeReadback.HostAddress == nullptr || Identity.ImageHandle == VK_NULL_HANDLE)
+    {
+        return;
+    }
+    static_cast<uint32_t*>(ProbeReadback.HostAddress)[0] = 0u;
+    if (ProbeX >= 0 && ProbeY >= 0 && uint32_t(ProbeX) < Identity.WidthPx && uint32_t(ProbeY) < Identity.HeightPx)
+    {
+        VkBufferImageCopy Probe {};
+        Probe.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+        Probe.imageOffset      = { ProbeX, ProbeY, 0 };
+        Probe.imageExtent      = { 1u, 1u, 1u };
+        vkCmdCopyImageToBuffer(Commands, Identity.ImageHandle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ProbeReadback.BufferHandle, 1u, &Probe);
     }
 }
 

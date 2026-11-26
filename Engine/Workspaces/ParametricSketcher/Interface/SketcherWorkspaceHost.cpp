@@ -82,8 +82,11 @@ void SketcherWorkspaceHost::Finalize() noexcept
         Thumbnail->SetStatus(ImTextureStatus_Destroyed);
     }
     Sketcher::ReleaseSketcherProjectBrowserTextures(State);
+    DirectGpuTextureId          = 0ull;
     UploadedMatcapGen           = 0u;
     LastViewportRenderSignature = 0ull;
+    LastProbeX                  = -1;
+    LastProbeY                  = -1;
 
     if (RasterReady)
     {
@@ -101,6 +104,22 @@ void SketcherWorkspaceHost::AttachContentBrowserPanel(ContentBrowserPanel* Targe
     {
         BoundBrowser->ConfigureWorkspaceDomain(WorkspaceCategory::GeometryCad);
     }
+}
+
+void SketcherWorkspaceHost::AttachImGuiPresenter(GeometricRaster::ImGuiOverlayRasterization* Presenter) noexcept
+{
+    ImGuiPresenter     = Presenter;
+    DirectGpuTextureId = 0ull;
+    LastViewportRenderSignature = 0ull;
+}
+
+ImTextureRef SketcherWorkspaceHost::QueryViewportTextureRef() const noexcept
+{
+    if (DirectGpuTextureId != 0ull)
+    {
+        return ImTextureRef(static_cast<ImTextureID>(DirectGpuTextureId));
+    }
+    return (ViewportTexture.Pixels != nullptr) ? ViewportTexture.GetTexRef() : ImTextureRef();
 }
 
 void SketcherWorkspaceHost::SynchronizeHostScale(float ScaleFactor) noexcept
@@ -133,9 +152,7 @@ void SketcherWorkspaceHost::RegisterDockPanes(Components::HeadlessWorkspaceDockC
         [this]()
         {
             RenderViewportTarget();
-            const ImTextureRef TexRef =
-                (ViewportTexture.Pixels != nullptr) ? ViewportTexture.GetTexRef() : ImTextureRef();
-            Sketcher::DrawSketcherViewportPanel(State, TexRef);
+            Sketcher::DrawSketcherViewportPanel(State, QueryViewportTextureRef());
         },
     });
     ++RegisteredTabCount;
@@ -193,9 +210,7 @@ void SketcherWorkspaceHost::RenderFullscreenViewport(float WidthPx, float Height
     if (ImGui::Begin("##SolidArcFullscreenViewport", nullptr, FullscreenFlags))
     {
         RenderViewportTarget();
-        const ImTextureRef TexRef =
-            (ViewportTexture.Pixels != nullptr) ? ViewportTexture.GetTexRef() : ImTextureRef();
-        Sketcher::DrawSketcherViewportPanel(State, TexRef);
+        Sketcher::DrawSketcherViewportPanel(State, QueryViewportTextureRef());
     }
     ImGui::End();
     ImGui::PopStyleVar(3);
@@ -496,28 +511,91 @@ void SketcherWorkspaceHost::RenderViewportTarget()
         }
         if (Signature == 0ull) Signature = 1ull;
 
+        // Mirror Frontier Editor's zero-copy GPU viewport path: bind the offscreen VkImageView directly to ImGui
+        // via RegisterOrUpdateExternalImage, eliminating 25+ MB/frame of VRAM->CPU readback & CPU->VRAM re-upload!
+        if (ImGuiPresenter != nullptr && Rasterizer.ColourView() != VK_NULL_HANDLE)
+        {
+            DirectGpuTextureId = ImGuiPresenter->RegisterOrUpdateExternalImage(
+                0x534F4C41524331ull,
+                Rasterizer.TargetGeneration(),
+                Rasterizer.ColourView());
+        }
+        else
+        {
+            DirectGpuTextureId = 0ull;
+        }
+        const bool DirectGpuMode = (DirectGpuTextureId != 0ull);
+
         const bool CacheValid =
             !TargetResized &&
             Signature == LastViewportRenderSignature &&
-            ViewportTexture.GetTexID() != ImTextureID_Invalid &&
-            Rasterizer.ReadbackIdentity() != nullptr;
+            (DirectGpuMode
+                ? true
+                : (ViewportTexture.GetTexID() != ImTextureID_Invalid && Rasterizer.ReadbackIdentity() != nullptr));
         if (CacheValid)
         {
-            // Zero-GPU fast path: probe hover identity directly from cached CPU readback buffer in ~5 ns.
-            if (State.ViewportHovered && ProbeX >= 0 && ProbeY >= 0 &&
-                static_cast<uint32_t>(ProbeX) < Rasterizer.Width() &&
-                static_cast<uint32_t>(ProbeY) < Rasterizer.Height())
+            if (DirectGpuMode)
             {
-                const size_t PixelIndex = static_cast<size_t>(ProbeY) * static_cast<size_t>(Rasterizer.Width()) + static_cast<size_t>(ProbeX);
-                State.HoverIdentity = Rasterizer.ReadbackIdentity()[PixelIndex];
+                if (!State.ViewportHovered || ProbeX < 0 || ProbeY < 0 ||
+                    static_cast<uint32_t>(ProbeX) >= Rasterizer.Width() ||
+                    static_cast<uint32_t>(ProbeY) >= Rasterizer.Height())
+                {
+                    State.HoverIdentity = 0u;
+                    LastProbeX = -1;
+                    LastProbeY = -1;
+                    State.Profile.GpuRecordMs    = 0.0;
+                    State.Profile.GpuWaitMs      = 0.0;
+                    State.Profile.ReadbackCopyMs = 0.0;
+                }
+                else if (ProbeX != LastProbeX || ProbeY != LastProbeY)
+                {
+                    // Static scene + moved cursor: issue a 4-byte identity pixel copy only (zero render pass!).
+                    const Clock::time_point ProbeRecStart = Clock::now();
+                    VkCommandBuffer ProbeCmd = Device->BeginSingleTimeCommands();
+                    if (ProbeCmd != VK_NULL_HANDLE)
+                    {
+                        Rasterizer.RecordIdentityProbe(ProbeCmd, ProbeX, ProbeY);
+                        const uint64_t ProbeTick = Device->DispatchCommandBufferAsync(ProbeCmd);
+                        Rasterizer.NotifySubmittedTick(ProbeTick);
+                        State.Profile.GpuRecordMs = ElapsedMs(ProbeRecStart);
+                        const Clock::time_point ProbeWaitStart = Clock::now();
+                        const bool ProbeDone = Device->AwaitTimelineTick(ProbeTick);
+                        State.Profile.GpuWaitMs = ElapsedMs(ProbeWaitStart);
+                        if (ProbeDone)
+                        {
+                            State.HoverIdentity = Rasterizer.ProbedIdentity();
+                            LastProbeX = ProbeX;
+                            LastProbeY = ProbeY;
+                        }
+                        Device->FreeCommandBuffer(ProbeCmd);
+                    }
+                    State.Profile.ReadbackCopyMs = 0.0;
+                }
+                else
+                {
+                    State.Profile.GpuRecordMs    = 0.0;
+                    State.Profile.GpuWaitMs      = 0.0;
+                    State.Profile.ReadbackCopyMs = 0.0;
+                }
             }
             else
             {
-                State.HoverIdentity = 0u;
+                // Headless/CPU fallback fast path: probe hover identity directly from cached CPU readback buffer in ~5 ns.
+                if (State.ViewportHovered && ProbeX >= 0 && ProbeY >= 0 &&
+                    static_cast<uint32_t>(ProbeX) < Rasterizer.Width() &&
+                    static_cast<uint32_t>(ProbeY) < Rasterizer.Height())
+                {
+                    const size_t PixelIndex = static_cast<size_t>(ProbeY) * static_cast<size_t>(Rasterizer.Width()) + static_cast<size_t>(ProbeX);
+                    State.HoverIdentity = Rasterizer.ReadbackIdentity()[PixelIndex];
+                }
+                else
+                {
+                    State.HoverIdentity = 0u;
+                }
+                State.Profile.GpuRecordMs    = 0.0;
+                State.Profile.GpuWaitMs      = 0.0;
+                State.Profile.ReadbackCopyMs = 0.0;
             }
-            State.Profile.GpuRecordMs    = 0.0;
-            State.Profile.GpuWaitMs      = 0.0;
-            State.Profile.ReadbackCopyMs = 0.0;
             State.Profile.LastFrameCached = true;
             ++State.Profile.ViewportCacheHits;
             return;
@@ -526,10 +604,12 @@ void SketcherWorkspaceHost::RenderViewportTarget()
         const Clock::time_point RecordStart = Clock::now();
         VkCommandBuffer Cmd = Device->BeginSingleTimeCommands();
         if (Cmd == VK_NULL_HANDLE) return;
-        Rasterizer.RecordPanes(Cmd, Panes, State.Style.Background, true, ProbeX, ProbeY);
+        // Direct GPU mode skips the 16.6 MB full-target readback completely (copies only the 4-byte cursor probe!).
+        Rasterizer.RecordPanes(Cmd, Panes, State.Style.Background, !DirectGpuMode, ProbeX, ProbeY);
 
         // DispatchCommandBufferAsync ends Cmd internally; do not call vkEndCommandBuffer twice.
         const uint64_t Tick = Device->DispatchCommandBufferAsync(Cmd);
+        Rasterizer.NotifySubmittedTick(Tick);
         State.Profile.GpuRecordMs = ElapsedMs(RecordStart);
 
         const Clock::time_point WaitStart = Clock::now();
@@ -540,7 +620,12 @@ void SketcherWorkspaceHost::RenderViewportTarget()
         if (Completed)
         {
             State.HoverIdentity = State.ViewportHovered ? Rasterizer.ProbedIdentity() : 0u;
-            UploadViewportPixels(Rasterizer.ReadbackColour(), Rasterizer.Width(), Rasterizer.Height());
+            LastProbeX = State.ViewportHovered ? ProbeX : -1;
+            LastProbeY = State.ViewportHovered ? ProbeY : -1;
+            if (!DirectGpuMode)
+            {
+                UploadViewportPixels(Rasterizer.ReadbackColour(), Rasterizer.Width(), Rasterizer.Height());
+            }
             LastViewportRenderSignature = Signature;
         }
         State.Profile.ReadbackCopyMs = ElapsedMs(CopyStart);

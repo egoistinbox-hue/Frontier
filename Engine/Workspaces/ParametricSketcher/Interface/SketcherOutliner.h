@@ -105,6 +105,13 @@ struct SketcherOutlinerIntent
 // Bodies (creation order), then sketches and space curves (tree order), then image planes, with selection, visibility and lock.
 [[nodiscard]] std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus& State);
 
+// Telemetry for Outliner figure-list cache & Frontier RetainedCanvasCache (shown in the F3 Profiler HUD).
+void QuerySketcherOutlinerCacheStats(
+    uint64_t& OutFigureHits,
+    uint64_t& OutFigureRebuilds,
+    uint64_t& OutCanvasReplays,
+    uint64_t& OutCanvasCaptures) noexcept;
+
 // Draws the panel into the current ImGui window over Panel (logical px) and returns the action of this frame.
 SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State, const PlaneExtent& Panel);
 

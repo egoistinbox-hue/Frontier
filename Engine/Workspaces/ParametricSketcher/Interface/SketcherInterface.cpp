@@ -17,6 +17,7 @@
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherStyleSheet.h"
 #include "Engine/Components/Appearance/TypographyRepository.h"
 #include "Engine/Components/Panes/WorkspaceAppearance.h"
+#include "Engine/Components/RetainedCanvasCache.h"
 
 #include "Engine/GeometrySpace/Parametric/Diagnostics/OperationTrace.h"
 #include "Engine/GeometrySpace/Parametric/Exchange/ExchangePath.h"
@@ -41,14 +42,17 @@
 #include <cstring>
 #include <cfloat>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <numbers>
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace Frontier::Workspaces::Sketcher
@@ -423,7 +427,16 @@ bool OpenDocument(SketcherWorkspaceStatus& State, const std::string& Path, bool 
 
 void SaveDocument(SketcherWorkspaceStatus& State, const std::string& Path)
 {
-    if (WriteDocument(State.Document, Path))
+    const double SaveStart = SteadySeconds();
+    const bool Ok = WriteDocument(State.Document, Path);
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "File",
+        "Save document",
+        (SteadySeconds() - SaveStart) * 1.0e3,
+        Ok ? Path : ("FAILED: " + Path));
+    if (Ok)
     {
         State.DocumentPath   = Path;
         State.DirtyCondition = false;
@@ -441,7 +454,7 @@ void StartNewDocument(SketcherWorkspaceStatus& State)
     if (std::filesystem::exists(State.Options.RecoveryPath))
         std::filesystem::copy_file(State.Options.RecoveryPath, PreviousRecoveryPath(State), std::filesystem::copy_options::overwrite_existing, Failure);
     else if (!State.Document.Tree.Steps.empty())
-        WriteDocument(State.Document, PreviousRecoveryPath(State));
+        SaveSketcherRecoveryAutosave(State.Document, PreviousRecoveryPath(State));
     AdoptDocument(State, CreateSketcherDocument("Untitled"), false);
     State.DocumentPath = {};
     State.Camera       = OrbitCamera{ .FieldOfView = State.Options.FieldOfView, .OrthographicEnabled = State.Camera.OrthographicEnabled };
@@ -6895,12 +6908,17 @@ bool DriveGizmo(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, I
             else if (!Gizmo.Refusal.empty()) CancelGizmoDrag(State, "Refused: " + Gizmo.Refusal);
             else CommitGizmoDrag(State);
         }
-        else if (Length(Gizmo.Shift) > 0.0)
+        else
         {
-            // The gizmo rides with a move (axes stay fixed for the whole drag) and stays GizmoPixels on screen.
+            // The gizmo rides with a move (axes stay fixed for the whole drag) and stays GizmoPixels on screen,
+            // with Frontier's active drag visual guide (extended axis travel line / 360° rotation sweep wedge).
             GizmoPose Riding = Gizmo.Pose;
             Riding.Origin = Riding.Origin + Gizmo.Shift;
             Riding.Size   = MeasureGizmoSize(Frame, Riding.Origin, GizmoPixels);
+            Riding.Guide.Active        = true;
+            Riding.Guide.StartOrigin   = Gizmo.Pose.Origin;
+            Riding.Guide.StartAngleRad = Gizmo.GrabValue;
+            Riding.Guide.DeltaAngleRad = Gizmo.Angle;
             Gizmo.Geometry = BuildGizmoGeometry(Riding, Frame, GizmoHandle::None, Gizmo.Grab);
         }
     }
@@ -16023,6 +16041,10 @@ std::vector<SketcherRasterPane> ComposeSketcherRasterPanes(const SketcherWorkspa
             Riding.Origin = Riding.Origin + State.Gizmo.Shift;
             Riding.Modes  = State.Gizmo.Modes;
             Riding.Size   = MeasureGizmoSize(PaneFrame, Riding.Origin, GizmoPixels);
+            Riding.Guide.Active        = true;
+            Riding.Guide.StartOrigin   = State.Gizmo.Pose.Origin;
+            Riding.Guide.StartAngleRad = State.Gizmo.GrabValue;
+            Riding.Guide.DeltaAngleRad = State.Gizmo.Angle;
             return BuildGizmoGeometry(Riding, PaneFrame, GizmoHandle::None, State.Gizmo.Grab);
         }
         // Lightweight gizmo-only copy avoids constructing/destroying a full SketcherWorkspaceStatus every frame.
@@ -22143,15 +22165,95 @@ void DrawWelcome(SketcherWorkspaceStatus& State)
     ImGui::EndPopup();
 }
 
+class AsyncRecoveryAutosaveWriter
+{
+public:
+    AsyncRecoveryAutosaveWriter() = default;
+    ~AsyncRecoveryAutosaveWriter()
+    {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            StopRequested = true;
+        }
+        Signal.notify_all();
+        if (Worker.joinable()) Worker.join();
+    }
+
+    void Enqueue(std::string TargetPath, std::string EncodedToml)
+    {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            PendingPath = std::move(TargetPath);
+            PendingText = std::move(EncodedToml);
+            HasPending  = true;
+            if (!Worker.joinable())
+            {
+                Worker = std::thread([this]() { Run(); });
+            }
+        }
+        Signal.notify_one();
+    }
+
+private:
+    void Run()
+    {
+        while (true)
+        {
+            std::string Path;
+            std::string Text;
+            {
+                std::unique_lock<std::mutex> Lock(Mutex);
+                Signal.wait(Lock, [this]() { return StopRequested || HasPending; });
+                if (StopRequested && !HasPending) break;
+                Path = std::move(PendingPath);
+                Text = std::move(PendingText);
+                HasPending = false;
+            }
+            if (!Path.empty())
+            {
+                (void)WriteSketcherEncodedTextAtomically(Text, Path);
+            }
+        }
+    }
+
+    std::mutex              Mutex;
+    std::condition_variable Signal;
+    std::thread             Worker;
+    std::string             PendingPath;
+    std::string             PendingText;
+    bool                    HasPending    = false;
+    bool                    StopRequested = false;
+};
+
+AsyncRecoveryAutosaveWriter& SharedRecoveryAutosaveWriter()
+{
+    static AsyncRecoveryAutosaveWriter Writer;
+    return Writer;
+}
+
 void AdvanceAutosave(SketcherWorkspaceStatus& State, double DeltaSeconds)
 {
     if (State.AutosaveTimer < 0.0) return;
-    if (ImGui::IsAnyMouseDown() || State.Bevel.ActiveCondition) return;
+    if (ImGui::IsAnyMouseDown() || State.Bevel.ActiveCondition || State.Gizmo.DragCondition || State.Transform.ActiveCondition) return;
     State.AutosaveTimer -= DeltaSeconds;
     if (State.AutosaveTimer > 0.0) return;
     State.AutosaveTimer = -1.0;
-    if (WriteDocument(State.Document, State.Options.RecoveryPath)) State.Journal.push_back("Autosaved " + State.Options.RecoveryPath);
-    else Announce(State, "Autosave failed: " + State.Options.RecoveryPath);
+    if (State.Options.RecoveryPath.empty()) return;
+
+    // Encode lightweight parametric authoring TOML only (~0.1-0.4 ms, zero 65k-voxel SDF/BVH4 compile!)
+    // and dispatch atomic disk write off the UI thread so post-operation autosave NEVER freezes SolidArc.
+    const double EncodeStart = SteadySeconds();
+    std::string EncodedToml  = EncodeSketcherDocument(State.Document);
+    const size_t PayloadBytes = EncodedToml.size();
+    SharedRecoveryAutosaveWriter().Enqueue(State.Options.RecoveryPath, std::move(EncodedToml));
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "Autosave",
+        "Async recovery TOML",
+        (SteadySeconds() - EncodeStart) * 1.0e3,
+        Compose("%.1f KB queued", double(PayloadBytes) / 1024.0));
+    State.Journal.push_back("Autosaved " + State.Options.RecoveryPath);
 }
 
 void AppendJsonText(std::ostringstream& Stream, const std::string& Text)
@@ -22514,15 +22616,23 @@ void DrawProfilerPanel(SketcherWorkspaceStatus& State)
     const uint64_t GizmoTotal = GizmoHits + GizmoRebuilds;
     const double GizmoHitPct  = GizmoTotal > 0ull ? (100.0 * double(GizmoHits) / double(GizmoTotal)) : 100.0;
 
+    uint64_t OutFigHits = 0ull, OutFigRebuilds = 0ull, OutCanvasReplays = 0ull, OutCanvasCaptures = 0ull;
+    QuerySketcherOutlinerCacheStats(OutFigHits, OutFigRebuilds, OutCanvasReplays, OutCanvasCaptures);
+    const uint64_t OutCanvasTotal = OutCanvasReplays + OutCanvasCaptures;
+    const double OutCanvasPct = OutCanvasTotal > 0ull ? (100.0 * double(OutCanvasReplays) / double(OutCanvasTotal)) : 100.0;
+
     ImGui::Text("Frame %.2f ms (%.1f FPS)  |  Worst %.2f ms  |  Mode: %s",
                 SmoothMs, Fps, Profile.WorstMs, Profile.LastFrameCached ? "CACHED (0% GPU)" : "ACTIVE GPU");
-    ImGui::Text("Viewport Cache: %.1f%% (%llu hits / %llu draws)  |  Gizmo Cache: %.1f%% (%llu / %llu)",
+    ImGui::Text("Viewport Cache: %.1f%% (%llu/%llu)  |  Gizmo Cache: %.1f%% (%llu/%llu)  |  UI Retained: %.1f%% (%llu/%llu)",
                 ViewportHitPct,
                 static_cast<unsigned long long>(Profile.ViewportCacheHits),
-                static_cast<unsigned long long>(Profile.ViewportDraws),
+                static_cast<unsigned long long>(TotalViewportFrames),
                 GizmoHitPct,
                 static_cast<unsigned long long>(GizmoHits),
-                static_cast<unsigned long long>(GizmoTotal));
+                static_cast<unsigned long long>(GizmoTotal),
+                OutCanvasPct,
+                static_cast<unsigned long long>(OutCanvasReplays),
+                static_cast<unsigned long long>(OutCanvasTotal));
 
     if (ImGui::SmallButton("Reset Peaks"))
     {

@@ -166,6 +166,13 @@ public:
     void RecordPanes(VkCommandBuffer Commands, const std::vector<SketcherRasterPane>& Panes, const float Background[4], bool ReadbackCondition,
                      int ProbeX, int ProbeY);
 
+    // Lightweight 4-byte identity probe copy for static-scene hover updates (zero render pass, zero full-target readback).
+    void RecordIdentityProbe(VkCommandBuffer Commands, int ProbeX, int ProbeY);
+
+    // Track the latest timeline tick referencing this rasterizer's buffers so in-place updates wait only on our own
+    // submission (never global vkDeviceWaitIdle).
+    void NotifySubmittedTick(uint64_t TimelineTick) noexcept { LastSubmittedTick = TimelineTick; }
+
     // Valid after the recorded work completed.
     [[nodiscard]] uint32_t        ProbedIdentity() const;
     [[nodiscard]] const uint32_t* ReadbackColour() const;                                    // RGBA8, row-major, Width × Height
@@ -202,6 +209,7 @@ private:
     void DestroyTargets();
     void CreatePipelines(const std::filesystem::path& CompiledShaderDirectory);
     void ReleasePictures();
+    void AwaitPendingWork() const noexcept;
 
     [[nodiscard]] GpuImage CreateGpuImage(
         uint32_t           Width,
@@ -291,6 +299,7 @@ private:
     VkDescriptorSet             MatcapSet                    = VK_NULL_HANDLE;
     uint32_t                    MatcapLayers                 = 0u;
     uint64_t                    LastStatesHash               = 0ull;
+    uint64_t                    LastSubmittedTick            = 0ull;
 };
 
 } // namespace Frontier::Workspaces::Sketcher

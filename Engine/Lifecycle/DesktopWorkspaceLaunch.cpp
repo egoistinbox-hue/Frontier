@@ -1084,6 +1084,7 @@ int LaunchDesktopWorkspace(
             SketcherBrowserPtr->AccessPanel().ConfigureWorkspaceDomain(WorkspaceCategory::GeometryCad);
             SketcherBrowserPtr->AccessPanel().ConfigureShelfExtent(ContentShelfExtent::Closed, true);
             SketcherHostPtr->AttachContentBrowserPanel(&SketcherBrowserPtr->AccessPanel());
+            SketcherHostPtr->AttachImGuiPresenter(&SwapchainPresenter);
 
             (void)SketcherDockPtr->Initialize(
                 Windowing::WindowConfigurationDescriptor::ConstructApplicationWindow(

@@ -1280,6 +1280,14 @@ BooleanOutcome AssembleBoolean(ModelPartition& Partition, const GeneralFuseOutco
 
 static BooleanOutcome ComputeBooleanUntraced(ModelPartition& Partition, BodyToken First, BodyToken Second, BooleanOperation Operation, const GeneralFuseSettings& Settings, GeneralFuseStatistics* Statistics)
 {
+    const bool SolidOperationCondition = Operation == BooleanOperation::Union || Operation == BooleanOperation::Intersection
+                                      || Operation == BooleanOperation::Difference || Operation == BooleanOperation::ReversedDifference;
+    if (SolidOperationCondition && (Partition.Bodies.Resolve(First).Category == BodyCategory::Sheet || Partition.Bodies.Resolve(Second).Category == BodyCategory::Sheet))
+    {
+        BooleanOutcome Refused;
+        Refused.Refusal = "Boolean: solid boolean requires closed solid bodies (an argument is an open sheet)";
+        return Refused;
+    }
     const GeneralFuseOutcome Fuse = RunGeneralFuse(Partition, First, Second, Settings);
     if (Statistics != nullptr) *Statistics = Fuse.Statistics;
     return AssembleBoolean(Partition, Fuse, Operation, Settings.MaximalFacesEnabled);

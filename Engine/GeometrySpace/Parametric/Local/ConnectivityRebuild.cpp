@@ -13,6 +13,7 @@
 #include "Engine/GeometrySpace/Parametric/Geometry/NurbsCarrier.h"
 #include "Engine/GeometrySpace/Parametric/Geometry/ProjectedCurve.h"
 #include "Engine/GeometrySpace/Parametric/Sketch/SketchSpline.h"
+#include "Engine/GeometrySpace/Parametric/Surfacing/CurveNetwork.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1253,19 +1254,153 @@ int OpenSliverBridges(const ModelPartition& Partition, BodyToken Body, const Ort
 //                                                    RESHAPE (VERTICES / EDGES)
 //------------------------------------------------------------------------------------------------------------------------
 
+namespace
+{
+    [[nodiscard]] double ReshapeCross2D(Vector2 First, Vector2 Second) noexcept
+    {
+        return First.X * Second.Y - First.Y * Second.X;
+    }
+
+    [[nodiscard]] double ReshapeSegmentPointDistance2D(Vector2 Point, Vector2 Start, Vector2 End) noexcept
+    {
+        const Vector2 Chord  = End - Start;
+        const double  LengthSq = Chord.X * Chord.X + Chord.Y * Chord.Y;
+        if (LengthSq <= 1.0e-24) return std::hypot(Point.X - Start.X, Point.Y - Start.Y);
+        const double Share = std::clamp(((Point.X - Start.X) * Chord.X + (Point.Y - Start.Y) * Chord.Y) / LengthSq, 0.0, 1.0);
+        return std::hypot(Point.X - (Start.X + Chord.X * Share), Point.Y - (Start.Y + Chord.Y * Share));
+    }
+
+    [[nodiscard]] bool ReshapeSegmentsCross2D(Vector2 A0, Vector2 A1, Vector2 B0, Vector2 B1) noexcept
+    {
+        constexpr double Eps = 1.0e-11;
+        const auto Orient = [](Vector2 P, Vector2 Q, Vector2 R) noexcept { return ReshapeCross2D(Q - P, R - P); };
+        const auto OnSpan = [&](Vector2 P, Vector2 Q, Vector2 R) noexcept
+        {
+            return R.X >= std::min(P.X, Q.X) - Eps && R.X <= std::max(P.X, Q.X) + Eps &&
+                   R.Y >= std::min(P.Y, Q.Y) - Eps && R.Y <= std::max(P.Y, Q.Y) + Eps;
+        };
+        const double O1 = Orient(A0, A1, B0);
+        const double O2 = Orient(A0, A1, B1);
+        const double O3 = Orient(B0, B1, A0);
+        const double O4 = Orient(B0, B1, A1);
+        if (((O1 > Eps && O2 < -Eps) || (O1 < -Eps && O2 > Eps)) &&
+            ((O3 > Eps && O4 < -Eps) || (O3 < -Eps && O4 > Eps)))
+            return true;
+        if (std::fabs(O1) <= Eps && OnSpan(A0, A1, B0)) return true;
+        if (std::fabs(O2) <= Eps && OnSpan(A0, A1, B1)) return true;
+        if (std::fabs(O3) <= Eps && OnSpan(B0, B1, A0)) return true;
+        if (std::fabs(O4) <= Eps && OnSpan(B0, B1, A1)) return true;
+        return false;
+    }
+
+    [[nodiscard]] bool ReshapePointInPolygon2D(Vector2 Point, const std::vector<Vector2>& Polygon) noexcept
+    {
+        bool Inside = false;
+        const size_t Count = Polygon.size();
+        for (size_t Curr = 0, Prev = Count - 1; Curr < Count; Prev = Curr++)
+        {
+            const Vector2 A = Polygon[Prev];
+            const Vector2 B = Polygon[Curr];
+            if (((A.Y > Point.Y) != (B.Y > Point.Y)) &&
+                (Point.X < (B.X - A.X) * (Point.Y - A.Y) / (B.Y - A.Y) + A.X))
+                Inside = !Inside;
+        }
+        return Inside;
+    }
+
+    [[nodiscard]] bool ReshapePointInTriangle2D(Vector2 Point, Vector2 A, Vector2 B, Vector2 C) noexcept
+    {
+        constexpr double Eps = -1.0e-11;
+        return ReshapeCross2D(B - A, Point - A) >= Eps &&
+               ReshapeCross2D(C - B, Point - B) >= Eps &&
+               ReshapeCross2D(A - C, Point - C) >= Eps;
+    }
+
+    [[nodiscard]] NurbsCurve NormalizeOrientedNurbsSpan(const BlueprintEdge& Edge, Orientation Sense)
+    {
+        std::optional<NurbsCurve> Converted = ConvertCurveToNurbs(Edge.Curve, Edge.Low, Edge.High);
+        NurbsCurveDefinition      Def       = Converted && Converted->Definition
+                                            ? *Converted->Definition
+                                            : *ConvertLineToNurbs(StraightLine{ EvaluateCurve(Edge.Curve, Edge.Low).Position,
+                                                                                Normalize(EvaluateCurve(Edge.Curve, Edge.High).Position - EvaluateCurve(Edge.Curve, Edge.Low).Position) },
+                                                                  0.0, std::max(1.0e-9, Distance(EvaluateCurve(Edge.Curve, Edge.Low).Position, EvaluateCurve(Edge.Curve, Edge.High).Position))).Definition;
+        if (Sense == Orientation::Reversed)
+            Def = *ReverseNurbsCurve(Def).Definition;
+        const NurbsDomain Dom  = MeasureNurbsCurveDomain(Def);
+        const double      Span = std::max(1.0e-12, Dom.High - Dom.Low);
+        for (double& Knot : Def.Knots)
+            Knot = std::clamp((Knot - Dom.Low) / Span, 0.0, 1.0);
+        for (int K = 0; K <= Def.Degree && K < static_cast<int>(Def.Knots.size()); ++K)
+        {
+            Def.Knots[K] = 0.0;
+            Def.Knots[Def.Knots.size() - 1 - K] = 1.0;
+        }
+        Def.Period = 0.0;
+        return NurbsCurve{ std::make_shared<NurbsCurveDefinition>(std::move(Def)) };
+    }
+
+    // Exact ruled rational NURBS surface over a 4-sided loop with two opposite straight edges and two compatible rail edges
+    // (such as an extruded circular-arc wheel arch or spline wall when one or more corners move).
+    [[nodiscard]] std::optional<NurbsSurface> BuildRuledQuadCarrier(const BodyBlueprint& Blueprint, const std::vector<BlueprintUse>& Loop)
+    {
+        if (Loop.size() != 4) return std::nullopt;
+        int RailSlot = -1;
+        if (std::holds_alternative<StraightLine>(Blueprint.Edges[Loop[1].Edge].Curve) &&
+            std::holds_alternative<StraightLine>(Blueprint.Edges[Loop[3].Edge].Curve))
+        {
+            RailSlot = 0;
+        }
+        else if (std::holds_alternative<StraightLine>(Blueprint.Edges[Loop[0].Edge].Curve) &&
+                 std::holds_alternative<StraightLine>(Blueprint.Edges[Loop[2].Edge].Curve))
+        {
+            RailSlot = 1;
+        }
+        if (RailSlot < 0) return std::nullopt;
+
+        const BlueprintUse& LowerUse = Loop[RailSlot];
+        const BlueprintUse& UpperUse = Loop[(RailSlot + 2) % 4];
+        const Orientation   UpperOpposite = UpperUse.Sense == Orientation::Forward ? Orientation::Reversed : Orientation::Forward;
+        const NurbsCurve    LowerCurve = NormalizeOrientedNurbsSpan(Blueprint.Edges[LowerUse.Edge], LowerUse.Sense);
+        const NurbsCurve    UpperCurve = NormalizeOrientedNurbsSpan(Blueprint.Edges[UpperUse.Edge], UpperOpposite);
+        if (!LowerCurve.Definition || !UpperCurve.Definition) return std::nullopt;
+        const NurbsCurveDefinition& A = *LowerCurve.Definition;
+        const NurbsCurveDefinition& B = *UpperCurve.Definition;
+        if (A.Degree != B.Degree || A.Poles.size() != B.Poles.size() || A.Knots.size() != B.Knots.size())
+            return std::nullopt;
+        for (size_t K = 0; K < A.Knots.size(); ++K)
+            if (std::fabs(A.Knots[K] - B.Knots[K]) > 1.0e-6) return std::nullopt;
+        for (size_t P = 0; P < A.Weights.size(); ++P)
+            if (std::fabs(A.Weights[P] - B.Weights[P]) > 1.0e-6) return std::nullopt;
+
+        const int CountU = static_cast<int>(A.Poles.size());
+        std::vector<Vector3> Poles(static_cast<size_t>(CountU) * 2);
+        std::vector<double>  Weights(static_cast<size_t>(CountU) * 2);
+        for (int I = 0; I < CountU; ++I)
+        {
+            Poles[static_cast<size_t>(I) * 2 + 0]   = A.Poles[I];
+            Poles[static_cast<size_t>(I) * 2 + 1]   = B.Poles[I];
+            const double SharedWeight               = 0.5 * (A.Weights[I] + B.Weights[I]);
+            Weights[static_cast<size_t>(I) * 2 + 0] = SharedWeight;
+            Weights[static_cast<size_t>(I) * 2 + 1] = SharedWeight;
+        }
+        return ConstructNurbsSurface(A.Degree, 1, CountU, 2, A.Knots, { 0.0, 0.0, 1.0, 1.0 }, std::move(Poles), std::move(Weights));
+    }
+}
+
 std::string ReshapeBodyVertices(ModelPartition& Partition, BodyToken Body, const std::vector<VertexToken>& Vertices, const AffineMapping& Map,
                                 BodyToken& Result, std::vector<FaceChangeHistory>& Histories, AuditReport& Audit, std::string& Method)
 {
     BodyDescription Description;
     if (std::string Refusal = DescribeBody(Partition, Body, Description); !Refusal.empty()) return "Reshape: " + Refusal;
     BodyBlueprint& Blueprint = Description.Blueprint;
-    if (Blueprint.Category != BodyCategory::Solid) return "Reshape: the body is a sheet (🚧 reshaping sheets)";
+    if (Blueprint.Category != BodyCategory::Solid && Blueprint.Category != BodyCategory::Sheet)
+        return "Reshape: unsupported body category";
     if (Vertices.empty()) return "Reshape: pick vertices or edges first";
     const double Tolerance = 1.0e-8 * std::max(1.0, Description.Scale);                     // [len] - Coplanarity / travel floor (Accept)
     const auto   Carry     = [&](Vector3 Point) { return Map.ColumnX * Point.X + Map.ColumnY * Point.Y + Map.ColumnZ * Point.Z + Map.Shift; };
 
-    // ① New positions for the picked vertices (recording pre-move positions so already-bent bilinear NURBS faces keep
-    //    their pre-move outward orientation and reference tangent on subsequent reshapes).
+    // ① New positions for the picked vertices (recording pre-move positions so already-bent NURBS faces and N-gon planar
+    //    decompositions keep their pre-move chart orientation and visibility).
     const size_t         VertexCount = Blueprint.Vertices.size();
     std::vector<Vector3> OriginalPositions(VertexCount);
     for (size_t Index = 0; Index < VertexCount; ++Index) OriginalPositions[Index] = Blueprint.Vertices[Index].Position;
@@ -1286,139 +1421,710 @@ std::string ReshapeBodyVertices(ModelPartition& Partition, BodyToken Body, const
     }
     if (Travel <= Tolerance) return "Reshape: the move is zero";
 
-    // ② Straight edges at a moved vertex are re-drawn between their new ends (τ = arc length from Start).
-    std::vector<char> EdgeChanged(Blueprint.Edges.size(), 0);
+    // ② Incident edges follow their moved endpoints: straight lines re-draw between their new ends, in-plane circular arcs
+    //    preserve their sweep angle, and off-plane / freeform curves deform smoothly along their clamped NURBS poles.
+    const size_t      OriginalEdgeCount = Blueprint.Edges.size();
+    std::vector<char> EdgeChanged(OriginalEdgeCount, 0);
     int               ChangedEdges = 0;
-    for (size_t Index = 0; Index < Blueprint.Edges.size(); ++Index)
+    for (size_t Index = 0; Index < OriginalEdgeCount; ++Index)
     {
         BlueprintEdge& Edge = Blueprint.Edges[Index];
         if (!Moved[Edge.Start] && !Moved[Edge.End]) continue;
-        const std::string Name = LabelToken("E", Description.Inventory.Edges[Index]);
-        if (!std::holds_alternative<StraightLine>(Edge.Curve))
-            return "Reshape: edge " + Name + " is a " + CurveCategoryLabel(Edge.Curve) + " — only straight edges can follow a moved vertex (move the face instead)";
-        const Vector3 From   = Blueprint.Vertices[Edge.Start].Position;
-        const Vector3 Until  = Blueprint.Vertices[Edge.End].Position;
-        const double  Extent = Distance(From, Until);                                       // [len]
-        if (Extent <= 1.0e-6 * Description.Scale) return "Reshape: edge " + Name + " would shrink to a point";
-        Edge.Curve = StraightLine{ From, (Until - From) * (1.0 / Extent) };
-        Edge.Low   = 0.0;
-        Edge.High  = Extent;
+        const std::string Name   = LabelToken("E", Description.Inventory.Edges[Index]);
+        const Vector3     From   = Blueprint.Vertices[Edge.Start].Position;
+        const Vector3     Until  = Blueprint.Vertices[Edge.End].Position;
+        const double      Extent = Distance(From, Until);                                    // [len]
+        if (Edge.Start != Edge.End && Extent <= 1.0e-6 * Description.Scale)
+            return "Reshape: edge " + Name + " would shrink to a point";
+
+        if (std::holds_alternative<StraightLine>(Edge.Curve))
+        {
+            Edge.Curve = StraightLine{ From, (Until - From) * (1.0 / Extent) };
+            Edge.Low   = 0.0;
+            Edge.High  = Extent;
+        }
+        else if (const auto* Arc = std::get_if<CircularArc>(&Edge.Curve);
+                 Arc && Edge.Start != Edge.End &&
+                 std::fabs(Dot(Until - From, Arc->Frame.ZAxis)) <= Tolerance &&
+                 (Edge.High - Edge.Low) > 1.0e-6 && (Edge.High - Edge.Low) < 2.0 * std::numbers::pi - 1.0e-6)
+        {
+            const double  Sweep       = Edge.High - Edge.Low;
+            const Vector3 Chord       = Until - From;
+            const double  ChordLength = Length(Chord);
+            const Vector3 Perp        = Normalize(Cross(Arc->Frame.ZAxis, Chord));
+            const double  HalfAngle   = 0.5 * Sweep;
+            const double  NewRadius   = ChordLength / (2.0 * std::sin(HalfAngle));
+            const Vector3 NewOrigin   = (From + Until) * 0.5 + Perp * (0.5 * ChordLength / std::tan(HalfAngle));
+            const Vector3 NewXAxis    = Normalize(From - NewOrigin);
+            const Vector3 NewYAxis    = Cross(Arc->Frame.ZAxis, NewXAxis);
+            Edge.Curve = CircularArc{ { NewOrigin, NewXAxis, NewYAxis, Arc->Frame.ZAxis }, NewRadius };
+            Edge.Low   = 0.0;
+            Edge.High  = Sweep;
+        }
+        else
+        {
+            std::optional<NurbsCurve> Converted = ConvertCurveToNurbs(Edge.Curve, Edge.Low, Edge.High);
+            if (!Converted || !Converted->Definition)
+                return "Reshape: edge " + Name + " (" + CurveCategoryLabel(Edge.Curve) + ") cannot deform with a moved vertex";
+            NurbsCurveDefinition Def = *Converted->Definition;
+            const NurbsDomain    Dom = MeasureNurbsCurveDomain(Def);
+            const double         DomSpan = std::max(1.0e-12, Dom.High - Dom.Low);
+            const Vector3        ShiftStart = From - OriginalPositions[Edge.Start];
+            const Vector3        ShiftEnd   = Until - OriginalPositions[Edge.End];
+            const int            PoleCount  = static_cast<int>(Def.Poles.size());
+            for (int PoleIdx = 0; PoleIdx < PoleCount; ++PoleIdx)
+            {
+                double Greville = 0.0;
+                for (int K = 1; K <= Def.Degree; ++K) Greville += Def.Knots[PoleIdx + K];
+                Greville /= std::max(1, Def.Degree);
+                const double Share = PoleIdx == 0 ? 0.0 : (PoleIdx == PoleCount - 1 ? 1.0 : std::clamp((Greville - Dom.Low) / DomSpan, 0.0, 1.0));
+                Def.Poles[PoleIdx] = Def.Poles[PoleIdx] + ShiftStart * (1.0 - Share) + ShiftEnd * Share;
+            }
+            if (Edge.Start != Edge.End && !Def.Poles.empty())
+            {
+                Def.Poles.front() = From;
+                Def.Poles.back()  = Until;
+            }
+            Edge.Curve = NurbsCurve{ std::make_shared<NurbsCurveDefinition>(std::move(Def)) };
+            Edge.Low   = Dom.Low;
+            Edge.High  = Dom.High;
+        }
         EdgeChanged[Index] = 1;
         ++ChangedEdges;
     }
 
-    // ③ Faces at a moved vertex: plane re-fit, bilinear patch, or refusal.
-    std::vector<FaceChangeHistory> Planned(Blueprint.Faces.size());
-    int PlanarFaces = 0, BentFaces = 0;
-    double Bow = 0.0;                                                                        // [len] - Worst off-plane corner among bent faces
-    for (size_t Index = 0; Index < Blueprint.Faces.size(); ++Index)
+    // ③ Faces at a moved vertex: plane re-fit (including concave N-gons and faces with curved wheel arches/holes),
+    //    smooth bilinear / ruled NURBS patch on 4-sided faces, or minimal planar chord decomposition on off-plane N-gons.
+    const size_t                   OriginalFaceCount = Blueprint.Faces.size();
+    std::vector<FaceChangeHistory> Planned(OriginalFaceCount);
+    int    PlanarFaces = 0, BentFaces = 0, SplitFacets = 0;
+    double Bow         = 0.0;                                                                // [len] - Worst off-plane corner among bent faces
+
+    auto ConstructFittedPlane = [](Vector3 Centre, Vector3 Normal, Vector3 RefXAxis, Vector3 RefYAxis) -> PlaneSurface
     {
-        BlueprintFace&    Face = Blueprint.Faces[Index];
-        const FaceToken   Token = Description.Inventory.Faces[Index];
-        Planned[Index] = { {}, FaceChangeOrigin::Unchanged, Token, {} };
-        bool Touched = false;
-        for (const std::vector<BlueprintUse>& Loop : Face.Loops)
-            for (const BlueprintUse& Use : Loop) Touched = Touched || EdgeChanged[Use.Edge];
+        Vector3 Along = RefXAxis - Normal * Dot(RefXAxis, Normal);
+        if (Length(Along) < 1.0e-6) Along = RefYAxis - Normal * Dot(RefYAxis, Normal);
+        if (Length(Along) < 1.0e-6)
+        {
+            const Vector3 Seed = std::fabs(Normal.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+            Along = Seed - Normal * Dot(Seed, Normal);
+        }
+        Along = Along * (1.0 / Length(Along));
+        PlaneSurface Fitted;
+        Fitted.Frame = { Centre, Along, Cross(Normal, Along), Normal };
+        return Fitted;
+    };
+
+    for (size_t Index = 0; Index < OriginalFaceCount; ++Index)
+    {
+        const FaceToken Token = Description.Inventory.Faces[Index];
+        Planned[Index]        = { {}, FaceChangeOrigin::Unchanged, Token, {} };
+        bool Touched          = false;
+        for (const std::vector<BlueprintUse>& Loop : Blueprint.Faces[Index].Loops)
+            for (const BlueprintUse& Use : Loop)
+                if (static_cast<size_t>(Use.Edge) < OriginalEdgeCount && EdgeChanged[Use.Edge]) Touched = true;
         if (!Touched) continue;
-        const std::string Name = LabelToken("F", Token);
-        const auto* Plane = std::get_if<PlaneSurface>(&Face.Surface);
-        const auto* Nurbs = std::get_if<NurbsSurface>(&Face.Surface);
-        if (!Plane && !Nurbs)
-            return "Reshape: face " + Name + " is a " + SurfaceCategoryLabel(Face.Surface) + " — a moved vertex can only reshape flat or NURBS faces (move the face instead)";
+
+        const std::string Name  = LabelToken("F", Token);
+        const auto*       Plane = std::get_if<PlaneSurface>(&Blueprint.Faces[Index].Surface);
+        const auto*       Nurbs = std::get_if<NurbsSurface>(&Blueprint.Faces[Index].Surface);
+
+        // Pre-move outward orientation and local chart axes.
         Vector3 Outward{};
+        Vector3 RefOrigin{};
         Vector3 RefXAxis{ 1.0, 0.0, 0.0 }, RefYAxis{ 0.0, 1.0, 0.0 };
         if (Plane)
         {
-            Outward  = Plane->Frame.ZAxis * SignOfSense(Face.Sense);
-            RefXAxis = Plane->Frame.XAxis;
-            RefYAxis = Plane->Frame.YAxis;
+            Outward   = Plane->Frame.ZAxis * SignOfSense(Blueprint.Faces[Index].Sense);
+            RefOrigin = Plane->Frame.Origin;
+            RefXAxis  = Plane->Frame.XAxis;
+            RefYAxis  = Cross(Outward, RefXAxis);
         }
         else
         {
-            Vector3 PreNewell{};
-            for (const std::vector<BlueprintUse>& Loop : Face.Loops)
+            Vector3 PreNewell{}, PreSum{};
+            int     PreCount = 0;
+            for (const std::vector<BlueprintUse>& Loop : Blueprint.Faces[Index].Loops)
             {
                 std::vector<Vector3> PreRing;
                 for (const BlueprintUse& Use : Loop)
                 {
                     const BlueprintEdge& Edge = Blueprint.Edges[Use.Edge];
                     PreRing.push_back(OriginalPositions[Use.Sense == Orientation::Forward ? Edge.Start : Edge.End]);
+                    PreSum = PreSum + PreRing.back();
+                    ++PreCount;
                 }
                 for (size_t Corner = 0; Corner < PreRing.size(); ++Corner)
                     PreNewell = PreNewell + Cross(PreRing[Corner], PreRing[(Corner + 1) % PreRing.size()]);
             }
-            const NurbsDomain DomU = MeasureNurbsSurfaceDomain(*Nurbs->Definition, true);
-            const NurbsDomain DomV = MeasureNurbsSurfaceDomain(*Nurbs->Definition, false);
-            const Vector2     Mid{ 0.5 * (DomU.Low + DomU.High), 0.5 * (DomV.Low + DomV.High) };
-            Outward = Length(PreNewell) > 1.0e-12 * Description.Scale * Description.Scale
-                    ? Normalize(PreNewell)
-                    : EvaluateNurbsNormal(*Nurbs, Mid) * SignOfSense(Face.Sense);
-            const SurfaceSample Sample = EvaluateNurbsSurface(*Nurbs, Mid);
-            RefXAxis = Length(Sample.DerivativeU) > 1.0e-9 ? Normalize(Sample.DerivativeU)
-                                                           : (std::fabs(Outward.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 });
-            RefYAxis = Normalize(Cross(Outward, RefXAxis));
+            if (PreCount > 0) RefOrigin = PreSum * (1.0 / PreCount);
+            if (Length(PreNewell) > 1.0e-12 * Description.Scale * Description.Scale)
+            {
+                Outward = Normalize(PreNewell);
+            }
+            else if (Nurbs && Nurbs->Definition)
+            {
+                const NurbsDomain DomU = MeasureNurbsSurfaceDomain(*Nurbs->Definition, true);
+                const NurbsDomain DomV = MeasureNurbsSurfaceDomain(*Nurbs->Definition, false);
+                Outward = EvaluateNurbsNormal(*Nurbs, { 0.5 * (DomU.Low + DomU.High), 0.5 * (DomV.Low + DomV.High) }) * SignOfSense(Blueprint.Faces[Index].Sense);
+            }
+            else
+            {
+                Vector2 MidUV{};
+                if (!Blueprint.Faces[Index].Loops.empty() && !Blueprint.Faces[Index].Loops.front().empty())
+                {
+                    const BlueprintUse&  FirstUse  = Blueprint.Faces[Index].Loops.front().front();
+                    const BlueprintEdge& FirstEdge = Blueprint.Edges[FirstUse.Edge];
+                    MidUV = EvaluateParameterCurve(FirstUse.SurfaceCurve, 0.5 * (FirstEdge.Low + FirstEdge.High)).Position;
+                }
+                Outward = EvaluateSurfaceNormal(Blueprint.Faces[Index].Surface, MidUV) * SignOfSense(Blueprint.Faces[Index].Sense);
+            }
+            const Vector3 Seed = std::fabs(Outward.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+            RefXAxis = Normalize(Seed - Outward * Dot(Seed, Outward));
+            RefYAxis = Cross(Outward, RefXAxis);
         }
-        // Corners per loop in loop order (each use starts at its Start, or End when reversed); Newell's normal sums the
-        // loops (outer CCW about the outward normal, holes CW), so it points outward with twice the net area.
+
+        // Gather post-move corner rings AND dense boundary samples (so curved edges contribute to Newell area & coplanarity).
         std::vector<std::vector<Vector3>> Corners;
+        std::vector<std::vector<Vector3>> DenseRings;
+        bool    AllEdgesStraight = true;
         Vector3 Newell{}, Sum{};
-        int     Count = 0;
-        for (const std::vector<BlueprintUse>& Loop : Face.Loops)
+        int     SampleCount = 0;
+        for (const std::vector<BlueprintUse>& Loop : Blueprint.Faces[Index].Loops)
         {
             std::vector<Vector3> Ring;
+            std::vector<Vector3> Dense;
             for (const BlueprintUse& Use : Loop)
             {
-                const BlueprintEdge& Edge = Blueprint.Edges[Use.Edge];
-                if (!std::holds_alternative<StraightLine>(Edge.Curve))
-                    return "Reshape: face " + Name + " is bounded by a " + CurveCategoryLabel(Edge.Curve) + " — only faces with straight sides can follow a moved vertex";
-                Ring.push_back(Blueprint.Vertices[Use.Sense == Orientation::Forward ? Edge.Start : Edge.End].Position);
-                Sum = Sum + Ring.back();
-                ++Count;
+                const BlueprintEdge& Edge    = Blueprint.Edges[Use.Edge];
+                const bool           Forward = Use.Sense == Orientation::Forward;
+                const Vector3        StartPt = Blueprint.Vertices[Forward ? Edge.Start : Edge.End].Position;
+                Ring.push_back(StartPt);
+                if (std::holds_alternative<StraightLine>(Edge.Curve))
+                {
+                    Dense.push_back(StartPt);
+                    Sum = Sum + StartPt;
+                    ++SampleCount;
+                }
+                else
+                {
+                    AllEdgesStraight = false;
+                    constexpr int CurveSteps = 12;
+                    const double  FromParam  = Forward ? Edge.Low : Edge.High;
+                    const double  UntilParam = Forward ? Edge.High : Edge.Low;
+                    for (int Step = 0; Step < CurveSteps; ++Step)
+                    {
+                        const double  Param = FromParam + (UntilParam - FromParam) * (static_cast<double>(Step) / CurveSteps);
+                        const Vector3 Pt    = Step == 0 ? StartPt : EvaluateCurve(Edge.Curve, Param).Position;
+                        Dense.push_back(Pt);
+                        Sum = Sum + Pt;
+                        ++SampleCount;
+                    }
+                }
             }
-            for (size_t Corner = 0; Corner < Ring.size(); ++Corner) Newell = Newell + Cross(Ring[Corner], Ring[(Corner + 1) % Ring.size()]);
+            for (size_t K = 0; K < Dense.size(); ++K)
+                Newell = Newell + Cross(Dense[K], Dense[(K + 1) % Dense.size()]);
             Corners.push_back(std::move(Ring));
+            DenseRings.push_back(std::move(Dense));
         }
-        if (Length(Newell) <= 1.0e-12 * Description.Scale * Description.Scale) return "Reshape: face " + Name + " would collapse";
+
+        if (Length(Newell) <= 1.0e-12 * Description.Scale * Description.Scale)
+            return "Reshape: face " + Name + " would collapse";
         const Vector3 Normal = Newell * (1.0 / Length(Newell));
-        if (Dot(Normal, Outward) <= 0.0) return "Reshape: face " + Name + " would turn inside out";
-        const Vector3 Centre = Sum * (1.0 / Count);
-        double Residual = 0.0;                                                               // [len] - Worst corner off the fitted plane
-        for (const std::vector<Vector3>& Ring : Corners)
-            for (const Vector3& Corner : Ring) Residual = std::max(Residual, std::fabs(Dot(Corner - Centre, Normal)));
-        Planned[Index].Origin = FaceChangeOrigin::Replaced;
+        if (Dot(Normal, Outward) <= 0.0)
+            return "Reshape: face " + Name + " would turn inside out";
+
+        const Vector3 Centre   = Sum * (1.0 / std::max(1, SampleCount));
+        double        Residual = 0.0;
+        for (const std::vector<Vector3>& Dense : DenseRings)
+            for (const Vector3& Pt : Dense)
+                Residual = std::max(Residual, std::fabs(Dot(Pt - Centre, Normal)));
+
+        // ③a Coplanar post-move face (any side count, concave or convex, straight or curved edges, with or without holes):
+        //    verify no boundary ring self-intersects in the fitted plane, then re-fit an exact PlaneSurface.
         if (Residual <= Tolerance)
         {
-            // Plane through the corners, outward normal as its 𝑧 (Forward); 𝑥 the old 𝑥 laid into the new plane.
-            Vector3 Along = RefXAxis - Normal * Dot(RefXAxis, Normal);
-            if (Length(Along) < 1.0e-6) Along = RefYAxis - Normal * Dot(RefYAxis, Normal);
-            if (Length(Along) < 1.0e-6) Along = (std::fabs(Normal.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 }) - Normal * (std::fabs(Normal.X) < 0.9 ? Normal.X : Normal.Y);
-            Along = Along * (1.0 / Length(Along));
-            PlaneSurface Fitted;
-            Fitted.Frame = { Centre, Along, Cross(Normal, Along), Normal };
-            Face.Surface = Fitted;
-            Face.Sense   = Orientation::Forward;
+            const PlaneSurface Fitted = ConstructFittedPlane(Centre, Normal, RefXAxis, RefYAxis);
+            for (const std::vector<Vector3>& Dense : DenseRings)
+            {
+                std::vector<Vector2> Poly2D;
+                Poly2D.reserve(Dense.size());
+                for (const Vector3& Pt : Dense)
+                {
+                    const Vector3 Rel = Pt - Fitted.Frame.Origin;
+                    Poly2D.push_back({ Dot(Rel, Fitted.Frame.XAxis), Dot(Rel, Fitted.Frame.YAxis) });
+                }
+                const size_t N = Poly2D.size();
+                for (size_t A = 0; A < N; ++A)
+                {
+                    const size_t A1 = (A + 1) % N;
+                    for (size_t B = A + 2; B < N; ++B)
+                    {
+                        if (A == 0 && B + 1 == N) continue;
+                        const size_t B1 = (B + 1) % N;
+                        if (ReshapeSegmentsCross2D(Poly2D[A], Poly2D[A1], Poly2D[B], Poly2D[B1]))
+                            return "Reshape: face " + Name + " boundary would cross itself";
+                    }
+                }
+            }
+            BlueprintFace& Face = Blueprint.Faces[Index];
+            Face.Surface        = Fitted;
+            Face.Sense          = Orientation::Forward;
+            for (std::vector<BlueprintUse>& Loop : Face.Loops)
+                FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+            Planned[Index].Origin = FaceChangeOrigin::Replaced;
             ++PlanarFaces;
+            continue;
         }
-        else
+
+        // ③b Bent 4-sided single-loop face: try exact bilinear NURBS patch (all straight edges) or exact ruled rational NURBS
+        //    patch (two opposite straight edges + two compatible curved rails, e.g. an extruded wheel arch cylinder).
+        if (Blueprint.Faces[Index].Loops.size() == 1 && Corners.front().size() == 4)
         {
-            if (Face.Loops.size() != 1 || Corners.front().size() != 4)
-                return "Reshape: face " + Name + " (" + std::to_string(Corners.front().size()) + " sides" + (Face.Loops.size() > 1 ? ", with holes" : "") +
-                       ") would bend off its plane — only four-sided faces can bend (move along the face, or move a whole edge)";
-            // Bilinear patch S(𝑢, 𝑣) through the corners in loop order: S(0,0) = A, S(1,0) = B, S(1,1) = C, S(0,1) = D.
-            const std::vector<Vector3>& Ring = Corners.front();
-            const Vector3 A = Ring[0], B = Ring[1], C = Ring[2], D = Ring[3];
-            // Su × Sv at each corner must keep the outward side (a folded patch would cross itself).
-            const Vector3 Normals[] = { Cross(B - A, D - A), Cross(B - A, C - B), Cross(C - D, D - A), Cross(C - D, C - B) };
-            for (const Vector3& Corner : Normals)
-                if (Dot(Corner, Normal) <= 1.0e-12 * Description.Scale * Description.Scale) return "Reshape: face " + Name + " would fold over";
-            std::optional<NurbsSurface> Patch = ConstructNurbsSurface(1, 1, 2, 2, { 0.0, 0.0, 1.0, 1.0 }, { 0.0, 0.0, 1.0, 1.0 }, { A, D, B, C }, { 1.0, 1.0, 1.0, 1.0 });
-            if (!Patch) return "Reshape: face " + Name + " could not take a bilinear patch";
-            Face.Surface = *Patch;
-            Face.Sense   = Orientation::Forward;
-            Bow          = std::max(Bow, Residual);
-            ++BentFaces;
+            if (AllEdgesStraight)
+            {
+                const std::vector<Vector3>& Ring = Corners.front();
+                const Vector3 A = Ring[0], B = Ring[1], C = Ring[2], D = Ring[3];
+                const Vector3 CornerNormals[] = { Cross(B - A, D - A), Cross(B - A, C - B), Cross(C - D, D - A), Cross(C - D, C - B) };
+                bool UnfoldedCondition = true;
+                for (const Vector3& CornerNormal : CornerNormals)
+                    if (Dot(CornerNormal, Normal) <= 1.0e-12 * Description.Scale * Description.Scale) UnfoldedCondition = false;
+                if (UnfoldedCondition)
+                {
+                    if (std::optional<NurbsSurface> Patch = ConstructNurbsSurface(1, 1, 2, 2, { 0.0, 0.0, 1.0, 1.0 }, { 0.0, 0.0, 1.0, 1.0 }, { A, D, B, C }, { 1.0, 1.0, 1.0, 1.0 }))
+                    {
+                        BlueprintFace& Face = Blueprint.Faces[Index];
+                        Face.Surface        = *Patch;
+                        Face.Sense          = Orientation::Forward;
+                        for (std::vector<BlueprintUse>& Loop : Face.Loops)
+                            FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+                        Planned[Index].Origin = FaceChangeOrigin::Replaced;
+                        Bow                   = std::max(Bow, Residual);
+                        ++BentFaces;
+                        continue;
+                    }
+                }
+                // Twisted/folded quad falls through to ③c to split cleanly along its non-folding diagonal into two planar triangles.
+            }
+            else if (std::optional<NurbsSurface> Ruled = BuildRuledQuadCarrier(Blueprint, Blueprint.Faces[Index].Loops.front()))
+            {
+                BlueprintFace&      Face = Blueprint.Faces[Index];
+                const NurbsDomain   DomU = MeasureNurbsSurfaceDomain(*Ruled->Definition, true);
+                const NurbsDomain   DomV = MeasureNurbsSurfaceDomain(*Ruled->Definition, false);
+                const Vector3       MidN = EvaluateNurbsNormal(*Ruled, { 0.5 * (DomU.Low + DomU.High), 0.5 * (DomV.Low + DomV.High) });
+                Face.Surface             = *Ruled;
+                Face.Sense               = Dot(MidN, Normal) >= 0.0 ? Orientation::Forward : Orientation::Reversed;
+                for (std::vector<BlueprintUse>& Loop : Face.Loops)
+                    FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+                Planned[Index].Origin = FaceChangeOrigin::Replaced;
+                Bow                   = std::max(Bow, Residual);
+                ++BentFaces;
+                continue;
+            }
+            else
+            {
+                std::vector<NurbsCurve> EdgeCurves;
+                EdgeCurves.reserve(4);
+                for (const BlueprintUse& Use : Blueprint.Faces[Index].Loops.front())
+                    EdgeCurves.push_back(NormalizeOrientedNurbsSpan(Blueprint.Edges[Use.Edge], Use.Sense));
+                const ClosedLoopSurfaceOutcome Coons = ConstructClosedLoopPanels(EdgeCurves, 1.0e-5 * std::max(1.0, Description.Scale));
+                if (Coons.Refusal.empty() && Coons.Panels.size() == 1)
+                {
+                    BlueprintFace& Face = Blueprint.Faces[Index];
+                    const Vector3  MidN = EvaluateNurbsNormal(Coons.Panels[0].Surface, { 0.5, 0.5 });
+                    Face.Surface        = Coons.Panels[0].Surface;
+                    Face.Sense          = Dot(MidN, Normal) >= 0.0 ? Orientation::Forward : Orientation::Reversed;
+                    for (std::vector<BlueprintUse>& Loop : Face.Loops)
+                        FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+                    Planned[Index].Origin = FaceChangeOrigin::Replaced;
+                    Bow                   = std::max(Bow, Residual);
+                    ++BentFaces;
+                    continue;
+                }
+            }
         }
-        for (std::vector<BlueprintUse>& Loop : Face.Loops) FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+
+        // ③c General single-loop polygon / N-gon bent off its plane (e.g. moving a vertex along X on the 17-sided concave
+        //    car side cap, or a quad whose bilinear patch would fold, or a 3-sided curved tent):
+        //    triangulate in the pre-move 2D chart (isolating unmoved flat regions first), then greedily merge coplanar
+        //    adjacent triangles so ONLY the chords needed around the off-plane vertex(es) remain.
+        if (Blueprint.Faces[Index].Loops.size() != 1)
+            return "Reshape: face " + Name + " has inner hole loops and bends off its plane (move in the face plane instead)";
+
+        const std::vector<BlueprintUse> OriginalLoop = Blueprint.Faces[Index].Loops.front();
+        const size_t                    LoopCount    = OriginalLoop.size();
+        if (LoopCount == 3 && !AllEdgesStraight)
+        {
+            std::vector<NurbsCurve> EdgeCurves;
+            EdgeCurves.reserve(3);
+            for (const BlueprintUse& Use : OriginalLoop)
+                EdgeCurves.push_back(NormalizeOrientedNurbsSpan(Blueprint.Edges[Use.Edge], Use.Sense));
+            const ClosedLoopSurfaceOutcome Coons = ConstructClosedLoopPanels(EdgeCurves, 1.0e-5 * std::max(1.0, Description.Scale));
+            if (Coons.Refusal.empty() && Coons.Panels.size() == 1)
+            {
+                BlueprintFace& Face = Blueprint.Faces[Index];
+                const Vector3  MidN = EvaluateNurbsNormal(Coons.Panels[0].Surface, { 0.5, 0.5 });
+                Face.Surface        = Coons.Panels[0].Surface;
+                Face.Sense          = Dot(MidN, Normal) >= 0.0 ? Orientation::Forward : Orientation::Reversed;
+                for (std::vector<BlueprintUse>& Loop : Face.Loops)
+                    FitLoopSurfaceCurves(Face.Surface, Blueprint, Loop);
+                Planned[Index].Origin = FaceChangeOrigin::Replaced;
+                Bow                   = std::max(Bow, Residual);
+                ++BentFaces;
+                continue;
+            }
+        }
+
+        std::vector<int>     LoopVertices(LoopCount);
+        std::vector<Vector2> Pre2D(LoopCount);
+        std::vector<char>    OffPlane(LoopCount, 0);
+        std::vector<Vector2> PreDense2D;
+        std::vector<size_t>  DenseStartIdx(LoopCount);
+        auto ProjectPre2D = [&](Vector3 WorldPt) -> Vector2
+        {
+            const Vector3 Rel = WorldPt - RefOrigin;
+            return { Dot(Rel, RefXAxis), Dot(Rel, RefYAxis) };
+        };
+        for (size_t K = 0; K < LoopCount; ++K)
+        {
+            const BlueprintUse&  Use     = OriginalLoop[K];
+            const BlueprintEdge& Edge    = Blueprint.Edges[Use.Edge];
+            const bool           Forward = Use.Sense == Orientation::Forward;
+            const int            VIdx    = Forward ? Edge.Start : Edge.End;
+            LoopVertices[K]              = VIdx;
+            Pre2D[K]                     = ProjectPre2D(OriginalPositions[VIdx]);
+            OffPlane[K]                  = std::fabs(Dot(Blueprint.Vertices[VIdx].Position - RefOrigin, Outward)) > Tolerance ? 1 : 0;
+            DenseStartIdx[K]             = PreDense2D.size();
+            if (std::holds_alternative<StraightLine>(Edge.Curve) || (static_cast<size_t>(Use.Edge) < OriginalEdgeCount && EdgeChanged[Use.Edge]))
+            {
+                PreDense2D.push_back(Pre2D[K]);
+            }
+            else
+            {
+                constexpr int ArcSteps   = 12;
+                const double  FromParam  = Forward ? Edge.Low : Edge.High;
+                const double  UntilParam = Forward ? Edge.High : Edge.Low;
+                for (int Step = 0; Step < ArcSteps; ++Step)
+                {
+                    const double  Param = FromParam + (UntilParam - FromParam) * (static_cast<double>(Step) / ArcSteps);
+                    const Vector3 Pt    = Step == 0 ? OriginalPositions[VIdx] : EvaluateCurve(Edge.Curve, Param).Position;
+                    PreDense2D.push_back(ProjectPre2D(Pt));
+                }
+            }
+        }
+
+        double SignedArea2D = 0.0;
+        for (size_t K = 0; K < PreDense2D.size(); ++K)
+            SignedArea2D += ReshapeCross2D(PreDense2D[K], PreDense2D[(K + 1) % PreDense2D.size()]);
+        if (SignedArea2D < 0.0)
+        {
+            for (Vector2& Pt : Pre2D)      Pt.Y = -Pt.Y;
+            for (Vector2& Pt : PreDense2D) Pt.Y = -Pt.Y;
+            RefYAxis = RefYAxis * -1.0;
+        }
+
+        auto ValidInternalChord2D = [&](size_t U, size_t V) -> bool
+        {
+            if (U == V || (U + 1) % LoopCount == V || (V + 1) % LoopCount == U) return false;
+            const Vector2 A = Pre2D[U];
+            const Vector2 B = Pre2D[V];
+            if (std::hypot(B.X - A.X, B.Y - A.Y) <= 1.0e-8 * Description.Scale) return false;
+            const size_t DenseN = PreDense2D.size();
+            const size_t DU     = DenseStartIdx[U];
+            const size_t DV     = DenseStartIdx[V];
+            for (size_t S = 0; S < DenseN; ++S)
+            {
+                const size_t SNext = (S + 1) % DenseN;
+                if (S == DU || SNext == DU || S == DV || SNext == DV) continue;
+                if (ReshapeSegmentsCross2D(A, B, PreDense2D[S], PreDense2D[SNext])) return false;
+                if (ReshapeSegmentPointDistance2D((A + B) * 0.5, PreDense2D[S], PreDense2D[SNext]) <= 1.0e-9 * Description.Scale) return false;
+            }
+            return ReshapePointInPolygon2D((A + B) * 0.5, PreDense2D);
+        };
+
+        struct SubSide
+        {
+            int  StartLoop      = 0;                                                         // [-] - Index in [0 .. LoopCount-1]
+            int  EndLoop        = 0;                                                         // [-] - Index in [0 .. LoopCount-1]
+            int  OriginalUseIdx = -1;                                                        // [-] - >= 0 for original boundary use, -1 for internal chord
+            int  ChordId        = -1;                                                        // [-] - Shared chord identifier when OriginalUseIdx < 0
+            bool ChordForward   = true;                                                      // [-] - True on (ChordStart -> ChordEnd)
+        };
+        struct PendingChord
+        {
+            int StartVert = 0;                                                               // [-] - Blueprint vertex index
+            int EndVert   = 0;                                                               // [-] - Blueprint vertex index
+        };
+
+        std::vector<PendingChord>       Chords;
+        std::map<std::pair<int, int>, std::pair<int, bool>> ChordLookup;
+        auto AcquireChord = [&](int LoopU, int LoopV) -> std::pair<int, bool>
+        {
+            const int VA = LoopVertices[LoopU];
+            const int VB = LoopVertices[LoopV];
+            const std::pair<int, int> Key = VA < VB ? std::make_pair(VA, VB) : std::make_pair(VB, VA);
+            const bool Forward = (VA == Key.first);
+            auto Found = ChordLookup.find(Key);
+            if (Found != ChordLookup.end()) return { Found->second.first, Forward };
+            const int Id = static_cast<int>(Chords.size());
+            Chords.push_back({ Key.first, Key.second });
+            ChordLookup[Key] = { Id, true };
+            return { Id, Forward };
+        };
+
+        auto BuildSubSide = [&](int LoopU, int LoopV) -> SubSide
+        {
+            if ((static_cast<size_t>(LoopU) + 1) % LoopCount == static_cast<size_t>(LoopV))
+                return SubSide{ LoopU, LoopV, LoopU, -1, true };
+            const auto [Id, Forward] = AcquireChord(LoopU, LoopV);
+            return SubSide{ LoopU, LoopV, -1, Id, Forward };
+        };
+
+        std::vector<std::vector<SubSide>> SubPolys;
+        std::vector<int>                  Active(LoopCount);
+        for (size_t K = 0; K < LoopCount; ++K) Active[K] = static_cast<int>(K);
+
+        bool TriangulatedCondition = true;
+        while (Active.size() > 3)
+        {
+            const size_t Rem     = Active.size();
+            int          BestPos = -1;
+            int          BestTier = 99;
+            double       BestScore = -1.0e300;
+            for (size_t Pos = 0; Pos < Rem; ++Pos)
+            {
+                const int IPrev = Active[(Pos + Rem - 1) % Rem];
+                const int ICurr = Active[Pos];
+                const int INext = Active[(Pos + 1) % Rem];
+                const Vector2 A2 = Pre2D[IPrev], B2 = Pre2D[ICurr], C2 = Pre2D[INext];
+                const double CrossVal = ReshapeCross2D(B2 - A2, C2 - B2);
+                if (CrossVal <= 1.0e-11 * Description.Scale * Description.Scale) continue;
+
+                bool ContainsOther = false;
+                for (size_t Other = 0; Other < Rem; ++Other)
+                {
+                    if (Other == Pos || Other == (Pos + Rem - 1) % Rem || Other == (Pos + 1) % Rem) continue;
+                    const int IOther = Active[Other];
+                    if (ReshapePointInTriangle2D(Pre2D[IOther], A2, B2, C2)) { ContainsOther = true; break; }
+                }
+                if (ContainsOther || !ValidInternalChord2D(static_cast<size_t>(IPrev), static_cast<size_t>(INext)))
+                    continue;
+
+                // Post-move 3D triangle must remain non-degenerate and avoid turning inside out relative to Outward.
+                const Vector3 P0 = Blueprint.Vertices[LoopVertices[IPrev]].Position;
+                const Vector3 P1 = Blueprint.Vertices[LoopVertices[ICurr]].Position;
+                const Vector3 P2 = Blueprint.Vertices[LoopVertices[INext]].Position;
+                const Vector3 TriCross = Cross(P1 - P0, P2 - P0);
+                if (Length(TriCross) <= 1.0e-11 * Description.Scale * Description.Scale) continue;
+                if (Dot(Normalize(TriCross), Outward) <= 1.0e-4) continue;
+
+                // Prefer clipping flat unmoved ears first (especially around unmoved curved edges like wheel arches)
+                // so curved boundary spans stay inside the flat region and never end up on a tilted triangle.
+                const bool HasCurvedSpan = ((static_cast<size_t>(IPrev) + 1) % LoopCount == static_cast<size_t>(ICurr) &&
+                                            !std::holds_alternative<StraightLine>(Blueprint.Edges[OriginalLoop[IPrev].Edge].Curve)) ||
+                                           ((static_cast<size_t>(ICurr) + 1) % LoopCount == static_cast<size_t>(INext) &&
+                                            !std::holds_alternative<StraightLine>(Blueprint.Edges[OriginalLoop[ICurr].Edge].Curve));
+                const bool TouchesOffPlane = OffPlane[IPrev] || OffPlane[ICurr] || OffPlane[INext];
+                if (HasCurvedSpan && TouchesOffPlane) continue;
+
+                const int    Tier  = (!TouchesOffPlane && HasCurvedSpan) ? 0 : (!TouchesOffPlane ? 1 : 2);
+                const double LPrev = std::max(1.0e-12, std::hypot(A2.X - B2.X, A2.Y - B2.Y));
+                const double LNext = std::max(1.0e-12, std::hypot(C2.X - B2.X, C2.Y - B2.Y));
+                const double CosEar = ((A2.X - B2.X) * (C2.X - B2.X) + (A2.Y - B2.Y) * (C2.Y - B2.Y)) / (LPrev * LNext);
+                if (Tier < BestTier || (Tier == BestTier && CosEar > BestScore))
+                {
+                    BestTier  = Tier;
+                    BestScore = CosEar;
+                    BestPos   = static_cast<int>(Pos);
+                }
+            }
+            if (BestPos < 0) { TriangulatedCondition = false; break; }
+            const int IPrev = Active[(BestPos + Rem - 1) % Rem];
+            const int ICurr = Active[BestPos];
+            const int INext = Active[(BestPos + 1) % Rem];
+            SubPolys.push_back({ BuildSubSide(IPrev, ICurr), BuildSubSide(ICurr, INext), BuildSubSide(INext, IPrev) });
+            Active.erase(Active.begin() + BestPos);
+        }
+        if (!TriangulatedCondition || Active.size() != 3)
+            return "Reshape: face " + Name + " cannot split into valid planar facets without folding";
+        SubPolys.push_back({ BuildSubSide(Active[0], Active[1]), BuildSubSide(Active[1], Active[2]), BuildSubSide(Active[2], Active[0]) });
+
+        struct SubPlaneFit
+        {
+            bool    Valid  = false;
+            Vector3 Centre = {};
+            Vector3 Normal = {};
+            double  Area   = 0.0;
+        };
+        auto EvaluateSubPoly = [&](const std::vector<SubSide>& Poly) -> SubPlaneFit
+        {
+            std::vector<Vector3> Samples;
+            Vector3              LocalSum{};
+            for (const SubSide& Side : Poly)
+            {
+                const Vector3 StartPt = Blueprint.Vertices[LoopVertices[Side.StartLoop]].Position;
+                if (Side.OriginalUseIdx >= 0 && !std::holds_alternative<StraightLine>(Blueprint.Edges[OriginalLoop[Side.OriginalUseIdx].Edge].Curve))
+                {
+                    const BlueprintUse&  Use        = OriginalLoop[Side.OriginalUseIdx];
+                    const BlueprintEdge& Edge       = Blueprint.Edges[Use.Edge];
+                    const bool           Forward    = Use.Sense == Orientation::Forward;
+                    const double         FromParam  = Forward ? Edge.Low : Edge.High;
+                    const double         UntilParam = Forward ? Edge.High : Edge.Low;
+                    constexpr int        Steps      = 12;
+                    for (int S = 0; S < Steps; ++S)
+                    {
+                        const double  Param = FromParam + (UntilParam - FromParam) * (static_cast<double>(S) / Steps);
+                        const Vector3 Pt    = S == 0 ? StartPt : EvaluateCurve(Edge.Curve, Param).Position;
+                        Samples.push_back(Pt);
+                        LocalSum = LocalSum + Pt;
+                    }
+                }
+                else
+                {
+                    Samples.push_back(StartPt);
+                    LocalSum = LocalSum + StartPt;
+                }
+            }
+            if (Samples.size() < 3) return {};
+            Vector3 LocalNewell{};
+            for (size_t K = 0; K < Samples.size(); ++K)
+                LocalNewell = LocalNewell + Cross(Samples[K], Samples[(K + 1) % Samples.size()]);
+            const double TwiceArea = Length(LocalNewell);
+            if (TwiceArea <= 1.0e-12 * Description.Scale * Description.Scale) return {};
+            const Vector3 LocalNormal = LocalNewell * (1.0 / TwiceArea);
+            if (Dot(LocalNormal, Outward) <= 0.0) return {};
+            const Vector3 LocalCentre = LocalSum * (1.0 / static_cast<double>(Samples.size()));
+            for (const Vector3& Pt : Samples)
+                if (std::fabs(Dot(Pt - LocalCentre, LocalNormal)) > Tolerance) return {};
+            return { true, LocalCentre, LocalNormal, 0.5 * TwiceArea };
+        };
+
+        for (const std::vector<SubSide>& Poly : SubPolys)
+            if (!EvaluateSubPoly(Poly).Valid)
+                return "Reshape: face " + Name + " would fold or warp a curved edge off its plane";
+
+        // Greedily merge coplanar adjacent sub-polygons so flat unmoved regions stay a single clean face.
+        for (bool MergedAny = true; MergedAny;)
+        {
+            MergedAny = false;
+            for (size_t P = 0; P < SubPolys.size() && !MergedAny; ++P)
+            {
+                const SubPlaneFit FitP = EvaluateSubPoly(SubPolys[P]);
+                if (!FitP.Valid) continue;
+                for (size_t Q = P + 1; Q < SubPolys.size() && !MergedAny; ++Q)
+                {
+                    const SubPlaneFit FitQ = EvaluateSubPoly(SubPolys[Q]);
+                    if (!FitQ.Valid) continue;
+                    if (Dot(FitP.Normal, FitQ.Normal) < 1.0 - 1.0e-10) continue;
+                    if (std::fabs(Dot(FitQ.Centre - FitP.Centre, FitP.Normal)) > Tolerance) continue;
+
+                    int SharedCount = 0;
+                    int PosP = -1, PosQ = -1;
+                    for (size_t IP = 0; IP < SubPolys[P].size(); ++IP)
+                    {
+                        if (SubPolys[P][IP].ChordId < 0) continue;
+                        for (size_t IQ = 0; IQ < SubPolys[Q].size(); ++IQ)
+                        {
+                            if (SubPolys[P][IP].ChordId == SubPolys[Q][IQ].ChordId &&
+                                SubPolys[P][IP].ChordForward != SubPolys[Q][IQ].ChordForward)
+                            {
+                                ++SharedCount;
+                                PosP = static_cast<int>(IP);
+                                PosQ = static_cast<int>(IQ);
+                            }
+                        }
+                    }
+                    if (SharedCount != 1 || PosP < 0 || PosQ < 0) continue;
+
+                    std::vector<SubSide> Combined;
+                    Combined.reserve(SubPolys[P].size() + SubPolys[Q].size() - 2);
+                    for (int I = 0; I < PosP; ++I) Combined.push_back(SubPolys[P][I]);
+                    for (size_t I = static_cast<size_t>(PosQ) + 1; I < SubPolys[Q].size(); ++I) Combined.push_back(SubPolys[Q][I]);
+                    for (int I = 0; I < PosQ; ++I) Combined.push_back(SubPolys[Q][I]);
+                    for (size_t I = static_cast<size_t>(PosP) + 1; I < SubPolys[P].size(); ++I) Combined.push_back(SubPolys[P][I]);
+
+                    // Forbid figure-8 vertex pinches in the merged polygon cycle.
+                    std::set<int> SeenVerts;
+                    bool          SimpleCycle = true;
+                    for (const SubSide& Side : Combined)
+                        if (!SeenVerts.insert(LoopVertices[Side.StartLoop]).second) { SimpleCycle = false; break; }
+                    if (!SimpleCycle || !EvaluateSubPoly(Combined).Valid) continue;
+
+                    SubPolys[P] = std::move(Combined);
+                    SubPolys.erase(SubPolys.begin() + static_cast<std::ptrdiff_t>(Q));
+                    MergedAny = true;
+                }
+            }
+        }
+
+        // Keep the largest sub-face in Blueprint.Faces[Index] (so the primary face name stays stable) and append split facets.
+        size_t PrimaryIdx = 0;
+        double PrimaryArea = -1.0;
+        for (size_t P = 0; P < SubPolys.size(); ++P)
+        {
+            const SubPlaneFit Fit = EvaluateSubPoly(SubPolys[P]);
+            if (Fit.Area > PrimaryArea) { PrimaryArea = Fit.Area; PrimaryIdx = P; }
+        }
+        if (PrimaryIdx != 0) std::swap(SubPolys[0], SubPolys[PrimaryIdx]);
+
+        // Materialize ONLY the chords that survived coplanar merging so no orphan edges enter Blueprint.Edges.
+        std::map<int, int> MaterializedChordEdge;
+        for (const std::vector<SubSide>& Poly : SubPolys)
+        {
+            for (const SubSide& Side : Poly)
+            {
+                if (Side.ChordId < 0 || MaterializedChordEdge.count(Side.ChordId)) continue;
+                const PendingChord& Chord = Chords[Side.ChordId];
+                const Vector3       From  = Blueprint.Vertices[Chord.StartVert].Position;
+                const Vector3       Until = Blueprint.Vertices[Chord.EndVert].Position;
+                const double        Len   = Distance(From, Until);
+                if (Len <= 1.0e-6 * Description.Scale)
+                    return "Reshape: internal split chord on face " + Name + " would collapse";
+                const int NewEdgeIdx = static_cast<int>(Blueprint.Edges.size());
+                Blueprint.Edges.push_back({ StraightLine{ From, (Until - From) * (1.0 / Len) }, 0.0, Len, Chord.StartVert, Chord.EndVert });
+                MaterializedChordEdge[Side.ChordId] = NewEdgeIdx;
+                ++ChangedEdges;
+            }
+        }
+
+        for (size_t P = 0; P < SubPolys.size(); ++P)
+        {
+            const SubPlaneFit Fit = EvaluateSubPoly(SubPolys[P]);
+            BlueprintFace     BuiltFace;
+            BuiltFace.Surface = ConstructFittedPlane(Fit.Centre, Fit.Normal, RefXAxis, RefYAxis);
+            BuiltFace.Sense   = Orientation::Forward;
+            std::vector<BlueprintUse> BuiltLoop;
+            BuiltLoop.reserve(SubPolys[P].size());
+            for (const SubSide& Side : SubPolys[P])
+            {
+                if (Side.OriginalUseIdx >= 0)
+                {
+                    BuiltLoop.push_back(OriginalLoop[Side.OriginalUseIdx]);
+                }
+                else
+                {
+                    BuiltLoop.push_back({ MaterializedChordEdge.at(Side.ChordId),
+                                          Side.ChordForward ? Orientation::Forward : Orientation::Reversed,
+                                          ParameterLine{} });
+                }
+            }
+            FitLoopSurfaceCurves(BuiltFace.Surface, Blueprint, BuiltLoop);
+            BuiltFace.Loops.push_back(std::move(BuiltLoop));
+
+            if (P == 0)
+            {
+                Blueprint.Faces[Index] = std::move(BuiltFace);
+                Planned[Index].Origin  = FaceChangeOrigin::Replaced;
+                ++PlanarFaces;
+            }
+            else
+            {
+                Blueprint.Faces.push_back(std::move(BuiltFace));
+                Planned.push_back({ {}, FaceChangeOrigin::Replaced, Token, {} });
+                ++SplitFacets;
+            }
+        }
+        Bow = std::max(Bow, Residual);
     }
 
     // ④ Assemble, audit, clash check (Conclude), provenance per face.
@@ -1426,9 +2132,10 @@ std::string ReshapeBodyVertices(ModelPartition& Partition, BodyToken Body, const
         return Refusal.rfind("Reshape", 0) == 0 ? Refusal : "Reshape: " + Refusal;
     int MovedCount = 0;
     for (char Each : Moved) MovedCount += Each;
-    char Text[256];
-    std::snprintf(Text, sizeof(Text), "reshape: %d vertex(es) moved %.4g, %d edge(s) re-drawn, %d flat face(s) re-fitted, %d face(s) bent into bilinear patches (bow %.3g)",
-                  MovedCount, Travel, ChangedEdges, PlanarFaces, BentFaces, Bow);
+    char Text[320];
+    std::snprintf(Text, sizeof(Text),
+                  "reshape: %d vertex(es) moved %.4g, %d edge(s) re-drawn, %d flat face(s) re-fitted, %d face(s) bent, %d facet(s) split (bow %.3g)",
+                  MovedCount, Travel, ChangedEdges, PlanarFaces, BentFaces, SplitFacets, Bow);
     Method = Text;
     return {};
 }

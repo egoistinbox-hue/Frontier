@@ -9,8 +9,10 @@
 
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherExchange.h"
 
+#include "Engine/Codecs/SolidArcContainerCodec.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherDrawingSheet.h"
 
+#include "Engine/GeometrySpace/Parametric/Exchange/ExchangePath.h"
 #include "Engine/GeometrySpace/Parametric/Exchange/StepExchange.h"
 #include "Engine/GeometrySpace/Parametric/Exchange/StlExchange.h"
 
@@ -38,7 +40,7 @@ namespace
 [[nodiscard]] std::string FileStem(const std::string& Path)
 {
     std::string Stem = std::filesystem::path(Path).filename().string();
-    for (const char* Suffix : { ".sketcher", ".drafting.toml", ".toml", ".step", ".stp", ".stl", ".STEP", ".STP", ".STL" })
+    for (const char* Suffix : { ".solidarc", ".SOLIDARC", ".sketcher", ".drafting.toml", ".toml", ".step", ".stp", ".stl", ".STEP", ".STP", ".STL" })
     {
         const std::string Tail = Suffix;
         if (Stem.size() > Tail.size() && Stem.compare(Stem.size() - Tail.size(), Tail.size(), Tail) == 0) { Stem.resize(Stem.size() - Tail.size()); break; }
@@ -60,6 +62,7 @@ SketcherExchangeFormat SketcherExchangeFormatOf(const std::string& Path)
     if (Extension == ".stl") return SketcherExchangeFormat::Stl;
     if (Extension == ".toml") return SketcherExchangeFormat::Toml;
     if (Extension == ".blend") return SketcherExchangeFormat::Blend;
+    if (Extension == ".solidarc") return SketcherExchangeFormat::SolidArc;
     return SketcherExchangeFormat::Unknown;
 }
 
@@ -67,11 +70,12 @@ const char* SketcherExchangeFormatLabel(SketcherExchangeFormat Format) noexcept
 {
     switch (Format)
     {
-    case SketcherExchangeFormat::Step:    return "STEP";
-    case SketcherExchangeFormat::Stl:     return "STL";
-    case SketcherExchangeFormat::Toml:    return "TOML";
-    case SketcherExchangeFormat::Blend:   return "BLEND";
-    case SketcherExchangeFormat::Unknown: break;
+    case SketcherExchangeFormat::Step:     return "STEP";
+    case SketcherExchangeFormat::Stl:      return "STL";
+    case SketcherExchangeFormat::Toml:     return "TOML";
+    case SketcherExchangeFormat::Blend:    return "BLEND";
+    case SketcherExchangeFormat::SolidArc: return "SOLIDARC";
+    case SketcherExchangeFormat::Unknown:  break;
     }
     return "unknown";
 }
@@ -104,7 +108,12 @@ SketcherExportOutcome ExportSketcherBodies(const SketcherDocument& Document, con
     Outcome.Format = SketcherExchangeFormatOf(Path);
     Outcome.Bodies = Keys.empty() ? SketcherExportBodies(Document) : Keys;
     const auto Refuse = [&](const std::string& Reason) { Outcome.Refusal = "Export: " + Reason; Outcome.Milliseconds = ElapsedMilliseconds(Start); return Outcome; };
-    if (Outcome.Format != SketcherExchangeFormat::Step && Outcome.Format != SketcherExchangeFormat::Stl) return Refuse(Path + " is neither .step / .stp nor .stl");
+    if (Outcome.Format != SketcherExchangeFormat::Step &&
+        Outcome.Format != SketcherExchangeFormat::Stl &&
+        Outcome.Format != SketcherExchangeFormat::SolidArc)
+    {
+        return Refuse(Path + " is neither .step / .stp, .stl, nor .solidarc");
+    }
     if (!Document.Partition) return Refuse("the document has not been regenerated");
     if (Outcome.Bodies.empty()) return Refuse("no shown body to write");
     std::vector<GeometrySpace::Parametric::BodyToken> Tokens;
@@ -129,7 +138,7 @@ SketcherExportOutcome ExportSketcherBodies(const SketcherDocument& Document, con
         Outcome.Faces        = Export.Faces;
         Outcome.Approximated = Export.ApproximatedSurfaces + Export.ApproximatedCurves;
     }
-    else
+    else if (Outcome.Format == SketcherExchangeFormat::Stl)
     {
         GeometrySpace::Parametric::StlRequest Request;
         Request.ModelUnitMillimetres = SketcherModelUnitMillimetres;
@@ -138,6 +147,29 @@ SketcherExportOutcome ExportSketcherBodies(const SketcherDocument& Document, con
         if (!Export.Refusal.empty()) return Refuse(Export.Refusal);
         Failure           = GeometrySpace::Parametric::ExportStlFile(Export, Path);
         Outcome.Triangles = Export.Triangles;
+    }
+    else
+    {
+        GeometrySpace::Parametric::SolidArcCompileSettings CompileSettings {};
+        CompileSettings.AuditSampleCount = 512u;
+        GeometrySpace::Parametric::SolidArcFieldAuditMetrics Audit {};
+        const std::filesystem::path ResolvedTarget = GeometrySpace::Parametric::ResolveUtf8Path(Path);
+        if (!Codecs::SolidArcContainerEncoder::EncodeDocumentToFile(
+                Document,
+                ResolvedTarget,
+                CompileSettings,
+                Outcome.Bodies,
+                &Audit,
+                Failure))
+        {
+            return Refuse(Failure);
+        }
+        int TotalFaces = 0;
+        for (const GeometrySpace::Parametric::BodyToken Tok : Tokens)
+        {
+            TotalFaces += static_cast<int>(Document.Partition->CollectInventory(Tok).Faces.size());
+        }
+        Outcome.Faces = TotalFaces;
     }
     if (!Failure.empty()) return Refuse(Failure);
     Outcome.Bytes        = double(std::filesystem::file_size(Path, Error));

@@ -25,11 +25,12 @@ namespace Frontier::Workspaces::Sketcher
 
 enum class SketcherExchangeFormat : uint8_t
 {
-    Unknown = 0,                                                                             // Extension not recognised
-    Step    = 1,                                                                             // .step / .stp — ISO 10303-21, AP214
-    Stl     = 2,                                                                             // .stl — binary STL
-    Toml    = 3,                                                                             // .toml — VehicleCurves (import) / document
-    Blend   = 4,                                                                             // .blend — Blender high-poly vehicle reference
+    Unknown  = 0,                                                                            // Extension not recognised
+    Step     = 1,                                                                            // .step / .stp — ISO 10303-21, AP214
+    Stl      = 2,                                                                            // .stl — binary STL
+    Toml     = 3,                                                                            // .toml — VehicleCurves (import) / document
+    Blend    = 4,                                                                            // .blend — Blender high-poly vehicle reference
+    SolidArc = 5,                                                                            // .solidarc — Unified Authoring + .GeometrySpace + .Curve + .DistanceField
 };
 
 // 📝 One export: which bodies went out, how big the file is and what the writer reported.

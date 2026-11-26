@@ -9,6 +9,7 @@
 
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherDocumentCodec.h"
 
+#include "Engine/Codecs/SolidArcContainerCodec.h"
 #include "Engine/GeometrySpace/Parametric/Diagnostics/OperationTrace.h"
 #include "Engine/GeometrySpace/Parametric/Exchange/ExchangePath.h"
 
@@ -17,6 +18,8 @@
 
 #include <toml++/toml.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -804,9 +807,14 @@ SketcherDocumentFile DecodeSketcherDocument(const std::string& Text)
 {
     SketcherDocumentFile File;
     toml::table          Root;
+    constexpr std::string_view BoundaryMarker = "\n# === FRONTIER_BINARY_BOUNDARY ===\n";
+    const std::size_t          BoundaryPos    = Text.find(BoundaryMarker);
+    const std::string_view     TomlSlice      = (BoundaryPos != std::string::npos)
+        ? std::string_view(Text).substr(0u, BoundaryPos)
+        : std::string_view(Text);
     try
     {
-        Root = toml::parse(Text);
+        Root = toml::parse(TomlSlice);
     }
     catch (const toml::parse_error& Failure)
     {
@@ -1138,6 +1146,22 @@ bool SaveSketcherDocument(const SketcherDocument& Document, const std::string& P
     FRONTIER_TRACE_SCOPE("File", "Save · " + Path);
     // 📝 The folder is created on first save (a fresh install has no autosave folder yet); failure shows as a closed stream.
     const std::filesystem::path Target = GeometrySpace::Parametric::ResolveUtf8Path(Path);
+    std::string LowerExt = Target.extension().string();
+    std::transform(LowerExt.begin(), LowerExt.end(), LowerExt.begin(), [](unsigned char Ch) { return static_cast<char>(std::tolower(Ch)); });
+    if (LowerExt == ".solidarc")
+    {
+        GeometrySpace::Parametric::SolidArcCompileSettings CompileSettings {};
+        CompileSettings.AuditSampleCount = 0u; // Fast interactive Ctrl+S; explicit export / validation runs full WindingNumber audit
+        std::string Diagnostic {};
+        return Codecs::SolidArcContainerEncoder::EncodeDocumentToFile(
+            Document,
+            Target,
+            CompileSettings,
+            {},
+            nullptr,
+            Diagnostic);
+    }
+
     std::error_code Failure;
     if (Target.has_parent_path()) std::filesystem::create_directories(Target.parent_path(), Failure);
     std::ofstream Stream(Target, std::ios::binary);

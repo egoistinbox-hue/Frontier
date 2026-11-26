@@ -96,9 +96,96 @@ namespace
 
     struct Candidate
     {
-        double τ             = 0.0;                                                          // [-] - Curve parameter
-        bool   TouchCondition = false;                                                       // [-] - From a root of F′
+        double  τ              = 0.0;                                                        // [-] - Curve parameter
+        bool    TouchCondition = false;                                                      // [-] - From a root of F′
+        Vector2 SurfaceHint    = { NAN, NAN };                                               // [-] - Warm chart parameter
     };
+
+    void CollectScannedCandidates(const CurveGeometry& Curve, double Low, double High, int Count, double Chord,
+                                  const SurfaceGeometry& Surface, const CurveSurfaceSettings& Settings,
+                                  std::vector<CoincidentInterval>& Coincidences, std::vector<Candidate>& Candidates)
+    {
+        std::vector<double>  SignedDistances(Count + 1);
+        std::vector<Vector3> SamplePoints(Count + 1);
+        std::vector<Vector2> SurfaceHints(Count + 1, Vector2{ NAN, NAN });
+        Vector2 ScanHint = { NAN, NAN };
+        for (int Index = 0; Index <= Count; ++Index)
+        {
+            if ((Index & 7) == 0) ScanHint = { NAN, NAN };
+            const double τ        = Low + (High - Low) * Index / Count;
+            SamplePoints[Index]   = EvaluateCurve(Curve, τ).Position;
+            SignedDistances[Index] = MeasureSurfaceDistanceNear(Surface, SamplePoints[Index], ScanHint).Distance;
+            SurfaceHints[Index]   = ScanHint;
+        }
+
+        const double CoincidentThreshold = std::min(Settings.Precision, 1.0e-10 * std::max(1.0, Chord));
+        for (int Index = 0; Index <= Count; ++Index)
+        {
+            const double τ = Low + (High - Low) * Index / Count;
+            if (Index < Count && SignedDistances[Index] * SignedDistances[Index + 1] < 0.0)
+            {
+                Candidates.push_back({ τ + 0.5 * (High - Low) / Count, false, SurfaceHints[Index] });
+            }
+        }
+
+        for (int Index = 0; Index <= Count; ++Index)
+        {
+            if (std::fabs(SignedDistances[Index]) <= CoincidentThreshold)
+            {
+                int RunEnd = Index;
+                while (RunEnd < Count && std::fabs(SignedDistances[RunEnd + 1]) <= CoincidentThreshold) ++RunEnd;
+                if (RunEnd - Index >= 4)
+                {
+                    const double StartTau = Low + (High - Low) * Index / Count;
+                    const double EndTau   = Low + (High - Low) * RunEnd / Count;
+                    bool VerifiedCondition = true;
+                    Vector2 MidHint = SurfaceHints[(Index + RunEnd) / 2];
+                    for (int Check = 1; Check <= 3 && VerifiedCondition; ++Check)
+                    {
+                        const double MidTau = StartTau + (EndTau - StartTau) * (0.25 * Check);
+                        const double Gap    = std::fabs(MeasureSurfaceDistanceNear(Surface, EvaluateCurve(Curve, MidTau).Position, MidHint).Distance);
+                        VerifiedCondition   = Gap <= Settings.Precision;
+                    }
+                    if (VerifiedCondition)
+                    {
+                        if (!Coincidences.empty() && std::fabs(Coincidences.back().High - StartTau) <= 1.0e-12) Coincidences.back().High = EndTau;
+                        else Coincidences.push_back({ StartTau, EndTau });
+                        Index = RunEnd;
+                        continue;
+                    }
+                }
+            }
+
+            const double AbsHere = std::fabs(SignedDistances[Index]);
+            int PlateauEnd = Index;
+            while (PlateauEnd < Count && std::fabs(std::fabs(SignedDistances[PlateauEnd + 1]) - AbsHere) <= 1.0e-13 * std::max(1.0, AbsHere))
+            {
+                ++PlateauEnd;
+            }
+            const bool LeftDownCondition  = Index == 0 || AbsHere < std::fabs(SignedDistances[Index - 1]);
+            const bool RightUpCondition   = PlateauEnd == Count || AbsHere < std::fabs(SignedDistances[PlateauEnd + 1]);
+            if (LeftDownCondition && RightUpCondition && !(Index == 0 && PlateauEnd == Count && AbsHere > Settings.Precision))
+            {
+                const int    MidIndex = (Index + PlateauEnd) / 2;
+                const double StepPrev = MidIndex > 0 ? Length(SamplePoints[MidIndex] - SamplePoints[MidIndex - 1]) : 0.0;
+                const double StepNext = MidIndex < Count ? Length(SamplePoints[MidIndex + 1] - SamplePoints[MidIndex]) : 0.0;
+                const double MaxStep  = std::max({ StepPrev, StepNext, Chord / std::max(Count, 1) });
+                // Euclidean distance is 1-Lipschitz in arc length: |d| > 2.5·MaxStep + 16·Precision cannot reach Precision on the adjacent intervals.
+                if (AbsHere <= 2.5 * MaxStep + 16.0 * Settings.Precision)
+                {
+                    const double MidTau = Low + (High - Low) * (0.5 * static_cast<double>(Index + PlateauEnd)) / Count;
+                    Candidates.push_back({ MidTau, true, SurfaceHints[MidIndex] });
+                }
+            }
+            else if ((Index == 0 || PlateauEnd == Count) && AbsHere <= 2.5 * (Chord / std::max(Count, 1)) + 16.0 * Settings.Precision)
+            {
+                const int    EndIndex = Index == 0 ? 0 : Count;
+                const double EndTau   = Low + (High - Low) * EndIndex / Count;
+                Candidates.push_back({ EndTau, true, SurfaceHints[EndIndex] });
+            }
+            Index = PlateauEnd;
+        }
+    }
 }
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -133,20 +220,7 @@ CurveSurfaceOutcome IntersectCurveSurface(const CurveGeometry& Curve, double Low
         const int Floor = Settings.ScanSpacing > 0.0 ? 8 : 64;                               // [-] - Fewest samples
         if (Settings.ScanSpacing > 0.0) Spacing = Settings.ScanSpacing;
         const int Count = std::clamp(std::max(static_cast<int>(std::ceil(Chord / std::max(Spacing, 1.0e-300))), 16 * Knots), Floor, 16384);
-        std::vector<double> Values(Count + 1);
-        Vector2 ScanHint = { NAN, NAN };
-        for (int Index = 0; Index <= Count; ++Index)
-        {
-            if ((Index & 7) == 0) ScanHint = { NAN, NAN };
-            Values[Index] = ProbeDistanceNear(Curve, Surface, Low + (High - Low) * Index / Count, ScanHint).Distance;
-        }
-        for (int Index = 0; Index <= Count; ++Index)
-        {
-            const double τ = Low + (High - Low) * Index / Count;
-            if (Index < Count && Values[Index] * Values[Index + 1] < 0.0) Candidates.push_back({ τ + 0.5 * (High - Low) / Count, false });
-            const bool Minimum = (Index == 0 || std::fabs(Values[Index]) <= std::fabs(Values[Index - 1])) && (Index == Count || std::fabs(Values[Index]) <= std::fabs(Values[Index + 1]));
-            if (Minimum) Candidates.push_back({ τ, true });
-        }
+        CollectScannedCandidates(Curve, Low, High, Count, Chord, Surface, Settings, Outcome.Coincidences, Candidates);
     }
     if (const auto* Traced = std::get_if<IntersectionCurve>(&Curve))
     {
@@ -154,22 +228,17 @@ CurveSurfaceOutcome IntersectCurveSurface(const CurveGeometry& Curve, double Low
         //    segment (the guide turns ≤ 0.1 rad per segment, so d is near-linear between samples). Sign changes become
         //    transversal candidates and local minima of |d| touch candidates; ③ polishes both on the exact distance.
         const TracedIntersection& Trace = *Traced->Trace;
+        double Chord = 0.0;
+        Vector3 Previous = EvaluateCurve(Curve, Low).Position;
+        for (int Index = 1; Index <= 64; ++Index)
+        {
+            const Vector3 Next = EvaluateCurve(Curve, Low + (High - Low) * Index / 64).Position;
+            Chord += Length(Next - Previous);
+            Previous = Next;
+        }
         const double KnotSpan = Trace.Knots.back() - Trace.Knots.front();                    // [-] - τ per guide
         const int    Count    = std::clamp(static_cast<int>(16.0 * static_cast<double>(Trace.Knots.size()) * (High - Low) / std::max(KnotSpan, 1.0e-300)), 64, 8192);
-        std::vector<double> Values(Count + 1);
-        Vector2 ScanHint = { NAN, NAN };
-        for (int Index = 0; Index <= Count; ++Index)
-        {
-            if ((Index & 7) == 0) ScanHint = { NAN, NAN };
-            Values[Index] = ProbeDistanceNear(Curve, Surface, Low + (High - Low) * Index / Count, ScanHint).Distance;
-        }
-        for (int Index = 0; Index <= Count; ++Index)
-        {
-            const double τ = Low + (High - Low) * Index / Count;
-            if (Index < Count && Values[Index] * Values[Index + 1] < 0.0) Candidates.push_back({ τ + 0.5 * (High - Low) / Count, false });
-            const bool Minimum = (Index == 0 || std::fabs(Values[Index]) <= std::fabs(Values[Index - 1])) && (Index == Count || std::fabs(Values[Index]) <= std::fabs(Values[Index + 1]));
-            if (Minimum) Candidates.push_back({ τ, true });
-        }
+        CollectScannedCandidates(Curve, Low, High, Count, Chord, Surface, Settings, Outcome.Coincidences, Candidates);
     }
     for (const RationalSegment& Segment : ScanCondition ? std::vector<RationalSegment>{} : ConvertToRationalSegments(Curve, Low, High))
     {
@@ -220,7 +289,7 @@ CurveSurfaceOutcome IntersectCurveSurface(const CurveGeometry& Curve, double Low
     };
     for (const Candidate& Entry : Candidates)
     {
-        Vector2 Hint = { NAN, NAN };
+        Vector2 Hint = Entry.SurfaceHint;
         if (Entry.TouchCondition) Accept(PolishExtremum(Curve, Surface, Entry.τ, Low, High, Hint), true, Hint);
         else                      Accept(PolishTransversal(Curve, Surface, Entry.τ, Low, High, Hint), false, Hint);
     }

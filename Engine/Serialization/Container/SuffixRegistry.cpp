@@ -102,7 +102,7 @@ constexpr std::array<FormatSuffixDescriptor, 65u> RegisteredDescriptors = {{
 }};
 
 // 📝 Backward-compatible case-insensitive migration aliases for legacy Content/ files and older drafts
-constexpr std::array<SuffixAliasEntry, 21u> LegacyAliasDirectory = {{
+constexpr std::array<SuffixAliasEntry, 23u> LegacyAliasDirectory = {{
     { ".projectspace",          FormatSuffixCategory::ProjectIndex         },
     { ".componentspace",        FormatSuffixCategory::Component            },
     { ".renderspace",           FormatSuffixCategory::RenderSequence       },
@@ -124,6 +124,8 @@ constexpr std::array<SuffixAliasEntry, 21u> LegacyAliasDirectory = {{
     { ".pixelsheet",            FormatSuffixCategory::PixelSpace           },
     { ".logicspace",            FormatSuffixCategory::BehaviorSpace        },
     { ".directivespace",        FormatSuffixCategory::BehaviorSpace        },
+    { ".solidarc",              FormatSuffixCategory::Sketch               },
+    { ".sketcher",              FormatSuffixCategory::Sketch               },
 }};
 
 [[nodiscard]] std::string NormalizeLowercaseSuffix(std::string_view RawSuffix)

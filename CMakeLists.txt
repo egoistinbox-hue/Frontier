@@ -512,6 +512,7 @@ function(frontier_compile_modular_slang_shader DOMAIN_REL_PATH ENTRY_NAME SHADER
         "${FRONTIER_MODULAR_SHADER_DIR}/Atmosphere/*.slang"
         "${FRONTIER_MODULAR_SHADER_DIR}/Colour/*.slang"
         "${FRONTIER_MODULAR_SHADER_DIR}/Compute/*.slang"
+        "${FRONTIER_MODULAR_SHADER_DIR}/DistanceField/*.slang"
     )
     add_custom_command(
         OUTPUT "${OUT_SPV}"
@@ -524,6 +525,7 @@ function(frontier_compile_modular_slang_shader DOMAIN_REL_PATH ENTRY_NAME SHADER
             -I "${FRONTIER_MODULAR_SHADER_DIR}/Atmosphere"
             -I "${FRONTIER_MODULAR_SHADER_DIR}/Colour"
             -I "${FRONTIER_MODULAR_SHADER_DIR}/Compute"
+            -I "${FRONTIER_MODULAR_SHADER_DIR}/DistanceField"
             -I "${FRONTIER_MODULAR_SHADER_DIR}"
             -target spirv
             -profile spirv_1_3+spvGroupNonUniformArithmetic+spvInt64Atomics
@@ -570,6 +572,7 @@ frontier_compile_modular_slang_shader(Atmosphere/LensFlareBakeCompute.slang     
 frontier_compile_modular_slang_shader(Atmosphere/LensFlareCompute.slang                         ComputeEntry                    compute  LensFlareCompute.comp.spv)
 frontier_compile_modular_slang_shader(Baking/ThumbnailSpecimenCompute.slang                     ComputeEntry                    compute  ThumbnailSpecimenCompute.comp.spv)
 frontier_compile_modular_slang_shader(GeometricRaster/InspectorPreviewCompute.slang             ComputeEntry                    compute  InspectorPreviewCompute.comp.spv)
+frontier_compile_modular_slang_shader(DistanceField/EvaluateSolidArcFieldCompute.slang          EvaluateSolidArcFieldEntry      compute  EvaluateSolidArcFieldCompute.comp.spv)
 
 function(frontier_compile_sketcher_slang_shader SLANG_FILE ENTRY_NAME SHADER_UNIT OUT_SPV_NAME)
     set(IN_SLANG "${CMAKE_SOURCE_DIR}/Engine/Shaders/Sketcher/${SLANG_FILE}")
@@ -1075,6 +1078,7 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/GeometrySpace/Parametric/Drawing/DrawingExport.cpp
     Engine/GeometrySpace/Parametric/Drawing/DrawingProjection.cpp
     Engine/GeometrySpace/Parametric/Drawing/DrawingSheet.cpp
+    Engine/GeometrySpace/Parametric/Exchange/SolidArcFieldCompiler.cpp
     Engine/GeometrySpace/Parametric/Exchange/StepExchange.cpp
     Engine/GeometrySpace/Parametric/Exchange/StepReading.cpp
     Engine/GeometrySpace/Parametric/Exchange/StlExchange.cpp
@@ -1158,6 +1162,7 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/Workspaces/ParametricSketcher/Document/SketcherReferenceSurface.cpp
     Engine/Workspaces/ParametricSketcher/Document/SketcherScene.cpp
     Engine/Workspaces/ParametricSketcher/Document/SketcherSpecimen.cpp
+    Engine/DistanceFieldSpace/CompiledSurfaceField.cpp
     Engine/DistanceFieldSpace/LocalSignedDistanceVolume.cpp
     Engine/SpatialAcceleration/ClusterPyramid.cpp
     Engine/SpatialAcceleration/WideBoundingTree.cpp
@@ -1220,6 +1225,7 @@ set(FRONTIER_ENGINE_SOURCES
     Engine/Codecs/InputCodec.cpp
     Engine/Codecs/ColourCodec.cpp
     Engine/Codecs/GeometryCodec.cpp
+    Engine/Codecs/SolidArcContainerCodec.cpp
     Engine/Codecs/FontCodec.cpp
     Engine/Codecs/UVCodec.cpp
     Engine/Codecs/ImageCodec.cpp
@@ -1698,6 +1704,7 @@ if(BUILD_TESTING)
     frontier_register_exhibit(SketcherKernelValidation                  Exhibits/ParametricSketcher/SketcherKernelValidation.cpp)
     frontier_register_exhibit(SketcherDocumentValidation                Exhibits/ParametricSketcher/SketcherDocumentValidation.cpp)
     frontier_register_exhibit(SketcherViewportValidation                Exhibits/ParametricSketcher/SketcherViewportValidation.cpp)
+    frontier_register_exhibit(SolidArcUnifiedContainerValidation        Exhibits/ParametricSketcher/SolidArcUnifiedContainerValidation.cpp)
     add_executable(SerializationValidation Exhibits/SerializationValidation.cpp)
     target_include_directories(SerializationValidation PRIVATE "${CMAKE_SOURCE_DIR}/ExternalPackages/stb")
     target_compile_definitions(SerializationValidation PRIVATE "FRONTIER_REPO_ROOT_DIR=\"${CMAKE_SOURCE_DIR}\"")

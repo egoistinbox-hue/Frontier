@@ -3,7 +3,9 @@
 ============================================================================================================================================*/
 // 🧩 Validation exhibit for Phase 2 Parametric Sketcher Document, Codec, Scene, DrawingSheet & MatCap layer
 
+#include "Engine/GeometrySpace/Parametric/Geometry/NurbsCarrier.h"
 #include "Engine/GeometrySpace/Parametric/Geometry/SurfaceGeometry.h"
+#include "Engine/GeometrySpace/Parametric/Intersection/CurveSurfaceIntersection.h"
 #include "Engine/GeometrySpace/Parametric/Surfacing/CurveFitting.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherDocument.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherDocumentCodec.h"
@@ -11,8 +13,10 @@
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherImagePlane.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherMatcap.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherScene.h"
+#include "Engine/Workspaces/ParametricSketcher/Viewport/SketcherSurfaceTracing.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -399,6 +403,266 @@ int main()
             {
                 std::fprintf(stderr, "Loft refusal: %s bodies=%zu faces=%d\n",
                              LoftOut.Refusal.c_str(), ManualDoc.Summary.Bodies.size(), TotalManualFaces);
+                return 1;
+            }
+            ++Passed;
+        }
+    }
+
+    // 8. Concave box-car closed-loop auto-surface (exact trimmed PlaneSurface), sheet extrusion & coplanar Boolean/intersection safety
+    {
+        const std::vector<Vector3> UpperTracePts = {
+            { 0.0, -3.0, -0.8 }, { 0.0, -3.0,  0.1 }, { 0.0, -1.8,  0.2 },
+            { 0.0, -1.1,  1.1 }, { 0.0,  1.0,  1.1 }, { 0.0,  1.6,  0.35 },
+            { 0.0,  2.8,  0.35 }, { 0.0,  3.0,  0.2 }, { 0.0,  3.0, -0.8 }
+        };
+        const std::vector<Vector3> LowerTracePts = {
+            { 0.0,  3.0, -0.8 }, { 0.0,  2.3, -0.8 }, { 0.0,  2.1, -0.35 },
+            { 0.0,  1.4, -0.35 }, { 0.0,  1.2, -0.8 }, { 0.0, -1.2, -0.8 },
+            { 0.0, -1.4, -0.35 }, { 0.0, -2.1, -0.35 }, { 0.0, -2.3, -0.8 }, { 0.0, -3.0, -0.8 }
+        };
+
+        SketcherDocument CarDoc = CreateSketcherDocument("BoxCarProfile");
+        const auto UpperTrace = MakeSketcherControlTrace(UpperTracePts, SketcherDrawingCategory::Line, SketchSplineForm{}, false);
+        const auto LowerTrace = MakeSketcherControlTrace(LowerTracePts, SketcherDrawingCategory::Line, SketchSplineForm{}, false);
+        const auto OutA = DrawSketcherProjectedCurve(CarDoc, UpperTrace.Curve, false, true, 0.001, true);
+        const auto OutB = DrawSketcherProjectedCurve(CarDoc, LowerTrace.Curve, false, true, 0.001, true);
+        const SketcherScene CarScene = BuildSketcherScene(CarDoc);
+
+        int PositiveXCount = 0;
+        int NegativeXCount = 0;
+        for (size_t CornerIdx = 0; CornerIdx + 2 < CarScene.Corners.size(); CornerIdx += 3)
+        {
+            const auto& P0 = CarScene.Corners[CornerIdx].Position;
+            const auto& P1 = CarScene.Corners[CornerIdx + 1].Position;
+            const auto& P2 = CarScene.Corners[CornerIdx + 2].Position;
+            const double NormalX = double(P1[1] - P0[1]) * double(P2[2] - P0[2]) - double(P1[2] - P0[2]) * double(P2[1] - P0[1]);
+            if (NormalX > 1.0e-7) ++PositiveXCount;
+            else if (NormalX < -1.0e-7) ++NegativeXCount;
+        }
+        if (!VerifyCheck(OutA.AcceptedCondition && OutB.AcceptedCondition && CarDoc.Summary.SoundCondition &&
+                         CarScene.Faces.size() == 1u && CarScene.Faces[0].Surface == "Plane" &&
+                         CarScene.Edges.size() == 17u && PositiveXCount > 0 && NegativeXCount == 0 &&
+                         std::abs(CarScene.Faces[0].Area - 7.845) < 1.0e-4,
+                         "Concave 17-edge box-car closed loop builds exact 1-face Plane sheet with zero fold-overs"))
+        {
+            return 1;
+        }
+
+        // Direct positive & negative Face Extrude on the concave planar sheet face -> closed Solid car body
+        SketcherDocument ExtrudePosDoc = CloneSketcherDocument(CarDoc);
+        ExtrudePosDoc.Selection.Faces  = { CarScene.Faces[0].Name };
+        const auto FaceExPos = ChangeSketcherSelection(ExtrudePosDoc, FaceOperationCategory::Extrude, 1.8);
+        SketcherDocument ExtrudeNegDoc = CloneSketcherDocument(CarDoc);
+        ExtrudeNegDoc.Selection.Faces  = { CarScene.Faces[0].Name };
+        const auto FaceExNeg = ChangeSketcherSelection(ExtrudeNegDoc, FaceOperationCategory::Extrude, -1.8);
+        if (!VerifyCheck(FaceExPos.AcceptedCondition && FaceExNeg.AcceptedCondition &&
+                         ExtrudePosDoc.Summary.Bodies.size() == 1u && !ExtrudePosDoc.Summary.Bodies[0].SheetCondition &&
+                         ExtrudePosDoc.Summary.Bodies[0].SoundCondition && ExtrudePosDoc.Summary.Bodies[0].Faces == 19 &&
+                         std::abs(ExtrudePosDoc.Summary.Bodies[0].Volume - 7.845 * 1.8) < 1.0e-4 &&
+                         ExtrudeNegDoc.Summary.Bodies.size() == 1u && !ExtrudeNegDoc.Summary.Bodies[0].SheetCondition &&
+                         ExtrudeNegDoc.Summary.Bodies[0].SoundCondition &&
+                         std::abs(ExtrudeNegDoc.Summary.Bodies[0].Volume - 7.845 * 1.8) < 1.0e-4,
+                         "Extruding concave car Network sheet face (+1.8 and -1.8) builds watertight 19-face Solid"))
+        {
+            return 1;
+        }
+
+        // Sketch Extrude with Union while an open Network sheet body is active (regression for UI freeze)
+        SketcherDrawingRequest CarSketch {};
+        CarSketch.Kind            = SketcherDrawingCategory::Line;
+        CarSketch.GridPlane       = 2;
+        CarSketch.ClosedCondition = true;
+        CarSketch.FillCondition   = true;
+        for (size_t Index = 0; Index + 1 < UpperTracePts.size(); ++Index) CarSketch.Points.push_back({ UpperTracePts[Index].Y, UpperTracePts[Index].Z });
+        for (size_t Index = 0; Index + 1 < LowerTracePts.size(); ++Index) CarSketch.Points.push_back({ LowerTracePts[Index].Y, LowerTracePts[Index].Z });
+        if (!VerifyCheck(DrawSketcherSketch(CarDoc, CarSketch).AcceptedCondition, "Draw concave car Sketch on YZ")) return 1;
+        const std::string CarSketchLabel = CarDoc.Tree.Steps.back().Label;
+        const auto ExtrudeStart = std::chrono::steady_clock::now();
+        const auto SketchExOut  = ExtrudeSketcherSketch(CarDoc, CarSketchLabel, 1.8, FeatureCombination::Union, "", 0.0, true);
+        const double ExtrudeMs  = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ExtrudeStart).count();
+        if (!VerifyCheck(SketchExOut.AcceptedCondition && CarDoc.Summary.SoundCondition && ExtrudeMs < 250.0,
+                         "ExtrudeSketcherSketch with active Network sheet completes without freeze (< 250 ms)"))
+        {
+            return 1;
+        }
+
+        // 3D curved tumblehome concave car loop -> convex ear-clipped NURBS panels with zero fold-overs
+        std::vector<Vector3> CurvedUpper = UpperTracePts;
+        std::vector<Vector3> CurvedLower = LowerTracePts;
+        for (Vector3& Pt : CurvedUpper) Pt.X = 0.08 * (Pt.Z + 0.8) * (1.1 - Pt.Z);
+        for (Vector3& Pt : CurvedLower) Pt.X = 0.08 * (Pt.Z + 0.8) * (1.1 - Pt.Z);
+        SketcherDocument CurvedCarDoc = CreateSketcherDocument("CurvedCarLoop");
+        const auto CurvedA = MakeSketcherControlTrace(CurvedUpper, SketcherDrawingCategory::Line, SketchSplineForm{}, false);
+        const auto CurvedB = MakeSketcherControlTrace(CurvedLower, SketcherDrawingCategory::Line, SketchSplineForm{}, false);
+        (void)DrawSketcherProjectedCurve(CurvedCarDoc, CurvedA.Curve, false, true, 0.001, true);
+        const auto CurvedOutB = DrawSketcherProjectedCurve(CurvedCarDoc, CurvedB.Curve, false, true, 0.001, true);
+        const SketcherScene CurvedScene = BuildSketcherScene(CurvedCarDoc);
+        int CurvedPosX = 0, CurvedNegX = 0;
+        for (size_t CornerIdx = 0; CornerIdx + 2 < CurvedScene.Corners.size(); CornerIdx += 3)
+        {
+            const auto& P0 = CurvedScene.Corners[CornerIdx].Position;
+            const auto& P1 = CurvedScene.Corners[CornerIdx + 1].Position;
+            const auto& P2 = CurvedScene.Corners[CornerIdx + 2].Position;
+            const double NormalX = double(P1[1] - P0[1]) * double(P2[2] - P0[2]) - double(P1[2] - P0[2]) * double(P2[1] - P0[1]);
+            if (NormalX > 1.0e-7) ++CurvedPosX;
+            else if (NormalX < -1.0e-7) ++CurvedNegX;
+        }
+        if (!VerifyCheck(CurvedOutB.AcceptedCondition && CurvedPosX > 0 && CurvedNegX == 0,
+                         "3D non-planar concave car loop decomposes into convex panels with zero fold-overs"))
+        {
+            return 1;
+        }
+
+        // Coplanar StraightLine on NurbsSurface -> Coincidences recorded in < 50 ms (no cold-grid extremum storm)
+        const auto FlatNurbs = ConstructNurbsSurface(
+            1, 1, 2, 2, { 0.0, 0.0, 1.0, 1.0 }, { 0.0, 0.0, 1.0, 1.0 },
+            { { 0.0, -3.0, -1.0 }, { 0.0, -3.0, 1.0 }, { 0.0, 3.0, -1.0 }, { 0.0, 3.0, 1.0 } },
+            { 1.0, 1.0, 1.0, 1.0 });
+        const auto ScanStart = std::chrono::steady_clock::now();
+        const CurveSurfaceOutcome CoincidentOut = IntersectCurveSurface(
+            StraightLine{ { 0.0, -2.5, 0.0 }, { 0.0, 1.0, 0.0 } }, 0.0, 5.0, SurfaceGeometry{ *FlatNurbs });
+        const double ScanMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ScanStart).count();
+        if (!VerifyCheck(!CoincidentOut.Coincidences.empty() && ScanMs < 50.0,
+                         "Coplanar line on NurbsSurface detects CoincidentInterval rapidly without extremum storm"))
+        {
+            return 1;
+        }
+        ++Passed;
+
+        // 9. B-Rep vertex reshape on concave N-gon car solid & curved wheel-arch cylinder (in-plane, off-plane X, slide, chained moves, sheet)
+        {
+            auto FindVertexByPosition = [](const SketcherScene& TargetScene, Vector3 Expected) -> std::string
+            {
+                double      BestGap = 1.0e-3;
+                std::string Found   = {};
+                for (const SketcherSceneVertex& Vert : TargetScene.Vertices)
+                {
+                    const double Gap = Distance(Vector3{ Vert.Position[0], Vert.Position[1], Vert.Position[2] }, Expected);
+                    if (Gap < BestGap) { BestGap = Gap; Found = Vert.Name; }
+                }
+                return Found;
+            };
+
+            // (a) Sheet vertex move on unextruded concave car profile
+            SketcherDocument SheetMoveDoc = CloneSketcherDocument(CarDoc);
+            const SketcherScene SheetScene0 = BuildSketcherScene(SheetMoveDoc);
+            const std::string SheetHoodVert = FindVertexByPosition(SheetScene0, { 0.0, -1.8, 0.2 });
+            SheetMoveDoc.Selection = {};
+            SheetMoveDoc.Selection.Vertices = { SheetHoodVert };
+            const auto SheetMoveOut = ReshapeSketcherSelection(SheetMoveDoc, TranslationMap({ 0.0, 0.12, 0.14 }), "Move");
+            if (!VerifyCheck(!SheetHoodVert.empty() && SheetMoveOut.AcceptedCondition && SheetMoveDoc.Summary.SoundCondition,
+                             "ReshapeSketcherSelection moves vertex on concave 17-edge Sheet body cleanly"))
+            {
+                std::fprintf(stderr, "  SheetMove refusal: %s\n", SheetMoveOut.Refusal.c_str());
+                return 1;
+            }
+
+            // (b) Slide hood-windshield A-pillar corner (0, -1.8, 0.2) 40% along the hood edge on the 19-face extruded solid
+            const SketcherScene CarSolidScene = BuildSketcherScene(ExtrudePosDoc);
+            const std::string   HoodWindshieldVert = FindVertexByPosition(CarSolidScene, { 0.0, -1.8, 0.2 });
+            SketcherDocument    SlideHoodDoc       = CloneSketcherDocument(ExtrudePosDoc);
+            SlideHoodDoc.Selection                 = {};
+            SlideHoodDoc.Selection.Vertices        = { HoodWindshieldVert };
+            const Vector3 HoodDelta                = (Vector3{ 0.0, -3.0, 0.1 } - Vector3{ 0.0, -1.8, 0.2 }) * 0.4;
+            const auto    SlideHoodOut             = ReshapeSketcherSelection(SlideHoodDoc, TranslationMap(HoodDelta), "Move");
+            const SketcherScene SlideHoodScene     = BuildSketcherScene(SlideHoodDoc);
+            if (!VerifyCheck(!HoodWindshieldVert.empty() && SlideHoodOut.AcceptedCondition &&
+                             SlideHoodDoc.Summary.Bodies[0].SoundCondition && SlideHoodDoc.Summary.Bodies[0].Faces == 19 &&
+                             !FindVertexByPosition(SlideHoodScene, Vector3{ 0.0, -1.8, 0.2 } + HoodDelta).empty(),
+                             "Sliding hood-windshield vertex along hood edge keeps 19-face solid sound"))
+            {
+                std::fprintf(stderr, "  SlideHood refusal: %s\n", SlideHoodOut.Refusal.c_str());
+                return 1;
+            }
+
+            // (c) In-plane YZ move (bends hood & windshield into bilinear NURBS patches while 17-sided cap stays a single Plane)
+            SketcherDocument InPlaneDoc = CloneSketcherDocument(ExtrudePosDoc);
+            InPlaneDoc.Selection          = {};
+            InPlaneDoc.Selection.Vertices = { HoodWindshieldVert };
+            const auto InPlaneOut = ReshapeSketcherSelection(InPlaneDoc, TranslationMap({ 0.0, 0.14, 0.18 }), "Move");
+            if (!VerifyCheck(InPlaneOut.AcceptedCondition && InPlaneDoc.Summary.Bodies[0].SoundCondition &&
+                             InPlaneDoc.Summary.Bodies[0].Faces == 19,
+                             "In-plane YZ vertex move on 17-sided car cap bends adjacent quads without refusal"))
+            {
+                std::fprintf(stderr, "  InPlane refusal: %s\n", InPlaneOut.Refusal.c_str());
+                return 1;
+            }
+
+            // (d) Off-plane 3D / X move on 17-sided concave car cap + chained second move via auto-rebound Selection.Vertices
+            SketcherDocument OffPlaneDoc = CloneSketcherDocument(ExtrudePosDoc);
+            OffPlaneDoc.Selection          = {};
+            OffPlaneDoc.Selection.Vertices = { HoodWindshieldVert };
+            const auto OffPlaneOut1 = ReshapeSketcherSelection(OffPlaneDoc, TranslationMap({ -0.22, 0.08, 0.10 }), "Move");
+            const bool ReboundOk    = OffPlaneOut1.AcceptedCondition && OffPlaneDoc.Selection.Vertices.size() == 1u;
+            const auto OffPlaneOut2 = ReboundOk
+                                    ? ReshapeSketcherSelection(OffPlaneDoc, TranslationMap({ 0.06, -0.04, 0.05 }), "Move")
+                                    : SketcherCommandOutcome{};
+            if (!VerifyCheck(OffPlaneOut1.AcceptedCondition && ReboundOk && OffPlaneOut2.AcceptedCondition &&
+                             OffPlaneDoc.Summary.Bodies[0].SoundCondition,
+                             "Off-plane X / 3D vertex move on 17-sided concave cap splits minimal planar facets & chains moves"))
+            {
+                std::fprintf(stderr, "  OffPlane1='%s' OffPlane2='%s'\n",
+                             OffPlaneOut1.Refusal.c_str(), OffPlaneOut2.Refusal.c_str());
+                return 1;
+            }
+
+            // (e) Concave car with CircularArc wheel well -> extruded CylinderSurface + 17-sided cap with CircularArc:
+            //     verify moving BOTH the hood-windshield vertex AND the wheel-arch corner vertex (in-plane + off-plane) succeeds!
+            SketcherDocument ArcCarDoc = CreateSketcherDocument("ArcWheelCar");
+            SketcherDrawingRequest ArcSketch {};
+            ArcSketch.Kind            = SketcherDrawingCategory::Line;
+            ArcSketch.GridPlane       = 2;
+            ArcSketch.ClosedCondition = false;
+            ArcSketch.Points          = { { -2.4, -0.5 }, { -2.4, 0.2 }, { -1.4, 0.25 }, { -0.8, 0.9 }, { 1.2, 0.9 }, { 1.8, 0.25 }, { 1.8, -0.5 }, { 0.8, -0.5 } };
+            (void)DrawSketcherSketch(ArcCarDoc, ArcSketch);
+            const std::string ArcSketchLabel = ArcCarDoc.Tree.Steps.back().Label;
+            // Close bottom with a CircularArc wheel well from (0.8, -0.5) over (0.0, -0.05) to (-0.8, -0.5), then line to (-2.4, -0.5)
+            SketcherDrawingRequest WheelArcReq {};
+            WheelArcReq.Kind      = SketcherDrawingCategory::Arc;
+            WheelArcReq.GridPlane = 2;
+            WheelArcReq.Points    = { { 0.8, -0.5 }, { -0.8, -0.5 }, { 0.0, -0.05 } };
+            (void)DrawSketcherSketch(ArcCarDoc, WheelArcReq);
+            const std::string WheelArcLabel = ArcCarDoc.Tree.Steps.back().Label;
+            SketcherDrawingRequest FloorLineReq {};
+            FloorLineReq.Kind      = SketcherDrawingCategory::Line;
+            FloorLineReq.GridPlane = 2;
+            FloorLineReq.Points    = { { -0.8, -0.5 }, { -2.4, -0.5 } };
+            (void)DrawSketcherSketch(ArcCarDoc, FloorLineReq);
+            const std::string FloorLineLabel = ArcCarDoc.Tree.Steps.back().Label;
+            const auto JoinedOut = JoinSketcherSketches(ArcCarDoc, { ArcSketchLabel, WheelArcLabel, FloorLineLabel });
+            const std::string JoinedLabel = ArcCarDoc.Tree.Steps.back().Label;
+            const auto ArcExOut = ExtrudeSketcherSketch(ArcCarDoc, JoinedLabel, 1.5, FeatureCombination::New);
+            const SketcherScene ArcCarScene = BuildSketcherScene(ArcCarDoc);
+            const std::string ArcHoodVert  = FindVertexByPosition(ArcCarScene, { 0.0, -1.4, 0.25 });
+            const std::string ArcWheelVert = FindVertexByPosition(ArcCarScene, { 0.0, -0.8, -0.5 });
+
+            // Move hood vertex in YZ and in X while cap has a CircularArc wheel well
+            SketcherDocument ArcHoodMoveDoc = CloneSketcherDocument(ArcCarDoc);
+            ArcHoodMoveDoc.Selection = {};
+            ArcHoodMoveDoc.Selection.Vertices = { ArcHoodVert };
+            const auto ArcHoodYZ = ReshapeSketcherSelection(ArcHoodMoveDoc, TranslationMap({ 0.0, 0.12, 0.15 }), "Move");
+            const auto ArcHoodX  = ArcHoodYZ.AcceptedCondition
+                                 ? ReshapeSketcherSelection(ArcHoodMoveDoc, TranslationMap({ -0.18, 0.0, 0.0 }), "Move")
+                                 : SketcherCommandOutcome{};
+
+            // Move wheel-arch endpoint vertex (incident to CircularArc + CylinderSurface!) in-plane and off-plane
+            SketcherDocument ArcWheelMoveDoc = CloneSketcherDocument(ArcCarDoc);
+            ArcWheelMoveDoc.Selection = {};
+            ArcWheelMoveDoc.Selection.Vertices = { ArcWheelVert };
+            const auto ArcWheelInPlane  = ReshapeSketcherSelection(ArcWheelMoveDoc, TranslationMap({ 0.0, -0.10, 0.0 }), "Move");
+            const auto ArcWheelOffPlane = ArcWheelInPlane.AcceptedCondition
+                                        ? ReshapeSketcherSelection(ArcWheelMoveDoc, TranslationMap({ -0.12, 0.0, 0.0 }), "Move")
+                                        : SketcherCommandOutcome{};
+
+            if (!VerifyCheck(JoinedOut.AcceptedCondition && ArcExOut.AcceptedCondition &&
+                             ArcHoodYZ.AcceptedCondition && ArcHoodX.AcceptedCondition && ArcHoodMoveDoc.Summary.SoundCondition &&
+                             ArcWheelInPlane.AcceptedCondition && ArcWheelOffPlane.AcceptedCondition && ArcWheelMoveDoc.Summary.SoundCondition,
+                             "Vertices on N-gon cap with CircularArc wheel well & CylinderSurface reshape cleanly in YZ and X"))
+            {
+                std::fprintf(stderr, "  ArcHoodYZ='%s' ArcHoodX='%s' ArcWheelIn='%s' ArcWheelOff='%s'\n",
+                             ArcHoodYZ.Refusal.c_str(), ArcHoodX.Refusal.c_str(),
+                             ArcWheelInPlane.Refusal.c_str(), ArcWheelOffPlane.Refusal.c_str());
                 return 1;
             }
             ++Passed;

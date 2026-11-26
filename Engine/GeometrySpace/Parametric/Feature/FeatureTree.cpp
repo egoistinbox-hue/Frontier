@@ -7,6 +7,7 @@
 #include "Engine/GeometrySpace/Parametric/Surfacing/SurfaceAlgebra.h"
 #include "Engine/GeometrySpace/Parametric/Surfacing/SurfaceDistanceCurve.h"
 
+#include "Engine/GeometrySpace/Parametric/Construction/BodyArrangement.h"
 #include "Engine/GeometrySpace/Parametric/Construction/BodyModifiers.h"
 #include "Engine/GeometrySpace/Parametric/Diagnostics/OperationTrace.h"
 
@@ -15,6 +16,7 @@
 #include "Engine/GeometrySpace/Parametric/Feature/ReplayDigest.h"
 #include "Engine/GeometrySpace/Parametric/Exchange/StepExchange.h"
 #include "Engine/GeometrySpace/Parametric/Geometry/NurbsCarrier.h"
+#include "Engine/GeometrySpace/Parametric/Geometry/ProjectedCurve.h"
 #include "Engine/GeometrySpace/Parametric/Local/FaceOperations.h"
 #include "Engine/GeometrySpace/Parametric/Local/ConnectivityRebuild.h"
 #include "Engine/GeometrySpace/Parametric/Sketch/SketchConstraining.h"
@@ -354,6 +356,271 @@ std::vector<std::string> ProjectSketchLinks(SketchModel& Model, const Orthonorma
     return Notes;
 }
 
+struct PlanarLoopSheet
+{
+    BodyToken              Body           = {};                                              // [-] - Trimmed PlaneSurface sheet body
+    std::vector<FaceToken> Faces          = {};                                              // [-] - Single planar face
+    NurbsSurface           PreviewSurface = {};                                              // [-] - Bounding bilinear patch
+};
+
+[[nodiscard]] NurbsCurveDefinition RemapCurveToUnitInterval(const NurbsCurveDefinition& Source)
+{
+    NurbsCurveDefinition Result = Source;
+    if (Result.Knots.size() < 2) return Result;
+    const double Low  = Result.Knots.front();
+    const double Span = Result.Knots.back() - Low;
+    if (Span > 0.0 && (Low != 0.0 || Span != 1.0))
+    {
+        for (double& Knot : Result.Knots) Knot = (Knot - Low) / Span;
+        Result.Knots.front() = 0.0;
+        Result.Knots.back()  = 1.0;
+    }
+    return Result;
+}
+
+[[nodiscard]] std::optional<PlanarLoopSheet> ConstructPlanarLoopSheet(ModelPartition& Partition, const std::vector<NurbsCurve>& OrderedLoop,
+                                                                      double CornerTolerance, bool ReverseNormals, const std::string& Label)
+{
+    if (OrderedLoop.empty()) return std::nullopt;
+
+    struct RawBoundarySpan
+    {
+        bool                 StraightCondition = true;
+        Vector3              Start             = {};
+        Vector3              End               = {};
+        NurbsCurveDefinition Spline            = {};
+    };
+
+    std::vector<RawBoundarySpan> Spans;
+    for (const NurbsCurve& Curve : OrderedLoop)
+    {
+        if (!Curve.Definition || Curve.Definition->Poles.size() < 2) return std::nullopt;
+        const NurbsCurveDefinition UnitDef = RemapCurveToUnitInterval(*Curve.Definition);
+        if (UnitDef.Degree == 1)
+        {
+            for (size_t Index = 0; Index + 1 < UnitDef.Poles.size(); ++Index)
+            {
+                if (Length(UnitDef.Poles[Index + 1] - UnitDef.Poles[Index]) > CornerTolerance * 0.05)
+                    Spans.push_back({ true, UnitDef.Poles[Index], UnitDef.Poles[Index + 1], {} });
+            }
+            continue;
+        }
+        const Vector3 Chord    = UnitDef.Poles.back() - UnitDef.Poles.front();
+        const double  ChordLen = Length(Chord);
+        bool StraightCondition = ChordLen > CornerTolerance * 0.05
+                              && std::all_of(UnitDef.Weights.begin(), UnitDef.Weights.end(), [](double Weight) { return std::fabs(Weight - 1.0) <= 1.0e-12; });
+        if (StraightCondition)
+        {
+            const Vector3 Dir = Chord * (1.0 / ChordLen);
+            for (const Vector3& Pole : UnitDef.Poles)
+            {
+                const Vector3 Rel = Pole - UnitDef.Poles.front();
+                const double  Along = Dot(Rel, Dir);
+                if (Along < -1.0e-9 * ChordLen || Along > (1.0 + 1.0e-9) * ChordLen || Length(Rel - Dir * Along) > 1.0e-8 * std::max(1.0, ChordLen))
+                {
+                    StraightCondition = false;
+                    break;
+                }
+            }
+        }
+        if (StraightCondition) Spans.push_back({ true, UnitDef.Poles.front(), UnitDef.Poles.back(), {} });
+        else Spans.push_back({ false, UnitDef.Poles.front(), UnitDef.Poles.back(), UnitDef });
+    }
+    if (Spans.size() < 2) return std::nullopt;
+
+    // Weld adjacent corners and collapse consecutive collinear straight spans (such as T-junction splits along one edge).
+    const size_t InitialCount = Spans.size();
+    for (size_t Index = 0; Index < InitialCount; ++Index)
+    {
+        const size_t Next   = (Index + 1) % InitialCount;
+        const Vector3 Joint = (Spans[Index].End + Spans[Next].Start) * 0.5;
+        if (Length(Spans[Index].End - Spans[Next].Start) > std::max(2.0 * CornerTolerance, 1.0e-3)) return std::nullopt;
+        Spans[Index].End  = Joint;
+        Spans[Next].Start = Joint;
+        if (!Spans[Index].StraightCondition) Spans[Index].Spline.Poles.back() = Joint;
+        if (!Spans[Next].StraightCondition)  Spans[Next].Spline.Poles.front() = Joint;
+    }
+
+    bool MergedCondition = true;
+    while (MergedCondition && Spans.size() > 3)
+    {
+        MergedCondition = false;
+        for (size_t Index = 0; Index < Spans.size(); ++Index)
+        {
+            const size_t Next = (Index + 1) % Spans.size();
+            if (!Spans[Index].StraightCondition || !Spans[Next].StraightCondition) continue;
+            const Vector3 FirstVec  = Spans[Index].End - Spans[Index].Start;
+            const Vector3 SecondVec = Spans[Next].End - Spans[Next].Start;
+            const double  FirstLen  = Length(FirstVec);
+            const double  SecondLen = Length(SecondVec);
+            if (FirstLen <= 1.0e-12 || SecondLen <= 1.0e-12) continue;
+            if (Dot(FirstVec * (1.0 / FirstLen), SecondVec * (1.0 / SecondLen)) <= 1.0 - 1.0e-6) continue;
+            Spans[Index].End = Spans[Next].End;
+            Spans.erase(Spans.begin() + static_cast<ptrdiff_t>(Next));
+            MergedCondition = true;
+            break;
+        }
+    }
+    if (Spans.size() < 2 || (Spans.size() == 2 && Spans[0].StraightCondition && Spans[1].StraightCondition)) return std::nullopt;
+
+    std::vector<Vector3> DenseLoop;
+    DenseLoop.reserve(Spans.size() * 8);
+    for (const RawBoundarySpan& Span : Spans)
+    {
+        if (Span.StraightCondition)
+        {
+            DenseLoop.push_back(Span.Start);
+        }
+        else
+        {
+            for (int Step = 0; Step < 8; ++Step)
+                DenseLoop.push_back(EvaluateNurbsCurve(Span.Spline, static_cast<double>(Step) / 8.0).Position);
+        }
+    }
+    Vector3 LoopCentre{};
+    for (const Vector3& Pt : DenseLoop) LoopCentre = LoopCentre + Pt;
+    LoopCentre = LoopCentre * (1.0 / static_cast<double>(DenseLoop.size()));
+
+    Vector3 AreaVector{};
+    double  MaxExtent = 0.0;
+    for (size_t Index = 0; Index < DenseLoop.size(); ++Index)
+    {
+        const Vector3 RelA = DenseLoop[Index] - LoopCentre;
+        const Vector3 RelB = DenseLoop[(Index + 1) % DenseLoop.size()] - LoopCentre;
+        AreaVector = AreaVector + Cross(RelA, RelB) * 0.5;
+        MaxExtent  = std::max(MaxExtent, Length(RelA));
+    }
+    const double AreaMagnitude = Length(AreaVector);
+    if (!(AreaMagnitude > 1.0e-10 * std::max(1.0, MaxExtent * MaxExtent))) return std::nullopt;
+    const Vector3 LoopNormal  = AreaVector * (1.0 / AreaMagnitude);
+    const double  PlanarLimit = std::max(1.0e-4 * std::max(1.0, MaxExtent), CornerTolerance);
+
+    for (const RawBoundarySpan& Span : Spans)
+    {
+        if (std::fabs(Dot(Span.Start - LoopCentre, LoopNormal)) > PlanarLimit) return std::nullopt;
+        if (!Span.StraightCondition)
+        {
+            for (const Vector3& Pole : Span.Spline.Poles)
+                if (std::fabs(Dot(Pole - LoopCentre, LoopNormal)) > PlanarLimit) return std::nullopt;
+        }
+    }
+
+    Vector3 OutwardNormal = LoopNormal;
+    if (ReverseNormals)
+    {
+        OutwardNormal = OutwardNormal * -1.0;
+        std::reverse(Spans.begin(), Spans.end());
+        for (RawBoundarySpan& Span : Spans)
+        {
+            std::swap(Span.Start, Span.End);
+            if (!Span.StraightCondition)
+            {
+                const NurbsCurve Reversed = ReverseNurbsCurve(Span.Spline);
+                if (!Reversed.Definition) return std::nullopt;
+                Span.Spline = RemapCurveToUnitInterval(*Reversed.Definition);
+            }
+        }
+    }
+
+    const Vector3 ReferenceAxis  = std::fabs(OutwardNormal.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+    const OrthonormalBasis Basis = ConstructFrame(LoopCentre, OutwardNormal, ReferenceAxis);
+    auto ProjectToPlane = [&](Vector3 Pt) -> Vector3
+    {
+        return Pt - Basis.ZAxis * Dot(Pt - Basis.Origin, Basis.ZAxis);
+    };
+
+    BodyBlueprint Blueprint;
+    Blueprint.Category = BodyCategory::Sheet;
+    for (const RawBoundarySpan& Span : Spans) Blueprint.Vertices.push_back({ ProjectToPlane(Span.Start) });
+
+    const PlaneSurface Carrier{ Basis };
+    BlueprintFace      SheetFace;
+    SheetFace.Surface = Carrier;
+    SheetFace.Sense   = Orientation::Forward;
+    std::vector<BlueprintUse> FaceLoop;
+
+    double LowU = 1.0e30, HighU = -1.0e30, LowV = 1.0e30, HighV = -1.0e30;
+    auto TrackBounds = [&](Vector3 Pt)
+    {
+        const Vector3 Rel = Pt - Basis.Origin;
+        const double  U   = Dot(Rel, Basis.XAxis);
+        const double  V   = Dot(Rel, Basis.YAxis);
+        LowU  = std::min(LowU, U);
+        HighU = std::max(HighU, U);
+        LowV  = std::min(LowV, V);
+        HighV = std::max(HighV, V);
+    };
+
+    for (size_t Index = 0; Index < Spans.size(); ++Index)
+    {
+        const int StartVertex = static_cast<int>(Index);
+        const int EndVertex   = static_cast<int>((Index + 1) % Spans.size());
+        const Vector3 StartPt = Blueprint.Vertices[StartVertex].Position;
+        const Vector3 EndPt   = Blueprint.Vertices[EndVertex].Position;
+        TrackBounds(StartPt);
+
+        BlueprintEdge EdgeRecord;
+        EdgeRecord.Start = StartVertex;
+        EdgeRecord.End   = EndVertex;
+        if (Spans[Index].StraightCondition)
+        {
+            const double SegLen = Distance(StartPt, EndPt);
+            if (!(SegLen > 1.0e-12)) return std::nullopt;
+            EdgeRecord.Curve = StraightLine{ StartPt, (EndPt - StartPt) * (1.0 / SegLen) };
+            EdgeRecord.Low   = 0.0;
+            EdgeRecord.High  = SegLen;
+        }
+        else
+        {
+            NurbsCurveDefinition ProjectedSpline = Spans[Index].Spline;
+            for (Vector3& Pole : ProjectedSpline.Poles)
+            {
+                Pole = ProjectToPlane(Pole);
+                TrackBounds(Pole);
+            }
+            ProjectedSpline.Poles.front() = StartPt;
+            ProjectedSpline.Poles.back()  = EndPt;
+            EdgeRecord.Curve = NurbsCurve{ std::make_shared<NurbsCurveDefinition>( std::move(ProjectedSpline) ) };
+            EdgeRecord.Low   = 0.0;
+            EdgeRecord.High  = 1.0;
+        }
+        const int EdgeIndex = static_cast<int>(Blueprint.Edges.size());
+        Blueprint.Edges.push_back(std::move(EdgeRecord));
+
+        BlueprintUse Use;
+        Use.Edge         = EdgeIndex;
+        Use.Sense        = Orientation::Forward;
+        Use.SurfaceCurve = FitSurfaceCurve(SurfaceGeometry{ Carrier }, Blueprint.Edges[EdgeIndex].Curve,
+                                           Blueprint.Edges[EdgeIndex].Low, Blueprint.Edges[EdgeIndex].High,
+                                           { { -1.0e6, -1.0e6 }, { 1.0e6, 1.0e6 } });
+        FaceLoop.push_back(std::move(Use));
+    }
+    SheetFace.Loops.push_back(std::move(FaceLoop));
+    Blueprint.Faces.push_back(std::move(SheetFace));
+
+    const ArrangementOutcome Built = AssembleBody(Partition, Blueprint, Label);
+    if (!Built.Refusal.empty() || Built.Faces.size() != 1) return std::nullopt;
+
+    // Verify valid non-self-intersecting planar profile and full B-Rep audit.
+    SketchProfile    Outline;
+    OrthonormalBasis ExtractedBasis;
+    bool             IslandCondition = false;
+    if (!DescribePlanarFaceProfile(Partition, Built.Body, Built.Faces.front(), Outline, ExtractedBasis, IslandCondition).empty())
+        return std::nullopt;
+    if (!AuditBody(Partition, Built.Body).SoundCondition())
+        return std::nullopt;
+
+    auto Corner3D = [&]( double U, double V ) -> Vector3 { return Basis.Origin + Basis.XAxis * U + Basis.YAxis * V; };
+    std::vector<Vector3> PatchPoles = {
+        Corner3D(LowU, LowV), Corner3D(LowU, HighV), Corner3D(HighU, LowV), Corner3D(HighU, HighV)
+    };
+    const std::optional<NurbsSurface> Preview = ConstructNurbsSurface(
+        1, 1, 2, 2, { 0.0, 0.0, 1.0, 1.0 }, { 0.0, 0.0, 1.0, 1.0 }, std::move(PatchPoles), { 1.0, 1.0, 1.0, 1.0 });
+    if (!Preview) return std::nullopt;
+
+    return PlanarLoopSheet{ Built.Body, Built.Faces, *Preview };
+}
+
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    REPLAY CHECKPOINT
 //------------------------------------------------------------------------------------------------------------------------
@@ -405,6 +672,30 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
         Current = Bodies[Target].Body;
         Naming  = Bodies[Target].Naming;
         return true;
+    };
+    // Loads a closed solid body for solid Boolean combinations; skips open sheet bodies when Key is empty.
+    auto LoadSolid = [&](const std::string& Key) -> bool
+    {
+        if (!Key.empty()) return Load(Key);
+        if (Active >= 0 && Partition.Bodies.Resolve(Bodies[Active].Body).Category == BodyCategory::Solid)
+        {
+            Target  = Active;
+            Current = Bodies[Target].Body;
+            Naming  = Bodies[Target].Naming;
+            return true;
+        }
+        for (int Index = static_cast<int>(Bodies.size()) - 1; Index >= 0; --Index)
+        {
+            if (Partition.Bodies.Resolve(Bodies[Index].Body).Category == BodyCategory::Solid)
+            {
+                Target  = Index;
+                Current = Bodies[Target].Body;
+                Naming  = Bodies[Target].Naming;
+                return true;
+            }
+        }
+        Target = -1;
+        return false;
     };
     // Writes the working copy back; the changed body becomes the active one.
     auto Store = [&]()
@@ -754,17 +1045,27 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             }
             if (!Sweep.Refusal.empty()) { Refuse(Sweep.Refusal); break; }
             const BodyNaming ToolNaming = NameSweptBody(Partition, Sweep, Step.Label);
-            // A separate sweep (Plasticity "new body"), or the first body of the part, starts a body of its own.
-            const bool SeparateCondition = Step.Combination == FeatureCombination::Separate || WallsCondition;
-            if (SeparateCondition || Bodies.empty())
+            // A separate sweep (Plasticity "new body"), or the first solid body when only open sheets exist, starts its own body.
+            const bool SeparateCondition       = Step.Combination == FeatureCombination::Separate || WallsCondition;
+            const bool SolidAvailableCondition = Step.Target.empty() ? LoadSolid({}) : Load(Step.Target);
+            if (SeparateCondition || Bodies.empty() || (!SolidAvailableCondition && Step.Target.empty()))
             {
-                if (!SeparateCondition && Step.Combination != FeatureCombination::New && Step.Combination != FeatureCombination::Union) { Refuse(std::string(Verb) + ": nothing to " + FeatureCombinationLabel(Step.Combination) + " with"); break; }
+                if (!SeparateCondition && Step.Combination != FeatureCombination::New && Step.Combination != FeatureCombination::Union)
+                {
+                    Refuse(std::string(Verb) + ": nothing solid to " + FeatureCombinationLabel(Step.Combination) + " with");
+                    break;
+                }
                 Current = Sweep.Body;
                 Naming  = ToolNaming;
                 Create();
                 break;
             }
-            if (!Load(Step.Target)) { Refuse(std::string(Verb) + ": no body named " + Step.Target); break; }
+            if (!SolidAvailableCondition) { Refuse(std::string(Verb) + ": no body named " + Step.Target); break; }
+            if (Partition.Bodies.Resolve(Current).Category == BodyCategory::Sheet)
+            {
+                Refuse(std::string(Verb) + ": target body " + Bodies[Target].Key + " is an open sheet (extrude the sheet face or sweep as a new body)");
+                break;
+            }
             const BooleanOperation Operation = Step.Combination == FeatureCombination::Difference ? BooleanOperation::Difference
                                              : Step.Combination == FeatureCombination::Intersection ? BooleanOperation::Intersection : BooleanOperation::Union;
             const BooleanOutcome Boolean = ComputeBoolean(Partition, Current, Sweep.Body, Operation);
@@ -780,7 +1081,15 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             // ③ Resolve references on the current body; any refusal refuses the step (never a partial selection).
             if (Bodies.empty()) { Refuse(std::string(Verb) + ": no body yet"); break; }
             if (!Load(Step.Target)) { Refuse(std::string(Verb) + ": no body named " + Step.Target); break; }
-            if (Partition.Bodies.Resolve(Current).Category == BodyCategory::Sheet) { Refuse(std::string(Verb) + ": the body is a sheet (🚧 blends / face operations on sheets)"); break; }
+            const bool SheetTargetCondition = Partition.Bodies.Resolve(Current).Category == BodyCategory::Sheet;
+            if (SheetTargetCondition && (Step.Kind == FeatureStepCategory::Blend ||
+                (Step.Operation != FaceOperationCategory::Extrude &&
+                 Step.Operation != FaceOperationCategory::Thicken &&
+                 Step.Operation != FaceOperationCategory::Reshape)))
+            {
+                Refuse(std::string(Verb) + ": the body is a sheet (🚧 blends / face operations on sheets)");
+                break;
+            }
             std::vector<uint32_t>      Slots;
             std::vector<ReferenceCategory> Kinds;                                                // [-] - Per slot (Reshape takes vertices and edges)
             for (ConnectivityReference& Reference : Step.References)
@@ -821,6 +1130,87 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             }
             if (Report.Status == FeatureStepStatus::Refused) break;
             const double Amount = EvaluateFeatureValue(Tree, Step.Kind == FeatureStepCategory::Blend ? Step.Size : Step.Amount);
+            if (SheetTargetCondition && Step.Operation == FaceOperationCategory::Extrude)
+            {
+                if (!(std::fabs(Amount) > 1.0e-9)) { Refuse("Extrude: distance is zero"); break; }
+                std::vector<FaceToken> SheetFaces;
+                if (Slots.empty()) SheetFaces = Partition.CollectInventory(Current).Faces;
+                else for (uint32_t Slot : Slots) SheetFaces.push_back(Partition.Faces.TokenAt(Slot));
+                if (SheetFaces.empty()) { Refuse("Extrude: no sheet faces selected"); break; }
+
+                std::vector<SketchProfile>    Outlines;
+                std::vector<OrthonormalBasis> Planes;
+                std::string                   PlanarProblem;
+                for (FaceToken SheetFace : SheetFaces)
+                {
+                    SketchProfile    Outline;
+                    OrthonormalBasis Plane;
+                    bool             IslandCondition = false;
+                    PlanarProblem = DescribePlanarFaceProfile(Partition, Current, SheetFace, Outline, Plane, IslandCondition);
+                    if (!PlanarProblem.empty()) break;
+                    Outlines.push_back(std::move(Outline));
+                    Planes.push_back(Plane);
+                }
+                if (PlanarProblem.empty())
+                {
+                    BodyToken  SolidBody{};
+                    BodyNaming SolidNaming{};
+                    std::string SweepProblem;
+                    for (size_t Index = 0; Index < Outlines.size() && SweepProblem.empty(); ++Index)
+                    {
+                        const SweepOutcome Swept = ExtrudeProfile(Partition, Outlines[Index], Planes[Index], Amount, true);
+                        if (!Swept.Refusal.empty()) { SweepProblem = Swept.Refusal; break; }
+                        BodyNaming PieceNaming = NameSweptBody(Partition, Swept, Step.Label);
+                        if (Outlines.size() == 1)
+                        {
+                            const auto SourceName = Naming.Faces.find(SheetFaces.front().Slot);
+                            if (SourceName != Naming.Faces.end())
+                            {
+                                for (size_t RoleIdx = 0; RoleIdx < Swept.Roles.size(); ++RoleIdx)
+                                {
+                                    if (Swept.Roles[RoleIdx].Role == SweepFacePlacement::EndCap)
+                                    {
+                                        PieceNaming.Faces[Swept.Faces[RoleIdx].Slot] = SourceName->second;
+                                        CompleteNaming(Partition, Swept.Body, PieceNaming);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (Index == 0)
+                        {
+                            SolidBody   = Swept.Body;
+                            SolidNaming = std::move(PieceNaming);
+                        }
+                        else
+                        {
+                            const BooleanOutcome United = ComputeBoolean(Partition, SolidBody, Swept.Body, BooleanOperation::Union);
+                            if (!United.Refusal.empty()) { SweepProblem = United.Refusal; break; }
+                            SolidNaming = NameBooleanBody(Partition, United.Body, United, SolidNaming, PieceNaming);
+                            SolidBody   = United.Body;
+                        }
+                    }
+                    if (!SweepProblem.empty()) { Refuse(SweepProblem); break; }
+                    Outcome.Audits.emplace_back(SolidBody, AuditBody(Partition, SolidBody));
+                    if (Target == PanelBody) { PanelBody = -1; ClosedBy = Step.Label; Panels.clear(); }
+                    Current = SolidBody;
+                    Naming  = std::move(SolidNaming);
+                    Store();
+                    break;
+                }
+                // Curved sheet fallback: thicken along sheet normal into a closed solid.
+                FaceOperationSettings ThickenSettings;
+                ThickenSettings.Kind     = FaceOperationCategory::Thicken;
+                ThickenSettings.Distance = std::fabs(Amount);
+                const FaceOperationOutcome Thickened = ApplyFaceOperation(Partition, Current, ThickenSettings);
+                if (!Thickened.Refusal.empty()) { Refuse("Extrude: " + Thickened.Refusal); break; }
+                Outcome.Audits.emplace_back(Thickened.Body, Thickened.Audit);
+                if (Target == PanelBody) { PanelBody = -1; ClosedBy = Step.Label; Panels.clear(); }
+                Naming  = NameChangedBody(Partition, Thickened.Body, Thickened, Naming, Step.Label);
+                Current = Thickened.Body;
+                Store();
+                break;
+            }
             if (Step.Kind == FeatureStepCategory::Blend)
             {
                 std::vector<EdgeToken> Edges;
@@ -1259,6 +1649,31 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             if (const std::string Blocked = PanelJoinRefusal("Network"); !Blocked.empty()) { Refuse(Blocked); break; }
             NetworkSettings NetSettings;
             NetSettings.MeetingGap = std::max(5.0e-4, EvaluateFeatureValue(Tree, Step.Tolerance));
+            const bool PanelWorkflowCondition = std::any_of(Tree.Steps.begin(), Tree.Steps.end(), [](const FeatureStep& Candidate)
+            {
+                return Candidate.Kind == FeatureStepCategory::Mirror || Candidate.Kind == FeatureStepCategory::Close;
+            });
+            const std::vector<ClosedCurveLoop> DetectedLoops = DetectClosedCurveLoops(Curves, NetSettings.MeetingGap);
+            if (!PanelWorkflowCondition && Panels.empty() && DetectedLoops.size() == 1 && DetectedLoops[0].Edges.size() == Curves.size())
+            {
+                std::vector<NurbsCurve> Ordered;
+                Ordered.reserve(Curves.size());
+                for (const ClosedLoopEdge& Edge : DetectedLoops[0].Edges)
+                {
+                    const NurbsCurveDefinition& Def = *Curves[Edge.CurveIndex].Definition;
+                    Ordered.push_back(Edge.ReversedCondition ? ReverseNurbsCurve(Def) : Curves[Edge.CurveIndex]);
+                }
+                if (const std::optional<PlanarLoopSheet> PlanarSheet = ConstructPlanarLoopSheet(Partition, Ordered, NetSettings.MeetingGap, Step.ReverseNormals, Step.Label))
+                {
+                    const std::string FaceName = Step.Label + ".Side(Surface)";
+                    Outcome.Audits.emplace_back(PlanarSheet->Body, AuditBody(Partition, PlanarSheet->Body));
+                    Outcome.Panels[FaceName] = PlanarSheet->PreviewSurface;
+                    Naming  = NamePanelBody(Partition, PlanarSheet->Body, PlanarSheet->Faces, { FaceName });
+                    Current = PlanarSheet->Body;
+                    Create();
+                    break;
+                }
+            }
             const NetworkSurfaceOutcome Network = ConstructNetworkSurface(Curves, NetSettings, Step.Sections);
             std::vector<SurfacePanel> NewPanels;
             std::vector<std::string>  Boundaries;
@@ -1274,15 +1689,14 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             }
             else
             {
-                const std::vector<ClosedCurveLoop> Loops = DetectClosedCurveLoops(Curves, NetSettings.MeetingGap);
-                if (Loops.size() != 1 || Loops[0].Edges.size() != Curves.size())
+                if (DetectedLoops.size() != 1 || DetectedLoops[0].Edges.size() != Curves.size())
                 {
                     Refuse(Network.Refusal);
                     break;
                 }
                 std::vector<NurbsCurve> Ordered;
                 std::vector<std::string> OrderedNames;
-                for (const ClosedLoopEdge& Edge : Loops[0].Edges)
+                for (const ClosedLoopEdge& Edge : DetectedLoops[0].Edges)
                 {
                     const NurbsCurveDefinition& Def = *Curves[Edge.CurveIndex].Definition;
                     Ordered.push_back(Edge.ReversedCondition ? ReverseNurbsCurve(Def) : Curves[Edge.CurveIndex]);

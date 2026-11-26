@@ -966,6 +966,46 @@ void OpenExtrudeSessionWithMode(SketcherWorkspaceStatus& State, SketcherExtrudeM
     }
     if (State.Document.Selection.Faces.empty())
     {
+        auto SheetKeyCondition = [&](const std::string& Key) -> bool
+        {
+            return std::any_of(State.Document.Summary.Bodies.begin(), State.Document.Summary.Bodies.end(),
+                               [&](const SketcherBodyFigures& Entry) { return Entry.Key == Key && Entry.SheetCondition; });
+        };
+        std::string CandidateSheet;
+        for (const std::string& PickedBody : State.Document.Selection.Bodies)
+        {
+            if (SheetKeyCondition(PickedBody)) { CandidateSheet = PickedBody; break; }
+        }
+        if (CandidateSheet.empty() && !State.FocusedStep.empty())
+        {
+            if (SheetKeyCondition(State.FocusedStep)) CandidateSheet = State.FocusedStep;
+            else
+            {
+                std::string SingleOwner;
+                for (const FeatureStep& Step : State.Document.Tree.Steps)
+                {
+                    if ((Step.Kind == FeatureStepCategory::Network || Step.Kind == FeatureStepCategory::Loft) &&
+                        std::find(Step.Sections.begin(), Step.Sections.end(), State.FocusedStep) != Step.Sections.end() &&
+                        SheetKeyCondition(Step.Label))
+                    {
+                        if (!SingleOwner.empty()) { SingleOwner.clear(); break; }
+                        SingleOwner = Step.Label;
+                    }
+                }
+                CandidateSheet = SingleOwner;
+            }
+        }
+        if (!CandidateSheet.empty())
+        {
+            for (const SketcherSceneFace& SceneFace : State.Scene.Faces)
+            {
+                if (SceneFace.Body < State.Scene.Bodies.size() && State.Scene.Bodies[SceneFace.Body].Key == CandidateSheet)
+                    State.Document.Selection.Faces.push_back(SceneFace.Name);
+            }
+        }
+    }
+    if (State.Document.Selection.Faces.empty())
+    {
         Announce(State, std::string(SketcherExtrudeModeLabel(Mode)) + " needs selected faces (mode 3) or a focused sketch");
         return;
     }
@@ -2905,13 +2945,15 @@ void OpenSketchExtrudeSession(SketcherWorkspaceStatus& State)
 {
     const std::string Label = State.FocusedStep;
     const double Remembered = State.Bevel.Verb == SketcherSessionVerb::Profile && State.Bevel.Size != 0.0 ? State.Bevel.Size : 0.5;
+    const bool SolidPresentCondition = std::any_of(State.Document.Summary.Bodies.begin(), State.Document.Summary.Bodies.end(),
+                                                   [](const SketcherBodyFigures& Entry) { return !Entry.SheetCondition; });
     ResetBevelSession(State);
     State.Bevel.ActiveCondition = true;
     State.Bevel.Verb            = SketcherSessionVerb::Profile;
     State.Bevel.ProfileLabel    = Label;
-    State.Bevel.ProfileSink     = MeasureSketcherProfileSink(State.Document, State.Scene, Label);
-    State.Bevel.Combination     = State.Document.Summary.PresentCondition ? FeatureCombination::Union : FeatureCombination::New;
-    State.Bevel.ProfileMaterial = State.Document.Summary.PresentCondition ? MeasureSketcherProfileMaterial(State.Document, Label, BooleanTarget(State)) : 0;
+    State.Bevel.ProfileSink     = SolidPresentCondition ? MeasureSketcherProfileSink(State.Document, State.Scene, Label) : 0.0;
+    State.Bevel.Combination     = SolidPresentCondition ? FeatureCombination::Union : FeatureCombination::New;
+    State.Bevel.ProfileMaterial = SolidPresentCondition ? MeasureSketcherProfileMaterial(State.Document, Label, BooleanTarget(State)) : 0;
     State.Bevel.AutoCombinationCondition = State.Bevel.ProfileMaterial != 0;
     State.Bevel.Size            = Remembered;
     ResolveProfileCombination(State.Bevel);
@@ -4701,6 +4743,260 @@ bool CollectTypedAmount(std::string& Typed)
     return Low.X <= High.X ? (Low + High) * 0.5 : Vector3{};
 }
 
+[[nodiscard]] Vector3 EvaluateSlideRailPoint(const SketcherSlideRail& Rail, double Factor)
+{
+    if (Rail.Samples.size() < 2) return Rail.Origin + (Rail.Target - Rail.Origin) * Factor;
+    const size_t Last = Rail.Samples.size() - 1;
+    if (Factor < 0.0)
+    {
+        const Vector3 StartTangent = (Rail.Samples[1] - Rail.Samples[0]) * double(Last);
+        return Rail.Samples.front() + StartTangent * Factor;
+    }
+    if (Factor > 1.0)
+    {
+        const Vector3 EndTangent = (Rail.Samples[Last] - Rail.Samples[Last - 1]) * double(Last);
+        return Rail.Samples.back() + EndTangent * (Factor - 1.0);
+    }
+    const double Scaled = Factor * double(Last);
+    const size_t Seg    = std::min(Last - 1, size_t(std::floor(Scaled)));
+    const double Frac   = Scaled - double(Seg);
+    return Rail.Samples[Seg] + (Rail.Samples[Seg + 1] - Rail.Samples[Seg]) * Frac;
+}
+
+[[nodiscard]] AffineMapping EvaluateEdgeSlideMap(const SketcherSlideRail& Rail, double Factor)
+{
+    const Vector3 A0    = Rail.Origin;
+    const Vector3 B0    = Rail.SecondOrigin;
+    const Vector3 A1    = Rail.Origin + (Rail.Target - Rail.Origin) * Factor;
+    const Vector3 B1    = Rail.SecondOrigin + (Rail.SecondTarget - Rail.SecondOrigin) * Factor;
+    const Vector3 Span0 = B0 - A0;
+    const double  LenSq = Dot(Span0, Span0);
+    if (LenSq <= 1.0e-18) return TranslationMap(A1 - A0);
+    const Vector3 DeltaSpan = (B1 - A1) - Span0;
+    const Vector3 UnitOverL = Span0 * (1.0 / LenSq);
+    AffineMapping Mapping;
+    Mapping.ColumnX = Vector3{ 1.0, 0.0, 0.0 } + DeltaSpan * UnitOverL.X;
+    Mapping.ColumnY = Vector3{ 0.0, 1.0, 0.0 } + DeltaSpan * UnitOverL.Y;
+    Mapping.ColumnZ = Vector3{ 0.0, 0.0, 1.0 } + DeltaSpan * UnitOverL.Z;
+    Mapping.Shift   = A1 - (Mapping.ColumnX * A0.X + Mapping.ColumnY * A0.Y + Mapping.ColumnZ * A0.Z);
+    return Mapping;
+}
+
+[[nodiscard]] std::vector<SketcherSlideRail> CollectTransformSlideRails(const SketcherWorkspaceStatus& State,
+                                                                        SketcherTransformTarget        TargetKind,
+                                                                        const std::vector<std::string>& Keys,
+                                                                        const std::string&             PointOwner,
+                                                                        const std::vector<int>&        PointIndices,
+                                                                        const Vector3&                 Pivot)
+{
+    std::vector<SketcherSlideRail> Rails;
+    const SketcherDocument& Doc = State.Document;
+
+    if (TargetKind == SketcherTransformTarget::Vertices && Doc.Partition && !Keys.empty())
+    {
+        const std::string OwnerKey = SketcherBodyOfName(Doc, SketcherSelectionCategory::Vertex, Keys.front());
+        for (const RegeneratedBody& Body : Doc.Regeneration.Bodies)
+        {
+            if (Body.Key != OwnerKey || !Body.Body.PresentCondition()) continue;
+            std::set<uint32_t> PickedSlots;
+            for (const auto& [Slot, VName] : Body.Naming.Vertices)
+                if (std::find(Keys.begin(), Keys.end(), VName) != Keys.end()) PickedSlots.insert(Slot);
+            if (PickedSlots.empty()) break;
+
+            // Anchor rails on the picked vertex closest to Pivot so multi-vertex selections also slide cleanly along shared directions.
+            uint32_t AnchorSlot = *PickedSlots.begin();
+            double   BestPivotGap = 1.0e300;
+            for (uint32_t Slot : PickedSlots)
+            {
+                const double Gap = Distance(Doc.Partition->Vertices.Resolve(Doc.Partition->Vertices.TokenAt(Slot)).Position, Pivot);
+                if (Gap < BestPivotGap) { BestPivotGap = Gap; AnchorSlot = Slot; }
+            }
+
+            const BodyInventory Inv = Doc.Partition->CollectInventory(Body.Body);
+            for (EdgeToken Edge : Inv.Edges)
+            {
+                const EdgeProfile& EProf = Doc.Partition->Edges.Resolve(Edge);
+                if (EProf.Start == EProf.End) continue;
+                const bool StartIsAnchor = (EProf.Start.Slot == AnchorSlot) && !PickedSlots.contains(EProf.End.Slot);
+                const bool EndIsAnchor   = (EProf.End.Slot == AnchorSlot)   && !PickedSlots.contains(EProf.Start.Slot);
+                if (!StartIsAnchor && !EndIsAnchor) continue;
+
+                const Vector3 V0 = Doc.Partition->Vertices.Resolve(StartIsAnchor ? EProf.Start : EProf.End).Position;
+                const Vector3 V1 = Doc.Partition->Vertices.Resolve(StartIsAnchor ? EProf.End   : EProf.Start).Position;
+                if (Distance(V0, V1) <= 1.0e-7) continue;
+
+                SketcherSlideRail Rail;
+                Rail.Origin = V0;
+                Rail.Target = V1;
+                if (const auto FoundName = Body.Naming.Edges.find(Edge.Slot); FoundName != Body.Naming.Edges.end())
+                    Rail.EdgeLabel = FoundName->second;
+                if (EProf.Curve.PresentCondition())
+                {
+                    const CurveGeometry& Curve      = Doc.Partition->Curves.Resolve(EProf.Curve);
+                    const double         FromParam  = StartIsAnchor ? EProf.IntervalLow  : EProf.IntervalHigh;
+                    const double         UntilParam = StartIsAnchor ? EProf.IntervalHigh : EProf.IntervalLow;
+                    constexpr int        Steps      = 24;
+                    Rail.Samples.reserve(Steps + 1);
+                    for (int S = 0; S <= Steps; ++S)
+                    {
+                        const double Param = FromParam + (UntilParam - FromParam) * (double(S) / double(Steps));
+                        Rail.Samples.push_back(S == 0 ? V0 : (S == Steps ? V1 : EvaluateCurve(Curve, Param).Position));
+                    }
+                }
+                else
+                {
+                    Rail.Samples = { V0, V1 };
+                }
+                Rails.push_back(std::move(Rail));
+            }
+            break;
+        }
+    }
+    else if (TargetKind == SketcherTransformTarget::Edges && Doc.Partition && Keys.size() == 1)
+    {
+        const std::string& EdgeName = Keys.front();
+        const std::string  OwnerKey = SketcherBodyOfName(Doc, SketcherSelectionCategory::Edge, EdgeName);
+        for (const RegeneratedBody& Body : Doc.Regeneration.Bodies)
+        {
+            if (Body.Key != OwnerKey || !Body.Body.PresentCondition()) continue;
+            const BodyInventory Inv = Doc.Partition->CollectInventory(Body.Body);
+            EdgeToken PickedEdge{};
+            for (EdgeToken Cand : Inv.Edges)
+            {
+                const auto It = Body.Naming.Edges.find(Cand.Slot);
+                if (It != Body.Naming.Edges.end() && It->second == EdgeName) { PickedEdge = Cand; break; }
+            }
+            if (!PickedEdge.PresentCondition()) break;
+            const EdgeProfile& EProf = Doc.Partition->Edges.Resolve(PickedEdge);
+            if (EProf.Start == EProf.End) break;
+            const Vector3 A0 = Doc.Partition->Vertices.Resolve(EProf.Start).Position;
+            const Vector3 B0 = Doc.Partition->Vertices.Resolve(EProf.End).Position;
+
+            for (FaceToken Face : Inv.Faces)
+            {
+                const FaceProfile& FProf = Doc.Partition->Faces.Resolve(Face);
+                for (LoopToken Loop : FProf.Loops)
+                {
+                    std::vector<FinToken> Fins;
+                    Doc.Partition->EnumerateLoopFins(Loop, [&](FinToken Fin) { Fins.push_back(Fin); });
+                    const size_t N = Fins.size();
+                    if (N < 3) continue;
+                    for (size_t K = 0; K < N; ++K)
+                    {
+                        const FinProfile& FinRec = Doc.Partition->Fins.Resolve(Fins[K]);
+                        if (FinRec.Edge != PickedEdge) continue;
+                        const FinToken PrevFin = Fins[(K + N - 1) % N];
+                        const FinToken NextFin = Fins[(K + 1) % N];
+                        const EdgeProfile& PrevEdge = Doc.Partition->Edges.Resolve(Doc.Partition->Fins.Resolve(PrevFin).Edge);
+                        const EdgeProfile& NextEdge = Doc.Partition->Edges.Resolve(Doc.Partition->Fins.Resolve(NextFin).Edge);
+                        if (PrevEdge.Start == PrevEdge.End || NextEdge.Start == NextEdge.End) continue;
+
+                        VertexToken NeighbourA{}, NeighbourB{};
+                        if (FinRec.Sense == Orientation::Forward)
+                        {
+                            // Loop travels Start(A) -> End(B); PrevFin arrives at A, NextFin leaves B.
+                            NeighbourA = (PrevEdge.End == EProf.Start) ? PrevEdge.Start : PrevEdge.End;
+                            NeighbourB = (NextEdge.Start == EProf.End) ? NextEdge.End   : NextEdge.Start;
+                        }
+                        else
+                        {
+                            // Loop travels End(B) -> Start(A); PrevFin arrives at B, NextFin leaves A.
+                            NeighbourB = (PrevEdge.End == EProf.End)     ? PrevEdge.Start : PrevEdge.End;
+                            NeighbourA = (NextEdge.Start == EProf.Start) ? NextEdge.End   : NextEdge.Start;
+                        }
+                        if (NeighbourA == EProf.Start || NeighbourA == EProf.End ||
+                            NeighbourB == EProf.Start || NeighbourB == EProf.End)
+                            continue;
+
+                        const Vector3 A1 = Doc.Partition->Vertices.Resolve(NeighbourA).Position;
+                        const Vector3 B1 = Doc.Partition->Vertices.Resolve(NeighbourB).Position;
+                        if (Distance(A0, A1) <= 1.0e-7 || Distance(B0, B1) <= 1.0e-7) continue;
+
+                        SketcherSlideRail Rail;
+                        Rail.EdgePair     = true;
+                        Rail.Origin       = A0;
+                        Rail.Target       = A1;
+                        Rail.SecondOrigin = B0;
+                        Rail.SecondTarget = B1;
+                        Rail.Samples      = { (A0 + B0) * 0.5, (A1 + B1) * 0.5 };
+                        if (const auto FaceIt = Body.Naming.Faces.find(Face.Slot); FaceIt != Body.Naming.Faces.end())
+                            Rail.EdgeLabel = FaceIt->second;
+                        Rails.push_back(std::move(Rail));
+                    }
+                }
+            }
+            break;
+        }
+    }
+    else if (TargetKind == SketcherTransformTarget::SketchPoints && !PointIndices.empty() && !PointOwner.empty())
+    {
+        if (const FeatureStep* Step = FindSketchStepByLabel(Doc, PointOwner))
+        {
+            const SketchModel&     Sketch = SolvedSketchOf(Doc, *Step);
+            const OrthonormalBasis Plane  = ElevatedSketchPlane(Doc, *Step);
+            const int              PtIdx  = PointIndices.front();
+            if (PtIdx >= 0 && PtIdx < int(Sketch.Points.size()))
+            {
+                const Vector3 Origin3D = PlacePlanePoint(Plane, Sketch.Points[PtIdx].Position);
+                for (const SketchCurve& Curve : Sketch.Curves)
+                {
+                    std::vector<Vector2> Samples2D = SampleSketchCurve(Sketch, Curve);
+                    if (Samples2D.size() < 2) continue;
+                    std::vector<Vector3> Samples3D;
+                    Samples3D.reserve(Samples2D.size());
+                    for (const Vector2& P2 : Samples2D) Samples3D.push_back(PlacePlanePoint(Plane, P2));
+
+                    if (Distance(Samples3D.front(), Origin3D) <= 1.0e-6 && Distance(Samples3D.back(), Origin3D) > 1.0e-6)
+                    {
+                        Rails.push_back({ Origin3D, Samples3D.back(), std::move(Samples3D), "sketch curve", false, {}, {} });
+                    }
+                    else if (Distance(Samples3D.back(), Origin3D) <= 1.0e-6 && Distance(Samples3D.front(), Origin3D) > 1.0e-6)
+                    {
+                        std::reverse(Samples3D.begin(), Samples3D.end());
+                        Rails.push_back({ Origin3D, Samples3D.back(), std::move(Samples3D), "sketch curve", false, {}, {} });
+                    }
+                    else
+                    {
+                        for (size_t K = 0; K < Curve.Points.size(); ++K)
+                        {
+                            if (Curve.Points[K] != PtIdx) continue;
+                            if (K > 0)
+                            {
+                                const Vector3 Prev3D = PlacePlanePoint(Plane, Sketch.Points[Curve.Points[K - 1]].Position);
+                                if (Distance(Origin3D, Prev3D) > 1.0e-6)
+                                    Rails.push_back({ Origin3D, Prev3D, { Origin3D, Prev3D }, "control span", false, {}, {} });
+                            }
+                            if (K + 1 < Curve.Points.size())
+                            {
+                                const Vector3 Next3D = PlacePlanePoint(Plane, Sketch.Points[Curve.Points[K + 1]].Position);
+                                if (Distance(Origin3D, Next3D) > 1.0e-6)
+                                    Rails.push_back({ Origin3D, Next3D, { Origin3D, Next3D }, "control span", false, {}, {} });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if (TargetKind == SketcherTransformTarget::CurvePoles && !PointIndices.empty() && !PointOwner.empty())
+    {
+        if (const CurveFitOutcome* Fit = FindFittedCurve(Doc, PointOwner); Fit && Fit->Curve.Definition)
+        {
+            const std::vector<Vector3>& Poles   = Fit->Curve.Definition->Poles;
+            const int                   PoleIdx = PointIndices.front();
+            if (PoleIdx >= 0 && PoleIdx < int(Poles.size()))
+            {
+                const Vector3 Origin3D = Poles[PoleIdx];
+                if (PoleIdx > 0 && Distance(Origin3D, Poles[PoleIdx - 1]) > 1.0e-7)
+                    Rails.push_back({ Origin3D, Poles[PoleIdx - 1], { Origin3D, Poles[PoleIdx - 1] }, "pole chord", false, {}, {} });
+                if (PoleIdx + 1 < int(Poles.size()) && Distance(Origin3D, Poles[PoleIdx + 1]) > 1.0e-7)
+                    Rails.push_back({ Origin3D, Poles[PoleIdx + 1], { Origin3D, Poles[PoleIdx + 1] }, "pole chord", false, {}, {} });
+            }
+        }
+    }
+    return Rails;
+}
+
 void OpenTransformSession(SketcherWorkspaceStatus& State, SketcherTransformVerb Verb, bool DuplicateCondition)
 {
     SketcherTransformTarget  TargetKind   = SketcherTransformTarget::Bodies;
@@ -4913,6 +5209,8 @@ void OpenTransformSession(SketcherWorkspaceStatus& State, SketcherTransformVerb 
     Transform.SketchCondition    = (TargetKind == SketcherTransformTarget::Sketches);
     Transform.Pivot              = Pivot;
     Transform.DisplayPivot       = Pivot;
+    if (!DuplicateCondition && Verb == SketcherTransformVerb::Move)
+        Transform.SlideRails = CollectTransformSlideRails(State, TargetKind, Keys, PointOwner, PointIndices, Pivot);
     State.Drawing.ActiveCondition       = false;
     State.Trim.ActiveCondition          = false;
     State.Fill.ActiveCondition          = false;
@@ -4920,9 +5218,12 @@ void OpenTransformSession(SketcherWorkspaceStatus& State, SketcherTransformVerb 
     State.DimensionTool.ActiveCondition = false;
     State.DimensionTool.Stage           = 0;
     const int ShownCount = !PointIndices.empty() ? int(PointIndices.size()) : int(Keys.size());
-    Announce(State, Compose("%s%s %d %s · X / Y / Z axis%s · drag or type a value · click / Enter commits%s · Esc cancels",
+    const char* SlideTag = (!Transform.SlideRails.empty() && Verb == SketcherTransformVerb::Move && !DuplicateCondition)
+                         ? " · press G again to slide along edge (GG)" : "";
+    Announce(State, Compose("%s%s %d %s · X / Y / Z axis%s%s · drag or type a value · click / Enter commits%s · Esc cancels",
                             DuplicateCondition ? "Duplicate + " : "", TransformVerbLabel(Verb), ShownCount, Noun,
                             (Verb == SketcherTransformVerb::Move || Verb == SketcherTransformVerb::Scale) ? " · Shift+X / Y / Z plane" : "",
+                            SlideTag,
                             DuplicateCondition ? " (at once: a copy in place)" : ""));
 }
 
@@ -5082,7 +5383,18 @@ void CancelTransformSession(SketcherWorkspaceStatus& State)
 void ApplyTransformSession(SketcherWorkspaceStatus& State)
 {
     SketcherTransformSession& Transform = State.Transform;
-    if (!Transform.Refusal.empty()) { Announce(State, "Refused: " + Transform.Refusal); return; }
+    if (!Transform.Refusal.empty())
+    {
+        if (Transform.LeftDragCondition)
+        {
+            Transform.ActiveCondition   = false;
+            Transform.LeftDragCondition = false;
+            Transform.RigidCondition    = false;
+            Transform.Preview.reset();
+        }
+        Announce(State, "Refused: " + Transform.Refusal);
+        return;
+    }
     if (!Transform.DuplicateCondition && IdentityMapCondition(Transform.Map))
     {
         Transform.ActiveCondition   = false;
@@ -5109,6 +5421,7 @@ void ApplyTransformSession(SketcherWorkspaceStatus& State)
 // - When unconstrained (Axis < 0): full Move / Rotate / Scale gizmo at DisplayPivot.
 // - When constrained to X / Y / Z (Axis >= 0, !PlaneCondition): hides all other handles so ONLY the chosen axis gizmo handle shows.
 // - When constrained to a plane (Shift+X / Y / Z): shows only the two in-plane handles + plane quad.
+// - When sliding along incident edges (GG, SlideCondition): hides world-axis handles so the yellow slide rail guides take centre stage.
 [[nodiscard]] GizmoPose MakeTransformSessionGizmoPose(const SketcherTransformSession& Transform, const OrbitCameraBasis& Frame, GizmoHandle& OutActiveHandle)
 {
     GizmoPose Pose{};
@@ -5120,6 +5433,11 @@ void ApplyTransformSession(SketcherWorkspaceStatus& State)
     Pose.Modes   = Transform.Verb == SketcherTransformVerb::Move ? GizmoTranslate
                  : Transform.Verb == SketcherTransformVerb::Rotate ? GizmoRotate : GizmoScale;
     OutActiveHandle = GizmoHandle::None;
+    if (Transform.SlideCondition)
+    {
+        Pose.Hidden = ~0u;
+        return Pose;
+    }
     constexpr auto Bit = [](GizmoHandle Handle) { return 1u << uint32_t(Handle); };
     if (Transform.Axis >= 0 && Transform.Axis < 3)
     {
@@ -5222,7 +5540,58 @@ void DrawTransformAxisOverlay(const SketcherWorkspaceStatus& State, ImDrawList* 
         }
     };
 
-    if (Transform.Axis >= 0 && Transform.Axis < 3)
+    if (Transform.SlideCondition && !Transform.SlideRails.empty())
+    {
+        const bool Unclamped = Transform.SlideUnclampedCondition || ImGui::GetIO().KeyAlt;
+        for (size_t RIdx = 0; RIdx < Transform.SlideRails.size(); ++RIdx)
+        {
+            const SketcherSlideRail& Rail     = Transform.SlideRails[RIdx];
+            const bool               IsActive = int(RIdx) == Transform.ActiveSlideRail;
+            auto RenderRailPolyline = [&](const std::vector<Vector3>& Pts, ImU32 LineCol, ImU32 GlowCol, float Width)
+            {
+                std::vector<ImVec2> Pix;
+                Pix.reserve(Pts.size());
+                for (const Vector3& W : Pts)
+                {
+                    ImVec2 P{};
+                    if (ProjectWorldPoint(State, Frame, W, P)) Pix.push_back(P);
+                }
+                if (Pix.size() < 2) return;
+                if (IsActive) Canvas->AddPolyline(Pix.data(), int(Pix.size()), GlowCol, ImDrawFlags_None, Width + 4.0f);
+                Canvas->AddPolyline(Pix.data(), int(Pix.size()), LineCol, ImDrawFlags_None, Width);
+                Canvas->AddCircle(Pix.back(), IsActive ? 5.0f : 3.5f, LineCol, 16, 1.5f);
+            };
+            const ImU32 CandCol = IM_COL32(0x8a, 0xc8, 0xff, 0x8a);
+            const ImU32 GoldCol = IM_COL32(0xff, 0xd4, 0x47, 0xf6);
+            const ImU32 GlowCol = IM_COL32(0xff, 0xd4, 0x47, 0x48);
+            if (Rail.EdgePair)
+            {
+                RenderRailPolyline({ Rail.Origin, Rail.Target }, IsActive ? GoldCol : CandCol, GlowCol, IsActive ? 2.5f : 1.5f);
+                RenderRailPolyline({ Rail.SecondOrigin, Rail.SecondTarget }, IsActive ? GoldCol : CandCol, GlowCol, IsActive ? 2.5f : 1.5f);
+            }
+            else
+            {
+                RenderRailPolyline(Rail.Samples, IsActive ? GoldCol : CandCol, GlowCol, IsActive ? 2.6f : 1.6f);
+                if (IsActive && Unclamped && Rail.Samples.size() >= 2)
+                {
+                    const Vector3 T0 = Normalize(Rail.Samples[1] - Rail.Samples[0]) * Span;
+                    const Vector3 T1 = Normalize(Rail.Samples.back() - Rail.Samples[Rail.Samples.size() - 2]) * Span;
+                    ImVec2 E0{}, E1{};
+                    if (ProjectClippedSegment(Rail.Samples.front() - T0, Rail.Samples.front(), E0, E1))
+                        DrawDashedPolyline(Canvas, { E0, E1 }, IM_COL32(0xff, 0xd4, 0x47, 0x98), 1.4f);
+                    if (ProjectClippedSegment(Rail.Samples.back(), Rail.Samples.back() + T1, E0, E1))
+                        DrawDashedPolyline(Canvas, { E0, E1 }, IM_COL32(0xff, 0xd4, 0x47, 0x98), 1.4f);
+                }
+            }
+        }
+        ImVec2 LivePix{};
+        if (ProjectWorldPoint(State, Frame, Transform.DisplayPivot, LivePix))
+        {
+            Canvas->AddCircleFilled(LivePix, 5.2f, IM_COL32(0xff, 0xd4, 0x47, 0xff));
+            Canvas->AddCircle(LivePix, 7.2f, IM_COL32(0x10, 0x12, 0x18, 0xe8), 16, 1.6f);
+        }
+    }
+    else if (Transform.Axis >= 0 && Transform.Axis < 3)
     {
         if (!Transform.PlaneCondition)
         {
@@ -5295,9 +5664,13 @@ void DriveTransformSession(SketcherWorkspaceStatus& State, const OrbitCameraBasi
     const Vector3 Forward{ Frame.Forward[0], Frame.Forward[1], Frame.Forward[2] };
     const Vector3 Axes[3] = { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
     static const char* AxisNames[] = { "x", "y", "z" };
-    const bool   SnapCondition = !Io.KeyCtrl;
-    double       Typed         = 0.0;
-    const bool   TypedCondition = ParseTypedAmount(Transform.Typed, Typed);
+    const bool   SubObjectSmooth = Transform.TargetKind == SketcherTransformTarget::Vertices ||
+                                   Transform.TargetKind == SketcherTransformTarget::Edges ||
+                                   Transform.TargetKind == SketcherTransformTarget::SketchPoints ||
+                                   Transform.TargetKind == SketcherTransformTarget::CurvePoles;
+    const bool   SnapCondition   = SubObjectSmooth ? Io.KeyCtrl : !Io.KeyCtrl;
+    double       Typed           = 0.0;
+    const bool   TypedCondition  = ParseTypedAmount(Transform.Typed, Typed);
     auto Snap = [&](double Value, double Step) { return SnapCondition ? std::round(Value / Step) * Step : Value; };
     ImVec2 PivotPixel;
     const bool PivotCondition = ProjectWorldPoint(State, Frame, Transform.Pivot, PivotPixel);
@@ -5305,6 +5678,107 @@ void DriveTransformSession(SketcherWorkspaceStatus& State, const OrbitCameraBasi
     {
     case SketcherTransformVerb::Move:
     {
+        if (Transform.SlideCondition && !Transform.SlideRails.empty())
+        {
+            State.Picker.Current = {};
+            const bool Unclamped = Transform.SlideUnclampedCondition || Io.KeyAlt;
+            int        ChosenRail = Transform.ActiveSlideRail >= 0 && Transform.ActiveSlideRail < int(Transform.SlideRails.size())
+                                  ? Transform.ActiveSlideRail : 0;
+            double     Factor     = 0.0;
+            if (TypedCondition)
+            {
+                Factor = Typed;
+            }
+            else
+            {
+                const float DeltaX = (Io.MousePos.x - Transform.Start.x) * (Io.KeyShift ? 0.25f : 1.0f);
+                const float DeltaY = (Io.MousePos.y - Transform.Start.y) * (Io.KeyShift ? 0.25f : 1.0f);
+                const float MovePx = std::hypot(DeltaX, DeltaY);
+                if (MovePx >= 2.0f)
+                {
+                    int    BestPosIdx = -1, BestNegIdx = -1;
+                    double BestPosCos = -2.0, BestNegCos = -2.0;
+                    double BestPosFac = 0.0, BestNegFac = 0.0;
+                    for (size_t RIdx = 0; RIdx < Transform.SlideRails.size(); ++RIdx)
+                    {
+                        const SketcherSlideRail& Rail = Transform.SlideRails[RIdx];
+                        const Vector3 Start3D = Rail.EdgePair ? (Rail.Origin + Rail.SecondOrigin) * 0.5 : Rail.Origin;
+                        const Vector3 End3D   = Rail.EdgePair ? (Rail.Target + Rail.SecondTarget) * 0.5 : Rail.Target;
+                        ImVec2 Pix0{}, Pix1{};
+                        if (!ProjectWorldPoint(State, Frame, Start3D, Pix0) || !ProjectWorldPoint(State, Frame, End3D, Pix1))
+                            continue;
+                        const float DirX   = Pix1.x - Pix0.x;
+                        const float DirY   = Pix1.y - Pix0.y;
+                        const float RailPx = std::hypot(DirX, DirY);
+                        if (RailPx < 3.0f) continue;
+                        const double DotPx = double(DeltaX) * double(DirX) + double(DeltaY) * double(DirY);
+                        const double CosA  = DotPx / (double(MovePx) * double(RailPx));
+                        const double Proj  = DotPx / (double(RailPx) * double(RailPx));
+                        if (CosA > BestPosCos)
+                        {
+                            BestPosCos = CosA;
+                            BestPosIdx = int(RIdx);
+                            BestPosFac = Proj;
+                        }
+                        if (-CosA > BestNegCos)
+                        {
+                            BestNegCos = -CosA;
+                            BestNegIdx = int(RIdx);
+                            BestNegFac = Proj;
+                        }
+                    }
+                    if (BestPosIdx >= 0 && BestPosCos >= (Unclamped ? 0.2 : 0.0))
+                    {
+                        ChosenRail = BestPosIdx;
+                        Factor     = BestPosFac;
+                    }
+                    else if (Unclamped && BestNegIdx >= 0 && BestNegCos >= 0.2)
+                    {
+                        ChosenRail = BestNegIdx;
+                        Factor     = BestNegFac;
+                    }
+                    else if (BestPosIdx >= 0)
+                    {
+                        ChosenRail = BestPosIdx;
+                        Factor     = 0.0;
+                    }
+                }
+                if (Io.KeyCtrl) Factor = std::round(Factor / 0.05) * 0.05;
+            }
+            const SketcherSlideRail& ActiveRail = Transform.SlideRails[size_t(ChosenRail)];
+            const double RailWorldLen = ActiveRail.EdgePair
+                ? std::min(Distance(ActiveRail.Origin, ActiveRail.Target), Distance(ActiveRail.SecondOrigin, ActiveRail.SecondTarget))
+                : Distance(ActiveRail.Origin, ActiveRail.Target);
+            if (!Unclamped)
+            {
+                const double MaxClamped = std::max(0.0, 1.0 - std::min(0.02, 2.0e-3 / std::max(1.0e-4, RailWorldLen)));
+                Factor = std::clamp(Factor, 0.0, MaxClamped);
+            }
+            Transform.ActiveSlideRail = ChosenRail;
+            Transform.SlideFactor     = Factor;
+            Transform.CurrentValue    = Factor;
+            if (ActiveRail.EdgePair)
+            {
+                Transform.Map = EvaluateEdgeSlideMap(ActiveRail, Factor);
+                const Vector3 A1 = ActiveRail.Origin + (ActiveRail.Target - ActiveRail.Origin) * Factor;
+                const Vector3 B1 = ActiveRail.SecondOrigin + (ActiveRail.SecondTarget - ActiveRail.SecondOrigin) * Factor;
+                Transform.DisplayPivot = (A1 + B1) * 0.5;
+            }
+            else
+            {
+                const Vector3 PosOnRail = EvaluateSlideRailPoint(ActiveRail, Factor);
+                const Vector3 Shift     = PosOnRail - ActiveRail.Origin;
+                Transform.Map           = TranslationMap(Shift);
+                Transform.DisplayPivot  = Transform.Pivot + Shift;
+            }
+            const double MovedDist = Distance(Transform.DisplayPivot, Transform.Pivot);
+            Transform.Readout = Compose("Slide (GG)%s %.0f%% (%s)",
+                                        Unclamped ? " [unclamped]" : "",
+                                        Factor * 100.0,
+                                        FormatLength(MovedDist).c_str());
+            break;
+        }
+
         Vector3 Shift;
         if (TypedCondition)
         {
@@ -5349,14 +5823,14 @@ void DriveTransformSession(SketcherWorkspaceStatus& State, const OrbitCameraBasi
             else if (EyeParallelToAxis && Transform.Axis >= 0)
             {
                 // Axis points straight at/away from camera (e.g. G Z in Top view): vertical mouse motion drives +Axis smoothly.
-                const double Raw = double(Transform.Start.y - Io.MousePos.y) * Frame.WorldPerPixel;
+                const double Raw = double(Transform.Start.y - Io.MousePos.y) * Frame.WorldPerPixel * (Io.KeyShift ? 0.25 : 1.0);
                 Shift = Axes[Transform.Axis] * Snap(Raw, MoveSnap);
             }
             else
             {
                 if (Meet(Transform.StartLocal, From) && Meet(Local, To))
                 {
-                    Shift = To - From;
+                    Shift = (To - From) * (Io.KeyShift ? 0.25 : 1.0);
                     if (Transform.Axis >= 0 && !Transform.PlaneCondition) Shift = Axes[Transform.Axis] * Dot(Shift, Axes[Transform.Axis]);
                 }
                 Shift = { Snap(Shift.X, MoveSnap), Snap(Shift.Y, MoveSnap), Snap(Shift.Z, MoveSnap) };
@@ -6070,7 +6544,10 @@ void DriveGizmoDrag(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Fram
     SketcherGizmoSession&    Gizmo = State.Gizmo;
     const GizmoPose& Pose  = Gizmo.Pose;
     const ImGuiIO&           Io    = ImGui::GetIO();
-    const bool               Snap  = !Io.KeyCtrl;                                            // Snapping on by default, Ctrl free
+    const bool               SubObjectSmooth = Gizmo.Target == SketcherGizmoTarget::Shape ||
+                                               Gizmo.Target == SketcherGizmoTarget::Points ||
+                                               Gizmo.Target == SketcherGizmoTarget::Poles;
+    const bool               Snap  = SubObjectSmooth ? Io.KeyCtrl : !Io.KeyCtrl;             // Sub-object sculpting is smooth by default; Ctrl snaps
     const OrbitRay           Ray   = CastOrbitRay(Frame, Local.x, Local.y);
     const int                Axis  = GizmoHandleAxis(Gizmo.Grab);
     const Vector3            Forward{ Frame.Forward[0], Frame.Forward[1], Frame.Forward[2] };
@@ -9233,18 +9710,27 @@ void DrawSketchOverlays(SketcherWorkspaceStatus& State, ImDrawList* Canvas, cons
     }
 }
 
+[[nodiscard]] int FindBodyVertexNear(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, ImVec2 Pointer);
+
 // Nearest shown sketch point within PoleReach of Pointer (mode 1, or selected free curves in mode 5); false when none.
 bool FindSketchPointNear(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, ImVec2 Pointer, std::string& Label, int& Point)
 {
+    const bool HasCoincidentBodyVertex = (State.PickMode == SketcherPickMode::ControlPoint) && (FindBodyVertexNear(State, Frame, Pointer) >= 0);
     float Best = 8.0f;
     Point = -1;
     for (const FeatureStep& Step : State.Document.Tree.Steps)
     {
         if (Step.Kind != FeatureStepCategory::Sketch || !CurveReachableCondition(State.Document, Step.Label)) continue;
+        const bool Selected = std::find(State.Document.Selection.Curves.begin(), State.Document.Selection.Curves.end(), Step.Label) != State.Document.Selection.Curves.end();
+        const bool Consumed = SketcherSketchConsumedCondition(State.Document, Step.Label);
         if (State.PickMode != SketcherPickMode::ControlPoint)
         {
-            const bool Selected = std::find(State.Document.Selection.Curves.begin(), State.Document.Selection.Curves.end(), Step.Label) != State.Document.Selection.Curves.end();
-            if (State.PickMode != SketcherPickMode::Any || !Selected || SketcherSketchConsumedCondition(State.Document, Step.Label)) continue;
+            if (State.PickMode != SketcherPickMode::Any || !Selected || Consumed) continue;
+        }
+        else if (Consumed && HasCoincidentBodyVertex && !Selected && State.FocusedStep != Step.Label && State.SketchPoints.Sketch != Step.Label)
+        {
+            // A sketch already consumed by a 3D feature yields to the visible B-rep vertex at that corner unless the sketch itself is focused / selected.
+            continue;
         }
         const SketchModel&     Sketch = SolvedSketchOf(State.Document, Step);
         const OrthonormalBasis Plane  = ElevatedSketchPlane(State.Document, Step);
@@ -9680,11 +10166,18 @@ std::string FindCurveNear(const SketcherWorkspaceStatus& State, const OrbitCamer
 // Nearest shown pole within PoleReach of the pointer.
 bool FindPoleNear(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, ImVec2 Pointer, std::string& Label, int& Pole)
 {
+    const bool HasCoincidentBodyVertex = (State.PickMode == SketcherPickMode::ControlPoint) && (FindBodyVertexNear(State, Frame, Pointer) >= 0);
     float Best = PoleReach;
     Pole = -1;
     for (const auto& [Candidate, Fit] : State.Document.Regeneration.Curves)
     {
         if (!Fit.Curve.Definition || !PolesShownCondition(State, Candidate) || !CurveReachableCondition(State.Document, Candidate)) continue;
+        if (HasCoincidentBodyVertex && CurveConsumedCondition(State.Document, Candidate) &&
+            CurveOrder(State, Candidate) <= 0 && State.PoleDrag.PickedLabel != Candidate)
+        {
+            // A 3D curve already consumed by a Network / Loft yields to the visible B-rep vertex at that corner unless the curve is selected.
+            continue;
+        }
         const std::vector<Vector3>& Poles = Fit.Curve.Definition->Poles;
         for (int Index = 0; Index < int(Poles.size()); ++Index)
         {
@@ -13082,8 +13575,11 @@ void ExportBodies(SketcherWorkspaceStatus& State, const std::string& Path)
     if (!Session.Export.Refusal.empty()) { Announce(State, "Refused: " + Session.Export.Refusal); return; }
     ++Session.Exports;
     const SketcherExportOutcome& Export = Session.Export;
-    const std::string Figures = Export.Format == SketcherExchangeFormat::Step ? Compose("%d face(s)%s", Export.Faces, Export.Approximated > 0 ? Compose(" · %d certified stand-in(s)", Export.Approximated).c_str() : "")
-                                                                             : Compose("%d facet(s)", Export.Triangles);
+    const std::string Figures = Export.Format == SketcherExchangeFormat::Step
+        ? Compose("%d face(s)%s", Export.Faces, Export.Approximated > 0 ? Compose(" · %d certified stand-in(s)", Export.Approximated).c_str() : "")
+        : Export.Format == SketcherExchangeFormat::SolidArc
+            ? Compose("%d face(s) · GeometrySpace + Curve + DistanceField", Export.Faces)
+            : Compose("%d face(s)", Export.Triangles);
     Announce(State, Compose("Exported %d body(ies) as %s → %s · %s · %.0f bytes · %.0f ms", int(Export.Bodies.size()), SketcherExchangeFormatLabel(Export.Format), Path.c_str(),
                             Figures.c_str(), Export.Bytes, Export.Milliseconds));
 }
@@ -13389,8 +13885,15 @@ void PickAtPointer(SketcherWorkspaceStatus& State, ImVec2 Local, SketcherPickInt
     uint32_t                  Identity = State.HoverIdentity;
     if (State.PickMode == SketcherPickMode::ControlPoint || State.PickMode == SketcherPickMode::Edge || State.PickMode == SketcherPickMode::Any || State.PickMode==SketcherPickMode::Curve)
     {
+        const ImVec2 ScreenPointer(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y);
+        if (State.PickMode == SketcherPickMode::ControlPoint)
+        {
+            // In Mode 1 (Points / Vertices), a visible B-rep vertex dot right under the cursor beats overlaid curve spans.
+            const int Vertex = FindBodyVertexNear(State, Frame, ScreenPointer);
+            if (Vertex >= 0) { PickBodyVertex(State, Vertex, Intent); return; }
+        }
         // Curves are overlays: within CurveReach they win over the face / edge underneath.
-        const std::string Curve = FindCurveNear(State, Frame, ImVec2(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y));
+        const std::string Curve = FindCurveNear(State, Frame, ScreenPointer);
         if (!Curve.empty())
         {
             PickCurve(State, Curve, Intent);
@@ -13402,9 +13905,6 @@ void PickAtPointer(SketcherWorkspaceStatus& State, ImVec2 Local, SketcherPickInt
         }
         if (State.PickMode == SketcherPickMode::ControlPoint)
         {
-            // Body vertices (direct reshape) under the curves.
-            const int Vertex = FindBodyVertexNear(State, Frame, ImVec2(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y));
-            if (Vertex >= 0) { PickBodyVertex(State, Vertex, Intent); return; }
             if (Intent == SketcherPickIntent::Replace && (!State.Document.Selection.Curves.empty() || !State.Document.Selection.Vertices.empty()))
             {
                 ClearSketcherSelection(State.Document);
@@ -16785,6 +17285,27 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
             Box.Start           = Io.MousePos;
         }
         const bool Moved = Io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] > ClickTolerance * ClickTolerance;
+        if (Box.ActiveCondition && Moved && State.PickMode == SketcherPickMode::ControlPoint && !Io.KeyShift && !Io.KeyCtrl)
+        {
+            const int PressVertex = FindBodyVertexNear(State, Frame, Box.Start);
+            if (PressVertex >= 0)
+            {
+                Box.ActiveCondition = false;
+                if (!BodyVertexPickedCondition(State, State.Scene.Vertices[size_t(PressVertex)]))
+                    PickBodyVertex(State, PressVertex, SketcherPickIntent::Replace);
+                OpenTransformSession(State, SketcherTransformVerb::Move, false);
+                if (State.Transform.ActiveCondition)
+                {
+                    State.Transform.StartCondition    = true;
+                    State.Transform.Start             = Box.Start;
+                    State.Transform.StartLocal        = ImVec2(Box.Start.x - State.ViewportRect[0], Box.Start.y - State.ViewportRect[1]);
+                    State.Transform.LeftDragCondition = true;
+                    if (Io.KeyAlt && !State.Transform.SlideRails.empty())
+                        State.Transform.SlideCondition = true;
+                    DriveTransformSession(State, Frame, Local);
+                }
+            }
+        }
         if (Box.ActiveCondition)
         {
             Box.End = Io.MousePos;
@@ -17117,7 +17638,12 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
                        : State.Gizmo.Hover != GizmoHandle::None
                            ? "Gizmo: press and drag · cones move along an axis · squares move in a plane · arcs rotate · cylinders scale · ring screen move / uniform scale · y cycles modes"
                        : State.Transform.ActiveCondition
-                           ? (State.Transform.Verb == SketcherTransformVerb::Move ? "Move: pointer snaps to points / edges / faces (Ctrl free) · X / Y / Z axis · Shift+X / Y / Z plane · G screen · type a distance · LMB / Enter commit · RMB cancel · Esc cancel"
+                           ? (State.Transform.Verb == SketcherTransformVerb::Move && State.Transform.SlideCondition
+                                  ? "Slide (GG): move mouse toward an incident edge · C or Alt unclamps extension · Ctrl 5% steps · Shift fine · G free move · X / Y / Z axis · LMB / Enter commit · RMB / Esc cancel"
+                              : State.Transform.Verb == SketcherTransformVerb::Move
+                                  ? (!State.Transform.SlideRails.empty()
+                                         ? "Move: G again slides along incident edge (GG) · X / Y / Z axis · Shift+X / Y / Z plane · Shift fine · Ctrl snap · type a distance · LMB / Enter commit · RMB / Esc cancel"
+                                         : "Move: pointer snaps to points / edges / faces (Ctrl free) · X / Y / Z axis · Shift+X / Y / Z plane · G screen · type a distance · LMB / Enter commit · RMB cancel · Esc cancel")
                               : State.Transform.Verb == SketcherTransformVerb::Rotate ? "Rotate: sweep about the centre (5° steps, Ctrl free) · X / Y / Z axis · R screen · type degrees · LMB / Enter commit · RMB cancel · Esc cancel"
                               : "Scale: distance to the centre (×0.1 steps, Ctrl free) · X / Y / Z one axis · S uniform · type a factor · LMB / Enter commit · RMB cancel · Esc cancel")
                        : State.Knife.ActiveCondition && !State.Knife.DrawPendingCondition
@@ -17166,7 +17692,7 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
                        : State.Bevel.ActiveCondition
                            ? "Drag anywhere / a handle: size, stops at the max (Shift fine) · corner diamonds: variable · D fillet · C chamfer · variable size in the card · F flip anchor · click / Alt (loop) / Ctrl+Alt (ring) edits edges · Enter / right-click finish · Esc abort"
                        : State.PickMode == SketcherPickMode::ControlPoint
-                           ? "Mode 1: drag a sketch point or pole (live, release commits, Esc drops; Ctrl ends / midpoints, Alt along a curve) · click a point for the gizmo (Shift add, box picks) · click a curve · L loft · 2/3/4/5 modes"
+                           ? "Mode 1: drag a vertex, sketch point, or pole (Alt slides along edge / curve) · click a vertex for gizmo · G move · GG slide along edge · 2/3/4/5 modes"
                            : "Middle orbit · right pan · wheel zoom · click select (Shift add, Ctrl remove · Ctrl on a new edge: path, Alt loop, Ctrl+Alt ring, double-click chain) · 1-5 modes · B fillet · E extrude · L loft · Shift+A line · Shift+S curve";
     float HintTop = 0.0f;                                                                   // [px] - The toolbar stays above the hint lines
     {
@@ -17249,8 +17775,9 @@ void DrawTransformSessionCard(SketcherWorkspaceStatus& State)
 
     // Single-axis lock buttons (isolates that axis gizmo handle + viewport guide line).
     const float Quarter = (ImGui::GetContentRegionAvail().x - 24.0f) / 4.0f;
-    if (ToggleButton(State, "Free###TransAxisFree", Transform.Axis < 0, ImVec2(Quarter, 0)))
+    if (ToggleButton(State, "Free###TransAxisFree", Transform.Axis < 0 && !Transform.SlideCondition, ImVec2(Quarter, 0)))
     {
+        Transform.SlideCondition  = false;
         Transform.Axis            = -1;
         Transform.PlaneCondition  = false;
         Transform.StagedCondition = false;
@@ -17259,11 +17786,34 @@ void DrawTransformSessionCard(SketcherWorkspaceStatus& State)
     for (int Axis = 0; Axis < 3; ++Axis)
     {
         ImGui::SameLine();
-        if (ToggleButton(State, AxisLabels[Axis], Transform.Axis == Axis && !Transform.PlaneCondition, ImVec2(Quarter, 0)))
+        if (ToggleButton(State, AxisLabels[Axis], !Transform.SlideCondition && Transform.Axis == Axis && !Transform.PlaneCondition, ImVec2(Quarter, 0)))
         {
+            Transform.SlideCondition = false;
             if (Transform.Axis == Axis && !Transform.PlaneCondition) Transform.Axis = -1;
             else { Transform.Axis = Axis; Transform.PlaneCondition = false; }
             Transform.StagedCondition = false;
+        }
+    }
+    if (Transform.Verb == SketcherTransformVerb::Move && !Transform.SlideRails.empty() && !Transform.DuplicateCondition)
+    {
+        const float Half = (ImGui::GetContentRegionAvail().x - 8.0f) * (Transform.SlideCondition ? 0.5f : 1.0f);
+        if (ToggleButton(State, "Slide along Edge (GG)###TransSlideGG", Transform.SlideCondition, ImVec2(Half, 0)))
+        {
+            Transform.SlideCondition          = !Transform.SlideCondition;
+            Transform.SlideUnclampedCondition = false;
+            Transform.Axis                    = -1;
+            Transform.PlaneCondition          = false;
+            Transform.Typed.clear();
+            Transform.StagedCondition         = false;
+        }
+        if (Transform.SlideCondition)
+        {
+            ImGui::SameLine();
+            if (ToggleButton(State, "Clamp (C)###TransSlideClamp", !Transform.SlideUnclampedCondition, ImVec2(Half, 0)))
+            {
+                Transform.SlideUnclampedCondition = !Transform.SlideUnclampedCondition;
+                Transform.StagedCondition         = false;
+            }
         }
     }
 
@@ -17274,7 +17824,8 @@ void DrawTransformSessionCard(SketcherWorkspaceStatus& State)
         const std::string Shown = !Transform.Typed.empty() ? Transform.Typed : FormatLength(Transform.CurrentValue);
         std::snprintf(Transform.ValueText.data(), Transform.ValueText.size(), "%s", Shown.c_str());
     }
-    const char* FieldCaption = Transform.Verb == SketcherTransformVerb::Move ? "Distance (m)###TransformAmount"
+    const char* FieldCaption = Transform.SlideCondition ? "Factor (0..1)###TransformAmount"
+                             : Transform.Verb == SketcherTransformVerb::Move ? "Distance (m)###TransformAmount"
                              : Transform.Verb == SketcherTransformVerb::Rotate ? "Angle (deg)###TransformAmount"
                              : "Factor###TransformAmount";
     ImGui::SetNextItemWidth(115.0f);
@@ -17287,7 +17838,7 @@ void DrawTransformSessionCard(SketcherWorkspaceStatus& State)
             char Clean[48];
             std::snprintf(Clean, sizeof(Clean), "%.8g", std::abs(Parsed) < 1.0e-12 ? 0.0 : Parsed);
             Transform.Typed = Clean;
-            if (Transform.Axis < 0 && Transform.Verb == SketcherTransformVerb::Move) Transform.Axis = 0;
+            if (!Transform.SlideCondition && Transform.Axis < 0 && Transform.Verb == SketcherTransformVerb::Move) Transform.Axis = 0;
             Transform.StagedCondition = false;
         }
     }
@@ -20567,47 +21118,78 @@ void ApplyShortcuts(SketcherWorkspaceStatus& State)
         if (CollectTypedAmount(Transform.Typed)) Transform.StagedCondition = false;
         if (OperationInput.ConfirmPressed()) ApplyTransformSession(State);
         else if (OperationInput.CancelPressed()) CancelTransformSession(State);
-        else if (!Control && !Alternate)
+        else if (!Control)
         {
-            static const ImGuiKey AxisKeys[] = { ImGuiKey_X, ImGuiKey_Y, ImGuiKey_Z };
-            for (int Axis = 0; Axis < 3; ++Axis)
+            if (Transform.SlideCondition && Pressed(ImGuiKey_C))
             {
-                if (Pressed(AxisKeys[Axis]))
-                {
-                    const bool WantPlane = Shift && (Transform.Verb == SketcherTransformVerb::Move || Transform.Verb == SketcherTransformVerb::Scale);
-                    if (Transform.Axis == Axis && Transform.PlaneCondition == WantPlane)
-                    {
-                        Transform.Axis           = -1;
-                        Transform.PlaneCondition = false;
-                    }
-                    else
-                    {
-                        Transform.Axis           = Axis;
-                        Transform.PlaneCondition = WantPlane;
-                    }
-                    Transform.StagedCondition = false;
-                }
+                Transform.SlideUnclampedCondition = !Transform.SlideUnclampedCondition;
+                Transform.StagedCondition         = false;
+                Announce(State, Transform.SlideUnclampedCondition
+                                    ? "Slide (GG): unclamped extension enabled (press C to clamp back to [0, 1])"
+                                    : "Slide (GG): clamped to [0, 1] along incident edge");
             }
-            const struct { ImGuiKey Key; SketcherTransformVerb Verb; } VerbKeys[] = {
-                { ImGuiKey_G, SketcherTransformVerb::Move },
-                { ImGuiKey_R, SketcherTransformVerb::Rotate },
-                { ImGuiKey_S, SketcherTransformVerb::Scale },
-            };
-            for (const auto& Entry : VerbKeys)
+            if (!Alternate)
             {
-                if (Pressed(Entry.Key))
+                static const ImGuiKey AxisKeys[] = { ImGuiKey_X, ImGuiKey_Y, ImGuiKey_Z };
+                for (int Axis = 0; Axis < 3; ++Axis)
                 {
-                    if (Transform.Verb == Entry.Verb)
+                    if (Pressed(AxisKeys[Axis]))
                     {
-                        Transform.Axis           = -1;
-                        Transform.PlaneCondition = false;
+                        const bool WantPlane = Shift && (Transform.Verb == SketcherTransformVerb::Move || Transform.Verb == SketcherTransformVerb::Scale);
+                        Transform.SlideCondition = false;
+                        if (Transform.Axis == Axis && Transform.PlaneCondition == WantPlane)
+                        {
+                            Transform.Axis           = -1;
+                            Transform.PlaneCondition = false;
+                        }
+                        else
+                        {
+                            Transform.Axis           = Axis;
+                            Transform.PlaneCondition = WantPlane;
+                        }
+                        Transform.StagedCondition = false;
                     }
-                    else
+                }
+                const struct { ImGuiKey Key; SketcherTransformVerb Verb; } VerbKeys[] = {
+                    { ImGuiKey_G, SketcherTransformVerb::Move },
+                    { ImGuiKey_R, SketcherTransformVerb::Rotate },
+                    { ImGuiKey_S, SketcherTransformVerb::Scale },
+                };
+                for (const auto& Entry : VerbKeys)
+                {
+                    if (Pressed(Entry.Key))
                     {
-                        Transform.Verb = Entry.Verb;
-                        if (Transform.Verb == SketcherTransformVerb::Rotate) Transform.PlaneCondition = false;
+                        if (Transform.Verb == Entry.Verb)
+                        {
+                            if (Entry.Verb == SketcherTransformVerb::Move && !Transform.SlideRails.empty() && !Transform.DuplicateCondition)
+                            {
+                                Transform.SlideCondition          = !Transform.SlideCondition;
+                                Transform.SlideUnclampedCondition = false;
+                                Transform.Axis                    = -1;
+                                Transform.PlaneCondition          = false;
+                                Transform.Typed.clear();
+                                Transform.Start                   = Io.MousePos;
+                                Transform.StartLocal              = ImVec2(Io.MousePos.x - State.ViewportRect[0], Io.MousePos.y - State.ViewportRect[1]);
+                                Transform.StartCondition          = true;
+                                Announce(State, Transform.SlideCondition
+                                                    ? "Slide along incident edge (GG): move mouse toward an edge · C or Alt unclamps · G returns to free move"
+                                                    : "Free screen move · press G again to slide along incident edge (GG)");
+                            }
+                            else
+                            {
+                                Transform.SlideCondition = false;
+                                Transform.Axis           = -1;
+                                Transform.PlaneCondition = false;
+                            }
+                        }
+                        else
+                        {
+                            Transform.Verb           = Entry.Verb;
+                            Transform.SlideCondition = false;
+                            if (Transform.Verb == SketcherTransformVerb::Rotate) Transform.PlaneCondition = false;
+                        }
+                        Transform.StagedCondition = false;
                     }
-                    Transform.StagedCondition = false;
                 }
             }
         }

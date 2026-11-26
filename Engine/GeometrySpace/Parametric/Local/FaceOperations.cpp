@@ -502,7 +502,12 @@ static FaceOperationOutcome ApplyFaceOperationUntraced(ModelPartition& Partition
         case FaceOperationCategory::Inset:   return Finish(InsetPlanarFaces(Partition, Body, Settings.Faces, Settings.Distance, Settings.Depth, Outcome.Body, Outcome.FaceHistories, Outcome.Audit, Outcome.Method));
         case FaceOperationCategory::Delete:  return Finish(DeleteBodyFaces(Partition, Body, Settings.Faces, Outcome.Body, Outcome.Category, Outcome.FaceHistories, Outcome.Audit, Outcome.Method));
         case FaceOperationCategory::Heal:    return Finish(HealBody(Partition, Body, Outcome.Body, Outcome.FaceHistories, Outcome.Audit, Outcome.Method, Settings.Edges, Settings.Vertices));
-        case FaceOperationCategory::Reshape: return Finish(ReshapeBodyVertices(Partition, Body, Settings.Vertices, Settings.Placement, Outcome.Body, Outcome.FaceHistories, Outcome.Audit, Outcome.Method));
+        case FaceOperationCategory::Reshape:
+        {
+            const std::string Problem = ReshapeBodyVertices(Partition, Body, Settings.Vertices, Settings.Placement, Outcome.Body, Outcome.FaceHistories, Outcome.Audit, Outcome.Method);
+            if (Problem.empty() && Outcome.Body.PresentCondition()) Outcome.Category = Partition.Bodies.Resolve(Outcome.Body).Category;
+            return Finish(Problem);
+        }
         case FaceOperationCategory::Thicken: return Finish(ThickenSheet(Partition, Body, Settings.Distance, Outcome.Body, Outcome.FaceHistories, Outcome.Audit, Outcome.Method));
         default: break;
     }

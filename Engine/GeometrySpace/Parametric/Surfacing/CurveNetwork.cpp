@@ -870,7 +870,7 @@ std::vector<ClosedCurveLoop> DetectClosedCurveLoops(const std::vector<NurbsCurve
     }
 
     // ④ Enumerate minimal simple cycles by seeded shortest paths across every (edge, next-edge) pair.
-    constexpr int MaxCycleEdges = 16;
+    constexpr int MaxCycleEdges = 64;
     struct CandidateCycle
     {
         ClosedCurveLoop  Loop      = {};
@@ -1061,7 +1061,7 @@ ClosedLoopSurfaceOutcome ConstructClosedLoopPanels(const std::vector<NurbsCurve>
     auto Refuse = [&](const std::string& Reason) { Outcome.Refusal = "Closed loop: " + Reason; return Outcome; };
     if (OrderedEdges.empty()) return Refuse("no edges");
 
-    // Expand 1-curve closed loops or 2-curve lenses into >= 3 open boundary edges.
+    // Expand 1-curve closed loops, degree-1 multi-segment polylines, or 2-curve smooth lenses into >= 3 open boundary edges.
     std::vector<NurbsCurve> Working = OrderedEdges;
     if (Working.size() == 1)
     {
@@ -1092,18 +1092,43 @@ ClosedLoopSurfaceOutcome ConstructClosedLoopPanels(const std::vector<NurbsCurve>
             Working.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Rem) });
         }
     }
-    else if (Working.size() == 2)
+    else
     {
-        std::string OrientRefusal;
-        const std::vector<NurbsCurve> Oriented = OrientClosedLoopEdges(Working, CornerTolerance, OrientRefusal);
-        if (!OrientRefusal.empty()) return Refuse(OrientRefusal);
-        Working.clear();
+        std::string InitialOrientRefusal;
+        const std::vector<NurbsCurve> Oriented = OrientClosedLoopEdges(Working, CornerTolerance, InitialOrientRefusal);
+        if (!InitialOrientRefusal.empty()) return Refuse(InitialOrientRefusal);
+
+        std::vector<NurbsCurve> Expanded;
         for (const NurbsCurve& Edge : Oriented)
         {
-            const auto Split = SplitNurbsCurve(MapCurveOntoUnit(*Edge.Definition), 0.5);
-            if (!Split) return Refuse("could not split 2-curve loop edge");
-            Working.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Split->first) });
-            Working.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Split->second) });
+            const NurbsCurveDefinition Def = MapCurveOntoUnit(*Edge.Definition);
+            if (Def.Degree == 1 && Def.Poles.size() >= 3)
+            {
+                for (size_t K = 0; K + 1 < Def.Poles.size(); ++K)
+                {
+                    if (Length(Def.Poles[K + 1] - Def.Poles[K]) > CornerTolerance * 0.1)
+                        Expanded.push_back(MakeSegmentCurve(Def.Poles[K], Def.Poles[K + 1]));
+                }
+            }
+            else
+            {
+                Expanded.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Def) });
+            }
+        }
+        if (Expanded.size() == 2)
+        {
+            Working.clear();
+            for (const NurbsCurve& Edge : Expanded)
+            {
+                const auto Split = SplitNurbsCurve(MapCurveOntoUnit(*Edge.Definition), 0.5);
+                if (!Split) return Refuse("could not split 2-curve loop edge");
+                Working.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Split->first) });
+                Working.push_back(NurbsCurve{ std::make_shared<NurbsCurveDefinition>(Split->second) });
+            }
+        }
+        else
+        {
+            Working = std::move(Expanded);
         }
     }
 
@@ -1126,6 +1151,15 @@ ClosedLoopSurfaceOutcome ConstructClosedLoopPanels(const std::vector<NurbsCurve>
             if (LenA <= 1.0e-12 || LenB <= 1.0e-12) continue;
             const double TanDot = Dot(TanA * (1.0 / LenA), TanB * (1.0 / LenB));
             if (TanDot <= 0.985) continue;
+
+            if (DefA.Degree == 1 && DefB.Degree == 1 && DefA.Poles.size() == 2 && DefB.Poles.size() == 2)
+            {
+                const NurbsCurve Joined = MakeSegmentCurve(DefA.Poles.front(), DefB.Poles.back());
+                if (Next == 0) { Edges[0] = Joined; Edges.pop_back(); }
+                else { Edges[I] = Joined; Edges.erase(Edges.begin() + static_cast<ptrdiff_t>(Next)); }
+                MergedAny = true;
+                break;
+            }
 
             std::vector<Vector3> MergedPts;
             constexpr int SamplesPerPiece = 17;
@@ -1157,15 +1191,100 @@ ClosedLoopSurfaceOutcome ConstructClosedLoopPanels(const std::vector<NurbsCurve>
         if (!MergedAny) break;
     }
 
-    if (Edges.size() == 3)
+    // Newell best-fit plane of the oriented loop so every emitted panel shares a consistent right-hand normal.
+    std::vector<Vector3> LoopSamples;
+    LoopSamples.reserve(Edges.size() * 8);
+    for (const NurbsCurve& Edge : Edges)
+    {
+        const NurbsCurveDefinition Def = MapCurveOntoUnit(*Edge.Definition);
+        for (int Step = 0; Step < 8; ++Step)
+            LoopSamples.push_back(EvaluateNurbsCurve(Def, static_cast<double>(Step) / 8.0).Position);
+    }
+    Vector3 LoopCentre{};
+    for (const Vector3& Pt : LoopSamples) LoopCentre = LoopCentre + Pt;
+    if (!LoopSamples.empty()) LoopCentre = LoopCentre * (1.0 / static_cast<double>(LoopSamples.size()));
+    Vector3 LoopArea{};
+    double  MaxSpan = 0.0;
+    for (size_t I = 0; I < LoopSamples.size(); ++I)
+    {
+        const Vector3 A = LoopSamples[I] - LoopCentre;
+        const Vector3 B = LoopSamples[(I + 1) % LoopSamples.size()] - LoopCentre;
+        LoopArea = LoopArea + Cross(A, B) * 0.5;
+        MaxSpan  = std::max(MaxSpan, Length(A));
+    }
+    const double AreaLength = Length(LoopArea);
+    const Vector3 LoopNormal = AreaLength > 1.0e-14 ? (LoopArea * (1.0 / AreaLength)) : Vector3{ 0.0, 0.0, 1.0 };
+    const Vector3 RefAxis    = std::fabs(LoopNormal.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+    const Vector3 AxisU      = Normalize(Cross(RefAxis, LoopNormal));
+    const Vector3 AxisV      = Cross(LoopNormal, AxisU);
+
+    auto AlignPanelNormal = [&](SurfacePanel Panel) -> SurfacePanel
+    {
+        if (AreaLength <= 1.0e-14 || !Panel.Surface.Definition) return Panel;
+        static constexpr Vector2 Spots[] = { { 0.5, 0.5 }, { 0.37, 0.41 }, { 0.63, 0.59 } };
+        for (const Vector2& Spot : Spots)
+        {
+            const auto Sample = EvaluateNurbsSurface(Panel.Surface, Spot);
+            const Vector3 Normal = Cross(Sample.DerivativeU, Sample.DerivativeV);
+            if (Length(Normal) > 1.0e-12)
+            {
+                if (Dot(Normal, LoopNormal) < 0.0)
+                {
+                    if (const auto Flipped = FinishNurbsSurface(ReverseNurbsSurface(*Panel.Surface.Definition, true)))
+                        Panel.Surface = *Flipped;
+                }
+                break;
+            }
+        }
+        return Panel;
+    };
+
+    double OffPlane = 0.0;
+    for (const NurbsCurve& Edge : Edges)
+        for (const Vector3& Pole : Edge.Definition->Poles)
+            OffPlane = std::max(OffPlane, std::fabs(Dot(Pole - LoopCentre, LoopNormal)));
+    const bool PlanarLoopCondition = OffPlane <= std::max(1.0e-4 * std::max(MaxSpan, 1.0), CornerTolerance);
+
+    const size_t Count = Edges.size();
+    std::vector<Vector3> Corners3D(Count);
+    std::vector<Vector2> Corners2D(Count);
+    for (size_t I = 0; I < Count; ++I)
+    {
+        Corners3D[I] = Edges[I].Definition->Poles.front();
+        const Vector3 Rel = Corners3D[I] - LoopCentre;
+        Corners2D[I] = { Dot(Rel, AxisU), Dot(Rel, AxisV) };
+    }
+
+    auto Cross2D = [](Vector2 Origin, Vector2 First, Vector2 Second) -> double
+    {
+        return (First.X - Origin.X) * (Second.Y - Origin.Y) - (First.Y - Origin.Y) * (Second.X - Origin.X);
+    };
+
+    bool StrictlyConvexCondition = AreaLength > 1.0e-14;
+    for (size_t I = 0; I < Count && StrictlyConvexCondition; ++I)
+    {
+        const Vector2 Prev = Corners2D[(I + Count - 1) % Count];
+        const Vector2 Cur  = Corners2D[I];
+        const Vector2 Next = Corners2D[(I + 1) % Count];
+        const Vector2 InVec{ Cur.X - Prev.X, Cur.Y - Prev.Y };
+        const Vector2 OutVec{ Next.X - Cur.X, Next.Y - Cur.Y };
+        const double LenIn = std::hypot(InVec.X, InVec.Y), LenOut = std::hypot(OutVec.X, OutVec.Y);
+        if (LenIn <= 1.0e-12 || LenOut <= 1.0e-12) { StrictlyConvexCondition = false; break; }
+        const double Sine   = (InVec.X * OutVec.Y - InVec.Y * OutVec.X) / (LenIn * LenOut);
+        const double Cosine = (InVec.X * OutVec.X + InVec.Y * OutVec.Y) / (LenIn * LenOut);
+        // Require strict CCW turn (> ~5 deg) and no near-180 or hairpin reversal so untrimmed Coons never folds.
+        if (Sine <= 0.087 || Cosine < -0.96) StrictlyConvexCondition = false;
+    }
+
+    if (Count == 3)
     {
         const LoftSurfaceOutcome Tri = LoftTriangularLoop(Edges, std::max(1.0e-4, CornerTolerance));
         if (!Tri.Refusal.empty()) return Refuse(Tri.Refusal);
-        Outcome.Panels.push_back(SurfacePanel{ Tri.Surface });
+        Outcome.Panels.push_back(AlignPanelNormal(SurfacePanel{ Tri.Surface }));
         return Outcome;
     }
 
-    if (Edges.size() == 4)
+    if (Count == 4 && StrictlyConvexCondition)
     {
         NetworkSettings QuadSettings;
         QuadSettings.MeetingGap = std::max(5.0e-4, CornerTolerance);
@@ -1175,40 +1294,191 @@ ClosedLoopSurfaceOutcome ConstructClosedLoopPanels(const std::vector<NurbsCurve>
         const std::vector<std::string> SecondNames = { NameOf(Names, 3, "edge"), NameOf(Names, 1, "edge") };
         const NetworkSurfaceOutcome Quad = ConstructGordonSurface(First, Second, QuadSettings, FirstNames, SecondNames);
         if (!Quad.Refusal.empty()) return Refuse(Quad.Refusal);
-        Outcome.Panels.push_back(SurfacePanel{ Quad.Surface });
+        Outcome.Panels.push_back(AlignPanelNormal(SurfacePanel{ Quad.Surface }));
         return Outcome;
     }
 
-    // N >= 5: split each edge at 0.5 and star-quad from a curvature-lifted loop centroid so curved N-gons stay on-surface.
-    const size_t Count = Edges.size();
-    Vector3 AvgCorner{}, AvgMid{};
-    std::vector<NurbsCurveDefinition> FirstHalves(Count), SecondHalves(Count);
-    std::vector<Vector3> EdgeMids(Count);
+    if (Count >= 5 && StrictlyConvexCondition && !PlanarLoopCondition)
+    {
+        // Strictly convex curved 3D N-gon: split each edge at 0.5 and star-quad from curvature-lifted centroid.
+        Vector3 AvgCorner{}, AvgMid{};
+        std::vector<NurbsCurveDefinition> FirstHalves(Count), SecondHalves(Count);
+        std::vector<Vector3> EdgeMids(Count);
+        for (size_t I = 0; I < Count; ++I)
+        {
+            const auto Split = SplitNurbsCurve(MapCurveOntoUnit(*Edges[I].Definition), 0.5);
+            if (!Split) return Refuse("could not split polygon boundary edge");
+            FirstHalves[I]  = MapCurveOntoUnit(Split->first);
+            SecondHalves[I] = MapCurveOntoUnit(Split->second);
+            EdgeMids[I]     = FirstHalves[I].Poles.back();
+            AvgCorner       = AvgCorner + FirstHalves[I].Poles.front();
+            AvgMid          = AvgMid + EdgeMids[I];
+        }
+        AvgCorner = AvgCorner * (1.0 / static_cast<double>(Count));
+        AvgMid    = AvgMid * (1.0 / static_cast<double>(Count));
+        const Vector3 Centroid = AvgMid + (AvgMid - AvgCorner);
+        NetworkSettings QuadSettings;
+        QuadSettings.MeetingGap = std::max(5.0e-4, CornerTolerance);
+        for (size_t I = 0; I < Count; ++I)
+        {
+            const size_t Prev = (I + Count - 1) % Count;
+            const NurbsCurve RadialPrev = MakeSegmentCurve(Centroid, EdgeMids[Prev]);
+            const NurbsCurve RadialCur  = MakeSegmentCurve(Centroid, EdgeMids[I]);
+            const NurbsCurve EdgeA      = NurbsCurve{ std::make_shared<NurbsCurveDefinition>(SecondHalves[Prev]) };
+            const NurbsCurve EdgeB      = ReverseNurbsCurve(FirstHalves[I]);
+            const NetworkSurfaceOutcome Quad = ConstructGordonSurface({ RadialPrev, EdgeB }, { RadialCur, EdgeA }, QuadSettings);
+            if (!Quad.Refusal.empty()) return Refuse(Quad.Refusal);
+            Outcome.Panels.push_back(AlignPanelNormal(SurfacePanel{ Quad.Surface }));
+        }
+        return Outcome;
+    }
+
+    // Concave closed loops (and planar N-gons): ear-clipping triangulation in the Newell projection + convex quad pairing.
+    if (AreaLength <= 1.0e-14) return Refuse("loop encloses zero projected area");
+    std::vector<int> Ring(Count);
+    std::iota(Ring.begin(), Ring.end(), 0);
+    double SignedArea2D = 0.0;
     for (size_t I = 0; I < Count; ++I)
     {
-        const auto Split = SplitNurbsCurve(MapCurveOntoUnit(*Edges[I].Definition), 0.5);
-        if (!Split) return Refuse("could not split polygon boundary edge");
-        FirstHalves[I]  = MapCurveOntoUnit(Split->first);
-        SecondHalves[I] = MapCurveOntoUnit(Split->second);
-        EdgeMids[I]     = FirstHalves[I].Poles.back();
-        AvgCorner       = AvgCorner + FirstHalves[I].Poles.front();
-        AvgMid          = AvgMid + EdgeMids[I];
+        const Vector2 A = Corners2D[I], B = Corners2D[(I + 1) % Count];
+        SignedArea2D += 0.5 * (A.X * B.Y - A.Y * B.X);
     }
-    AvgCorner = AvgCorner * (1.0 / static_cast<double>(Count));
-    AvgMid    = AvgMid * (1.0 / static_cast<double>(Count));
-    const Vector3 Centroid = AvgMid + (AvgMid - AvgCorner);
+    if (SignedArea2D < 0.0) std::reverse(Ring.begin(), Ring.end());
+
+    auto PointInTriangleCondition = [&](Vector2 Pt, Vector2 A, Vector2 B, Vector2 C) -> bool
+    {
+        const double Eps = -1.0e-10 * std::max(1.0, MaxSpan * MaxSpan);
+        return Cross2D(A, B, Pt) >= Eps && Cross2D(B, C, Pt) >= Eps && Cross2D(C, A, Pt) >= Eps;
+    };
+
+    std::vector<std::array<int, 3>> Triangles;
+    Triangles.reserve(Count - 2);
+    while (Ring.size() > 3)
+    {
+        const size_t RingSize = Ring.size();
+        int    BestSlot    = -1;
+        double BestQuality = -1.0;
+        for (size_t Slot = 0; Slot < RingSize; ++Slot)
+        {
+            const int Prev = Ring[(Slot + RingSize - 1) % RingSize];
+            const int Cur  = Ring[Slot];
+            const int Next = Ring[(Slot + 1) % RingSize];
+            const Vector2 A = Corners2D[Prev], B = Corners2D[Cur], C = Corners2D[Next];
+            const double TwiceArea = Cross2D(A, B, C);
+            if (!(TwiceArea > 1.0e-12 * std::max(1.0, MaxSpan * MaxSpan))) continue;
+            bool EmptyCondition = true;
+            for (size_t OtherSlot = 0; OtherSlot < RingSize; ++OtherSlot)
+            {
+                const int Other = Ring[OtherSlot];
+                if (Other == Prev || Other == Cur || Other == Next) continue;
+                if (PointInTriangleCondition(Corners2D[Other], A, B, C)) { EmptyCondition = false; break; }
+            }
+            if (!EmptyCondition) continue;
+            const double SideAB = (B.X - A.X) * (B.X - A.X) + (B.Y - A.Y) * (B.Y - A.Y);
+            const double SideBC = (C.X - B.X) * (C.X - B.X) + (C.Y - B.Y) * (C.Y - B.Y);
+            const double SideCA = (A.X - C.X) * (A.X - C.X) + (A.Y - C.Y) * (A.Y - C.Y);
+            const double Quality = TwiceArea / std::max(SideAB + SideBC + SideCA, 1.0e-30);
+            if (Quality > BestQuality) { BestQuality = Quality; BestSlot = static_cast<int>(Slot); }
+        }
+        if (BestSlot < 0)
+        {
+            // Fallback for near-collinear corner graze: clip largest positive turn.
+            double BestArea = -1.0e30;
+            for (size_t Slot = 0; Slot < RingSize; ++Slot)
+            {
+                const int Prev = Ring[(Slot + RingSize - 1) % RingSize];
+                const int Cur  = Ring[Slot];
+                const int Next = Ring[(Slot + 1) % RingSize];
+                const double TwiceArea = Cross2D(Corners2D[Prev], Corners2D[Cur], Corners2D[Next]);
+                if (TwiceArea > BestArea) { BestArea = TwiceArea; BestSlot = static_cast<int>(Slot); }
+            }
+            if (BestSlot < 0) return Refuse("concave polygon ear-clipping could not advance");
+        }
+        const size_t Slot = static_cast<size_t>(BestSlot);
+        Triangles.push_back({ Ring[(Slot + RingSize - 1) % RingSize], Ring[Slot], Ring[(Slot + 1) % RingSize] });
+        Ring.erase(Ring.begin() + static_cast<ptrdiff_t>(Slot));
+    }
+    if (Ring.size() == 3) Triangles.push_back({ Ring[0], Ring[1], Ring[2] });
+
+    auto DirectedEdge = [&](int From, int To) -> NurbsCurve
+    {
+        if (static_cast<size_t>(To) == (static_cast<size_t>(From) + 1) % Count) return Edges[static_cast<size_t>(From)];
+        if (static_cast<size_t>(From) == (static_cast<size_t>(To) + 1) % Count) return ReverseNurbsCurve(*Edges[static_cast<size_t>(To)].Definition);
+        return MakeSegmentCurve(Corners3D[static_cast<size_t>(From)], Corners3D[static_cast<size_t>(To)]);
+    };
+
+    auto WellShapedQuadCondition = [&](const std::array<int, 4>& QuadCorners) -> bool
+    {
+        for (int K = 0; K < 4; ++K)
+        {
+            const Vector2 Prev = Corners2D[static_cast<size_t>(QuadCorners[(K + 3) % 4])];
+            const Vector2 Cur  = Corners2D[static_cast<size_t>(QuadCorners[K])];
+            const Vector2 Next = Corners2D[static_cast<size_t>(QuadCorners[(K + 1) % 4])];
+            const Vector2 InVec{ Cur.X - Prev.X, Cur.Y - Prev.Y };
+            const Vector2 OutVec{ Next.X - Cur.X, Next.Y - Cur.Y };
+            const double LenIn = std::hypot(InVec.X, InVec.Y), LenOut = std::hypot(OutVec.X, OutVec.Y);
+            if (LenIn <= 1.0e-12 || LenOut <= 1.0e-12) return false;
+            const double Sine   = (InVec.X * OutVec.Y - InVec.Y * OutVec.X) / (LenIn * LenOut);
+            const double Cosine = (InVec.X * OutVec.X + InVec.Y * OutVec.Y) / (LenIn * LenOut);
+            if (Sine <= 0.25 || Cosine < -0.90) return false;
+        }
+        return true;
+    };
+
     NetworkSettings QuadSettings;
     QuadSettings.MeetingGap = std::max(5.0e-4, CornerTolerance);
-    for (size_t I = 0; I < Count; ++I)
+    std::vector<bool> Consumed(Triangles.size(), false);
+    for (size_t FirstIdx = 0; FirstIdx < Triangles.size(); ++FirstIdx)
     {
-        const size_t Prev = (I + Count - 1) % Count;
-        const NurbsCurve RadialPrev = MakeSegmentCurve(Centroid, EdgeMids[Prev]);
-        const NurbsCurve RadialCur  = MakeSegmentCurve(Centroid, EdgeMids[I]);
-        const NurbsCurve EdgeA      = NurbsCurve{ std::make_shared<NurbsCurveDefinition>(SecondHalves[Prev]) };
-        const NurbsCurve EdgeB      = ReverseNurbsCurve(FirstHalves[I]);
-        const NetworkSurfaceOutcome Quad = ConstructGordonSurface({ RadialPrev, EdgeB }, { RadialCur, EdgeA }, QuadSettings);
-        if (!Quad.Refusal.empty()) return Refuse(Quad.Refusal);
-        Outcome.Panels.push_back(SurfacePanel{ Quad.Surface });
+        if (Consumed[FirstIdx]) continue;
+        const auto& TriA = Triangles[FirstIdx];
+        bool PairedCondition = false;
+        for (size_t SecondIdx = FirstIdx + 1; SecondIdx < Triangles.size() && !PairedCondition; ++SecondIdx)
+        {
+            if (Consumed[SecondIdx]) continue;
+            const auto& TriB = Triangles[SecondIdx];
+            for (int SideA = 0; SideA < 3 && !PairedCondition; ++SideA)
+            {
+                const int U = TriA[SideA], V = TriA[(SideA + 1) % 3], OppA = TriA[(SideA + 2) % 3];
+                const bool BoundaryCondition = (static_cast<size_t>(V) == (static_cast<size_t>(U) + 1) % Count)
+                                            || (static_cast<size_t>(U) == (static_cast<size_t>(V) + 1) % Count);
+                if (BoundaryCondition) continue;
+                for (int SideB = 0; SideB < 3; ++SideB)
+                {
+                    if (TriB[SideB] == V && TriB[(SideB + 1) % 3] == U)
+                    {
+                        const int OppB = TriB[(SideB + 2) % 3];
+                        const std::array<int, 4> QuadIds = { OppA, U, OppB, V };
+                        if (!WellShapedQuadCondition(QuadIds)) break;
+                        const NurbsCurve Edge0 = DirectedEdge(QuadIds[0], QuadIds[1]);
+                        const NurbsCurve Edge1 = DirectedEdge(QuadIds[1], QuadIds[2]);
+                        const NurbsCurve Edge2 = DirectedEdge(QuadIds[2], QuadIds[3]);
+                        const NurbsCurve Edge3 = DirectedEdge(QuadIds[3], QuadIds[0]);
+                        const NetworkSurfaceOutcome Quad = ConstructGordonSurface(
+                            { Edge0, ReverseNurbsCurve(*Edge2.Definition) },
+                            { ReverseNurbsCurve(*Edge3.Definition), Edge1 },
+                            QuadSettings);
+                        if (Quad.Refusal.empty())
+                        {
+                            Outcome.Panels.push_back(AlignPanelNormal(SurfacePanel{ Quad.Surface }));
+                            Consumed[FirstIdx]  = true;
+                            Consumed[SecondIdx] = true;
+                            PairedCondition     = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (Consumed[FirstIdx]) continue;
+        const std::vector<NurbsCurve> TriEdges = {
+            DirectedEdge(TriA[0], TriA[1]),
+            DirectedEdge(TriA[1], TriA[2]),
+            DirectedEdge(TriA[2], TriA[0])
+        };
+        const LoftSurfaceOutcome Tri = LoftTriangularLoop(TriEdges, std::max(1.0e-4, CornerTolerance));
+        if (!Tri.Refusal.empty()) return Refuse(Tri.Refusal);
+        Outcome.Panels.push_back(AlignPanelNormal(SurfacePanel{ Tri.Surface }));
     }
     return Outcome;
 }

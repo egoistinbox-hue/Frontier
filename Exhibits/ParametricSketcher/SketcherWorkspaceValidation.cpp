@@ -870,6 +870,161 @@ int main()
         ++Passed;
     }
 
+    // 11. Blender-style GG vertex slide, rail switching, C unclamp, Mode 2 GG edge slide, and Mode 1 B-Rep vertex priority over consumed sketch
+    {
+        auto& State = Host.AccessState();
+        auto StepFrame = [&](auto&& Inject)
+        {
+            Inject();
+            ImGui::NewFrame();
+            Host.BeginFrame(1.0 / 60.0);
+            Dock.PresentWindowImGuiPanes(Components::HostWindowToken{ 0u });
+            Host.EndFrame(1.0 / 60.0, true, true);
+            ImGui::Render();
+        };
+
+        // Build a fresh document with a consumed sketch extruded into a box so sketch points & B-Rep vertices share Z = 0 corners.
+        State.Document = CreateSketcherDocument("VertexSlideWs");
+        SketcherDrawingRequest BaseRect {};
+        BaseRect.Kind            = SketcherDrawingCategory::Rectangle;
+        BaseRect.GridPlane       = 0;
+        BaseRect.ClosedCondition = true;
+        BaseRect.FillCondition   = true;
+        BaseRect.Points          = { { -1.0, -0.8 }, { 1.0, 0.8 } };
+        (void)DrawSketcherSketch(State.Document, BaseRect);
+        const std::string RectLabel = State.Document.Tree.Steps.back().Label;
+        (void)ExtrudeSketcherSketch(State.Document, RectLabel, 1.2, GeometrySpace::Parametric::FeatureCombination::New);
+        RefreshSketcherScene(State, false);
+        FitOrbitCamera(State.Camera, State.Scene.BoundsLow, State.Scene.BoundsHigh);
+        State.PickMode           = SketcherPickMode::ControlPoint;
+        State.FocusedStep        = {};
+        State.Document.Selection = {};
+        State.SketchPoints       = {};
+        StepFrame([&]() {});
+        StepFrame([&]() {});
+
+        // Pick a visible B-Rep vertex at Z = 0 (coincident with the consumed rectangle sketch!) via recorded BodyVertex widget
+        int    ChosenVertIdx = -1;
+        ImVec4 VertBox {};
+        for (size_t VIdx = 0; VIdx < State.Scene.Vertices.size(); ++VIdx)
+        {
+            if (std::abs(State.Scene.Vertices[VIdx].Position[2]) > 1.0e-4) continue;
+            if (const ImVec4* Box = State.Widgets.Find("BodyVertex" + std::to_string(VIdx)))
+            {
+                VertBox       = *Box;
+                ChosenVertIdx = int(VIdx);
+                break;
+            }
+        }
+        const float ClickX = 0.5f * (VertBox.x + VertBox.z);
+        const float ClickY = 0.5f * (VertBox.y + VertBox.w);
+        StepFrame([&]() { Io.AddMousePosEvent(ClickX, ClickY); });
+        StepFrame([&]() { Io.AddMouseButtonEvent(ImGuiMouseButton_Left, true); });
+        StepFrame([&]() { Io.AddMouseButtonEvent(ImGuiMouseButton_Left, false); });
+        StepFrame([&]() {});
+
+        const bool PickedBodyVertOverConsumedSketch =
+            ChosenVertIdx >= 0 &&
+            State.Document.Selection.Vertices.size() == 1u &&
+            State.SketchPoints.Points.empty() &&
+            State.Gizmo.Target == SketcherGizmoTarget::Shape &&
+            State.Gizmo.VertexCondition;
+
+        // Press G -> free Move with 3 incident slide rails; press G again (GG) -> enters SlideCondition!
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, false); });
+        const bool FirstGHasRails = State.Transform.ActiveCondition && !State.Transform.SlideCondition &&
+                                    State.Transform.SlideRails.size() == 3u;
+
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, false); });
+        const bool SecondGEntersSlide = State.Transform.ActiveCondition && State.Transform.SlideCondition;
+
+        // Move cursor along the first rail's actual screen direction: 40% along -> (0, 1), then 250% along -> clamped < 1.0, then C -> > 1.0!
+        // Probe a tiny step to see each rail's screen vector, or compute from two screen steps:
+        // Try 4 cardinal diagonals to find one that advances strongly (> 0.25) along an incident rail:
+        float BestDx = 60.0f, BestDy = 0.0f;
+        double BestProbe = -1.0;
+        for (const auto& Dir : std::array<std::pair<float, float>, 4>{{ { 80.0f, -30.0f }, { -80.0f, -30.0f }, { 80.0f, 30.0f }, { -80.0f, 30.0f } }})
+        {
+            StepFrame([&]() { Io.AddMousePosEvent(ClickX + Dir.first, ClickY + Dir.second); });
+            if (State.Transform.SlideFactor > BestProbe)
+            {
+                BestProbe = State.Transform.SlideFactor;
+                BestDx    = Dir.first;
+                BestDy    = Dir.second;
+            }
+        }
+        StepFrame([&]() { Io.AddMousePosEvent(ClickX + BestDx, ClickY + BestDy); });
+        const int    FirstRail   = State.Transform.ActiveSlideRail;
+        const double FirstFactor = State.Transform.SlideFactor;
+        bool CollinearOnRail = false;
+        if (FirstRail >= 0 && FirstRail < int(State.Transform.SlideRails.size()))
+        {
+            const SketcherSlideRail& R = State.Transform.SlideRails[size_t(FirstRail)];
+            const GeometrySpace::Parametric::Vector3 Expected = R.Origin + (R.Target - R.Origin) * FirstFactor;
+            CollinearOnRail = GeometrySpace::Parametric::Distance(State.Transform.DisplayPivot, Expected) < 1.0e-5;
+        }
+
+        // Move 12x along that exact rail screen direction to confirm default clamping (< 1.0), then press C to unclamp (> 1.0), then C again
+        StepFrame([&]() { Io.AddMousePosEvent(ClickX + BestDx * 12.0f, ClickY + BestDy * 12.0f); });
+        const double ClampedFar = State.Transform.SlideFactor;
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_C, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_C, false); });
+        const double UnclampedFar = State.Transform.SlideFactor;
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_C, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_C, false); });
+
+        // Move cursor back to the moderate offset along that rail and commit with Enter
+        const uint64_t RevBeforeSlide = State.Document.Revision;
+        StepFrame([&]() { Io.AddMousePosEvent(ClickX + BestDx * 0.5f, ClickY + BestDy * 0.5f); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_Enter, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_Enter, false); });
+        RefreshSketcherScene(State, false);
+        const bool VertexSlideCommitted = !State.Transform.ActiveCondition &&
+                                          State.Document.Revision > RevBeforeSlide &&
+                                          State.Document.Summary.SoundCondition &&
+                                          !State.Scene.Edges.empty();
+
+        // Mode 2 GG Edge Slide: select an edge, press G then G, slide, and commit
+        State.PickMode = SketcherPickMode::Edge;
+        State.Document.Selection = {};
+        State.Document.Selection.Edges = { State.Scene.Edges.front().Name };
+        StepFrame([&]() { Io.AddMousePosEvent(620.0f, 360.0f); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, false); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_G, false); });
+        const bool EdgeSlideActive = State.Transform.ActiveCondition && State.Transform.SlideCondition &&
+                                     !State.Transform.SlideRails.empty() && State.Transform.SlideRails.front().EdgePair;
+        const uint64_t RevBeforeEdgeSlide = State.Document.Revision;
+        for (const auto& Dir : std::array<std::pair<float, float>, 4>{{ { 55.0f, -25.0f }, { -55.0f, -25.0f }, { 55.0f, 25.0f }, { -55.0f, 25.0f } }})
+        {
+            StepFrame([&]() { Io.AddMousePosEvent(620.0f + Dir.first, 360.0f + Dir.second); });
+            if (State.Transform.SlideFactor > 0.05) break;
+        }
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_Enter, true); });
+        StepFrame([&]() { Io.AddKeyEvent(ImGuiKey_Enter, false); });
+        RefreshSketcherScene(State, false);
+        const bool EdgeSlideCommitted = !State.Transform.ActiveCondition &&
+                                        State.Document.Revision > RevBeforeEdgeSlide &&
+                                        State.Document.Summary.SoundCondition;
+
+        if (!VerifyCheck(PickedBodyVertOverConsumedSketch, "Mode 1 click picks 3D B-Rep vertex over coincident consumed sketch point") ||
+            !VerifyCheck(FirstGHasRails && SecondGEntersSlide, "Pressing G then G (GG) enters incident-edge Vertex Slide mode") ||
+            !VerifyCheck(CollinearOnRail && ClampedFar > 0.0 && ClampedFar < 1.0 && UnclampedFar > 1.0,
+                         "GG slides collinearly along incident edge, clamps within (0, 1), and C unclamps past 1.0") ||
+            !VerifyCheck(VertexSlideCommitted, "GG Vertex Slide commits a sound B-Rep reshape") ||
+            !VerifyCheck(EdgeSlideActive && EdgeSlideCommitted, "Mode 2 GG Edge Slide slides edge along side rails and commits"))
+        {
+            Host.Finalize();
+            Dock.Finalize();
+            ImGui::DestroyContext(Gui);
+            return 1;
+        }
+        ++Passed;
+    }
+
     Host.Finalize();
     Dock.Finalize();
     TypographyRepository::AssignCurrent(nullptr);

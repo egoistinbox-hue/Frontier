@@ -1316,10 +1316,27 @@ SketcherCommandOutcome ReshapeSketcherSelection(SketcherDocument& Document, cons
         MergeOwner(SketcherSelectionCategory::Edge, Selection.Edges);
         MergeOwner(SketcherSelectionCategory::Vertex, Selection.Vertices);
     }
+    std::vector<Vector3> ExpectedVertices;
+    if (Problem.empty() && Document.Partition && !Selection.Vertices.empty())
+    {
+        if (const RegeneratedBody* TargetBody = FindRegeneratedBody(Document, Owner))
+        {
+            for (const std::string& VName : Selection.Vertices)
+            {
+                for (const auto& [Slot, CandidateName] : TargetBody->Naming.Vertices)
+                {
+                    if (CandidateName != VName) continue;
+                    const Vector3 Was = Document.Partition->Vertices.Resolve(Document.Partition->Vertices.TokenAt(Slot)).Position;
+                    ExpectedVertices.push_back(Map.ColumnX * Was.X + Map.ColumnY * Was.Y + Map.ColumnZ * Was.Z + Map.Shift);
+                    break;
+                }
+            }
+        }
+    }
     std::vector<std::string> Names = Selection.Vertices;
     Names.insert(Names.end(), Selection.Edges.begin(), Selection.Edges.end());
     Names.insert(Names.end(), Selection.Faces.begin(), Selection.Faces.end());
-    return RunDirectEdit(Document, Label, Problem.empty() ? Owner : std::string(), Names, [&](FeatureStep& Step) -> std::string
+    SketcherCommandOutcome Outcome = RunDirectEdit(Document, Label, Problem.empty() ? Owner : std::string(), Names, [&](FeatureStep& Step) -> std::string
     {
         if (!Problem.empty()) return Problem;
         const std::string StepLabel = "Change#" + std::to_string(NextStepOrdinal(Document.Tree));
@@ -1334,6 +1351,33 @@ SketcherCommandOutcome ReshapeSketcherSelection(SketcherDocument& Document, cons
         Document.Captions[StepLabel] = NextCaption(Document, "Reshape");
         return {};
     });
+    // When an off-plane reshape splits an N-gon face, face disambiguation (/1, /2) updates incident vertex names;
+    // rebind any moved vertex whose name changed so the active vertex selection & gizmo stay anchored across edits.
+    if (Outcome.AcceptedCondition && Document.Partition && !ExpectedVertices.empty() && Document.Selection.Vertices.size() < ExpectedVertices.size())
+    {
+        if (const RegeneratedBody* TargetBody = FindRegeneratedBody(Document, Owner))
+        {
+            const BodyInventory Inventory = Document.Partition->CollectInventory(TargetBody->Body);
+            for (const Vector3& TargetPos : ExpectedVertices)
+            {
+                double      BestGap  = 1.0e-4;
+                std::string BestName = {};
+                for (VertexToken VToken : Inventory.Vertices)
+                {
+                    const auto FoundName = TargetBody->Naming.Vertices.find(VToken.Slot);
+                    if (FoundName == TargetBody->Naming.Vertices.end()) continue;
+                    const double Gap = Distance(Document.Partition->Vertices.Resolve(VToken).Position, TargetPos);
+                    if (Gap < BestGap) { BestGap = Gap; BestName = FoundName->second; }
+                }
+                if (!BestName.empty() &&
+                    std::find(Document.Selection.Vertices.begin(), Document.Selection.Vertices.end(), BestName) == Document.Selection.Vertices.end())
+                {
+                    Document.Selection.Vertices.push_back(BestName);
+                }
+            }
+        }
+    }
+    return Outcome;
 }
 
 SketcherCommandOutcome InsetSketcherSelection(SketcherDocument& Document, double Distance, double Depth)
@@ -1677,7 +1721,9 @@ SketcherCommandOutcome FlipSketcherFaces(SketcherDocument& Document, const std::
 SketcherCommandOutcome ExtrudeSketcherSketch(SketcherDocument& Document, const std::string& SketchLabel, double Distance, FeatureCombination Combination,
                                              const std::string& Target, double Start, bool FillCondition)
 {
-    const bool        FirstBodyCondition = !Document.Summary.PresentCondition && Combination != FeatureCombination::Separate;
+    const bool SolidPresentCondition = std::any_of(Document.Summary.Bodies.begin(), Document.Summary.Bodies.end(),
+                                                   [](const SketcherBodyFigures& Entry) { return !Entry.SheetCondition; });
+    const bool        FirstBodyCondition = !SolidPresentCondition && Combination != FeatureCombination::Separate;
     const std::string Caption = NextCaption(Document, "Extrude");
     const auto        Source  = Document.Captions.find(SketchLabel);
     const std::string Label   = Caption + " · " + (Source != Document.Captions.end() ? Source->second : SketchLabel) + " · " +
@@ -1701,7 +1747,7 @@ SketcherCommandOutcome ExtrudeSketcherSketch(SketcherDocument& Document, const s
         Step.Profile     = SketchLabel;
         Step.Extent      = FeatureScalar{ Distance };
         Step.Combination = FirstBodyCondition ? FeatureCombination::New : Combination;
-        Step.Target      = Target;
+        Step.Target      = FirstBodyCondition ? std::string{} : Target;
         Document.Captions[Step.Label] = Caption;
         Document.Tree.Steps.push_back(std::move(Step));
         return {};
@@ -1723,7 +1769,11 @@ OrthonormalBasis SketcherSketchPlane(int GridPlane) noexcept
 
 bool SketcherSketchConsumedCondition(const SketcherDocument& Document, const std::string& SketchLabel)
 {
-    return std::any_of(Document.Tree.Steps.begin(), Document.Tree.Steps.end(), [&](const FeatureStep& Step) { return Step.Profile == SketchLabel; });
+    return std::any_of(Document.Tree.Steps.begin(), Document.Tree.Steps.end(), [&](const FeatureStep& Step)
+    {
+        return Step.Profile == SketchLabel || Step.Path == SketchLabel ||
+               std::find(Step.Sections.begin(), Step.Sections.end(), SketchLabel) != Step.Sections.end();
+    });
 }
 
 bool SketcherSketchReferencedCondition(const SketcherDocument& Document, const std::string& SketchLabel)
@@ -5380,7 +5430,9 @@ namespace
 SketcherCommandOutcome RevolveSketcherSketch(SketcherDocument& Document, const std::string& Sketch, const SketcherRevolveAxis& Axis, double Angle, FeatureCombination Combination,
                                              const std::string& Target)
 {
-    const bool        FirstBodyCondition = !Document.Summary.PresentCondition && Combination != FeatureCombination::Separate;
+    const bool SolidPresentCondition = std::any_of(Document.Summary.Bodies.begin(), Document.Summary.Bodies.end(),
+                                                   [](const SketcherBodyFigures& Entry) { return !Entry.SheetCondition; });
+    const bool        FirstBodyCondition = !SolidPresentCondition && Combination != FeatureCombination::Separate;
     const std::string Caption = NextCaption(Document, "Revolve");
     const std::string Label   = Caption + " · " + SketcherBodyCaption(Document, Sketch) + " · " + FormatAmount(Angle * 180.0 / std::numbers::pi) + "° about " +
                                 DescribeSketcherRevolveAxis(Document, Sketch, Axis) + " · " + (FirstBodyCondition ? "New" : FeatureCombinationLabel(Combination));
@@ -5398,7 +5450,7 @@ SketcherCommandOutcome RevolveSketcherSketch(SketcherDocument& Document, const s
         if (Axis.Line < 0) { Step.AxisOrigin = Axis.Origin; Step.AxisDirection = Axis.Direction; }
         Step.Angle          = FeatureScalar{ Angle };
         Step.Combination    = FirstBodyCondition ? FeatureCombination::New : Combination;
-        Step.Target         = Target;
+        Step.Target         = FirstBodyCondition ? std::string{} : Target;
         Document.Captions[Step.Label] = Caption;
         Document.Tree.Steps.push_back(std::move(Step));
         return {};
@@ -5407,7 +5459,9 @@ SketcherCommandOutcome RevolveSketcherSketch(SketcherDocument& Document, const s
 
 SketcherCommandOutcome EvolveSketcherProfile(SketcherDocument& Document, const std::string& Profile, const std::string& Path, FeatureCombination Combination, const std::string& Target)
 {
-    const bool        FirstBodyCondition = !Document.Summary.PresentCondition && Combination != FeatureCombination::Separate;
+    const bool SolidPresentCondition = std::any_of(Document.Summary.Bodies.begin(), Document.Summary.Bodies.end(),
+                                                   [](const SketcherBodyFigures& Entry) { return !Entry.SheetCondition; });
+    const bool        FirstBodyCondition = !SolidPresentCondition && Combination != FeatureCombination::Separate;
     const std::string Caption = NextCaption(Document, "Evolution");
     const std::string Label   = Caption + " · " + SketcherBodyCaption(Document, Profile) + " along " + (Path.empty() ? std::string("?") : SketcherBodyCaption(Document, Path)) + " · " +
                                 (FirstBodyCondition ? "New" : FeatureCombinationLabel(Combination));
@@ -5425,7 +5479,7 @@ SketcherCommandOutcome EvolveSketcherProfile(SketcherDocument& Document, const s
         Step.Profile     = Profile;
         Step.Path        = Path;
         Step.Combination = FirstBodyCondition ? FeatureCombination::New : Combination;
-        Step.Target      = Target;
+        Step.Target      = FirstBodyCondition ? std::string{} : Target;
         Document.Captions[Step.Label] = Caption;
         Document.Tree.Steps.push_back(std::move(Step));
         Document.Selection = {};

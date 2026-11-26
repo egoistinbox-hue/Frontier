@@ -433,40 +433,57 @@ enum class SketcherTransformTarget : uint8_t
     ImagePlanes  = 7,                                                                        // Focused/selected reference image plane (.ImageSpace / image)
 };
 
+// Incident edge / curve rail available during a Blender-style GG vertex / point / pole / edge slide session.
+struct SketcherSlideRail
+{
+    GeometrySpace::Parametric::Vector3              Origin       = {};                       // [len] - Start point at factor 0
+    GeometrySpace::Parametric::Vector3              Target       = {};                       // [len] - Neighbour endpoint at factor 1
+    std::vector<GeometrySpace::Parametric::Vector3> Samples      = {};                       // [len] - Sampled 3D rail curve from Origin to Target
+    std::string                                     EdgeLabel    = {};                       // [-]   - Display label of the rail edge / curve
+    bool                                            EdgePair     = false;                    // [-]   - True when sliding both endpoints of a B-rep edge
+    GeometrySpace::Parametric::Vector3              SecondOrigin = {};                       // [len] - Second edge endpoint at factor 0
+    GeometrySpace::Parametric::Vector3              SecondTarget = {};                       // [len] - Second edge neighbour at factor 1
+};
+
 struct SketcherTransformSession
 {
-    bool                              ActiveCondition    = false;                            // [-]   - Session open
-    SketcherTransformVerb             Verb               = SketcherTransformVerb::Move;      // [-]   - G / R / S
-    SketcherTransformTarget           TargetKind         = SketcherTransformTarget::Bodies;  // [-]   - Entity class transformed
-    bool                              DuplicateCondition = false;                            // [-]   - Shift+D: commit copies
-    std::vector<std::string>          Keys               = {};                               // [-]   - Bodies / sketches / faces / edges / vertices moved
-    GeometrySpace::Parametric::Vector3       FaceNormal         = {};                               // [-]   - Area-weighted outward normal for face targets
-    std::string                       PointOwner         = {};                               // [-]   - Sketch / curve label for point/pole targets
-    std::vector<int>                  PointIndices       = {};                               // [-]   - Picked sketch points or curve poles
-    int                               Axis               = -1;                               // [-]   - −1 screen · 0 x · 1 y · 2 z
-    bool                              PlaneCondition     = false;                            // [-]   - Move / Scale in the plane normal to Axis
-    bool                              StartCondition     = false;                            // [-]   - Pointer anchor taken
-    bool                              LeftDragCondition  = false;                            // [-]   - LMB held & dragged inside modal session
-    ImVec2                            Start              = {};                               // [px]  - Anchor (screen)
-    ImVec2                            StartLocal         = {};                               // [px]  - Anchor (viewport)
-    GeometrySpace::Parametric::Vector3                 Pivot              = {};                               // [len] - Bounds centre of the target
-    GeometrySpace::Parametric::Vector3                 DisplayPivot       = {};                               // [len] - Live shifted pivot for gizmo & axis line
-    bool                              AnchorCondition    = false;                            // [-]   - Move started on an object snap
-    GeometrySpace::Parametric::Vector3                 Anchor             = {};                               // [len] - That snap point (moves onto the target snap)
-    std::string                       AnchorSource       = {};                               // [-]   - "Endpoint · Edge …"
-    std::string                       Typed              = {};                               // [-]   - Typed amount
-    double                            CurrentValue       = 0.0;                              // [-]   - Live scalar (m, °, ×) shown in Inspector numeric field
-    std::array<char, 48>              ValueText          = {};                               // [-]   - Editable numeric text buffer in Inspector session card
-    GeometrySpace::Parametric::AffineMapping     Map                = {};                               // [-]   - Current map
-    GeometrySpace::Parametric::AffineMapping               StagedMap          = {};                               // [-]   - Map the preview shows
-    bool                              StagedCondition    = false;                            // [-]   - A preview was built
-    std::unique_ptr<SketcherDocument> Preview            = {};                               // [-]   - Staged document
-    SketcherScene                     PreviewScene       = {};                               // [-]   - Its display arrays
-    bool                              RigidCondition     = false;                            // [-]   - PreviewScene is the shown scene mapped (no regeneration)
-    std::string                       Readout            = {};                               // [-]   - "Move x 0.3"
-    std::string                       Refusal            = {};                               // [-]   - Why commit is refused
-    int                               Commits            = 0;                                // [-]   - Committed (script evidence)
-    bool                              SketchCondition    = false;                            // [-]   - Keys are sketch steps (2D objects), no bodies picked
+    bool                              ActiveCondition         = false;                       // [-]   - Session open
+    SketcherTransformVerb             Verb                    = SketcherTransformVerb::Move; // [-]   - G / R / S
+    SketcherTransformTarget           TargetKind              = SketcherTransformTarget::Bodies; // [-] - Entity class transformed
+    bool                              DuplicateCondition      = false;                       // [-]   - Shift+D: commit copies
+    std::vector<std::string>          Keys                    = {};                          // [-]   - Bodies / sketches / faces / edges / vertices moved
+    GeometrySpace::Parametric::Vector3 FaceNormal             = {};                          // [-]   - Area-weighted outward normal for face targets
+    std::string                       PointOwner              = {};                          // [-]   - Sketch / curve label for point/pole targets
+    std::vector<int>                  PointIndices            = {};                          // [-]   - Picked sketch points or curve poles
+    int                               Axis                    = -1;                          // [-]   - −1 screen · 0 x · 1 y · 2 z
+    bool                              PlaneCondition          = false;                       // [-]   - Move / Scale in the plane normal to Axis
+    bool                              SlideCondition          = false;                       // [-]   - GG: slide along incident edge / curve rails
+    bool                              SlideUnclampedCondition = false;                       // [-]   - C / Alt: allow extending slide past [0, 1]
+    int                               ActiveSlideRail         = -1;                          // [-]   - Active rail index in SlideRails
+    double                            SlideFactor             = 0.0;                         // [-]   - Normalized slide parameter along ActiveSlideRail
+    std::vector<SketcherSlideRail>    SlideRails              = {};                          // [-]   - Candidate incident edge / curve rails for GG
+    bool                              StartCondition          = false;                       // [-]   - Pointer anchor taken
+    bool                              LeftDragCondition       = false;                       // [-]   - LMB held & dragged inside modal session
+    ImVec2                            Start                   = {};                          // [px]  - Anchor (screen)
+    ImVec2                            StartLocal              = {};                          // [px]  - Anchor (viewport)
+    GeometrySpace::Parametric::Vector3 Pivot                  = {};                          // [len] - Bounds centre of the target
+    GeometrySpace::Parametric::Vector3 DisplayPivot           = {};                          // [len] - Live shifted pivot for gizmo & axis line
+    bool                              AnchorCondition         = false;                       // [-]   - Move started on an object snap
+    GeometrySpace::Parametric::Vector3 Anchor                 = {};                          // [len] - That snap point (moves onto the target snap)
+    std::string                       AnchorSource            = {};                          // [-]   - "Endpoint · Edge …"
+    std::string                       Typed                   = {};                          // [-]   - Typed amount
+    double                            CurrentValue            = 0.0;                         // [-]   - Live scalar (m, °, ×) shown in Inspector numeric field
+    std::array<char, 48>              ValueText               = {};                          // [-]   - Editable numeric text buffer in Inspector session card
+    GeometrySpace::Parametric::AffineMapping Map              = {};                          // [-]   - Current map
+    GeometrySpace::Parametric::AffineMapping StagedMap        = {};                          // [-]   - Map the preview shows
+    bool                              StagedCondition         = false;                       // [-]   - A preview was built
+    std::unique_ptr<SketcherDocument> Preview                 = {};                          // [-]   - Staged document
+    SketcherScene                     PreviewScene            = {};                          // [-]   - Its display arrays
+    bool                              RigidCondition          = false;                       // [-]   - PreviewScene is the shown scene mapped (no regeneration)
+    std::string                       Readout                 = {};                          // [-]   - "Move x 0.3"
+    std::string                       Refusal                 = {};                          // [-]   - Why commit is refused
+    int                               Commits                 = 0;                           // [-]   - Committed (script evidence)
+    bool                              SketchCondition         = false;                       // [-]   - Keys are sketch steps (2D objects), no bodies picked
 };
 
 // 📝 Multi-view split layouts inside the docked Viewport panel (never undocked; draggable splitters adjust SplitX / SplitY).

@@ -1899,6 +1899,29 @@ void FinishDrawingSession(SketcherWorkspaceStatus& State, bool ClosedCondition)
     const bool RepeatSegment = Drawing.SegmentCondition;
     const SketchSplineForm RepeatForm = Drawing.Form;
     const int RepeatSides = Drawing.Sides;
+    const auto DrawingCaptionStem = [&](bool SurfaceTrace) -> std::string
+    {
+        std::string Base;
+        if (Drawing.Kind == SketcherDrawingCategory::Line)
+        {
+            Base = (Drawing.SegmentCondition || Drawing.Points.size() <= 2) ? "Line" : "Polyline";
+        }
+        else if (Drawing.Kind == SketcherDrawingCategory::Curve)
+        {
+            switch (Drawing.Form)
+            {
+            case SketchSplineForm::Hermite:     Base = "Hermite"; break;
+            case SketchSplineForm::Bezier:      Base = "Bezier";  break;
+            case SketchSplineForm::Nurbs:       Base = "NURBS";   break;
+            case SketchSplineForm::CubicSpline: Base = "Spline";  break;
+            }
+        }
+        else
+        {
+            Base = SketcherDrawingLabel(Drawing.Kind);
+        }
+        return SurfaceTrace ? (Base + " Trace") : Base;
+    };
     if (Drawing.SurfaceCondition || (State.DrawingAutoSplit && !KnifeCondition &&
         (Drawing.Kind == SketcherDrawingCategory::Curve || Drawing.Kind == SketcherDrawingCategory::Line)))
     {
@@ -1909,7 +1932,8 @@ void FinishDrawingSession(SketcherWorkspaceStatus& State, bool ClosedCondition)
             ? ConstructReferenceConformingTrace(State.Document, Controls, Drawing.Kind, Drawing.Form, ClosedCondition)
             : MakeSketcherControlTrace(Controls, Drawing.Kind, Drawing.Form, ClosedCondition);
         if (!Trace.Refusal.empty()) { Drawing.Refusal = Legible(Trace.Refusal); Announce(State, Drawing.Refusal); return; }
-        const SketcherCommandOutcome Outcome = Trace.Arc ? DrawSketcherSketch(State.Document, *Trace.Arc) : DrawSketcherProjectedCurve(State.Document, Trace.Curve, ClosedCondition, State.DrawingAutoSplit, State.DrawingIntersectionTolerance, State.DrawingAutoSurface);
+        const std::string Stem = DrawingCaptionStem(Drawing.SurfaceCondition);
+        const SketcherCommandOutcome Outcome = Trace.Arc ? DrawSketcherSketch(State.Document, *Trace.Arc) : DrawSketcherProjectedCurve(State.Document, Trace.Curve, ClosedCondition, State.DrawingAutoSplit, State.DrawingIntersectionTolerance, State.DrawingAutoSurface, Stem);
         if (Outcome.AcceptedCondition)
         {
             Drawing.ActiveCondition = false;
@@ -1919,8 +1943,8 @@ void FinishDrawingSession(SketcherWorkspaceStatus& State, bool ClosedCondition)
         if (Outcome.AcceptedCondition)
         {
             Announce(State, ConformToReference
-                ? Compose("Surface-conformed trace · %zu clicked controls · auto-split crossings active", Drawing.Points.size())
-                : Compose("Surface-point trace · %zu placed controls · auto-split crossings active", Drawing.Points.size()));
+                ? Compose("%s (surface-conformed) · %zu controls", Stem.c_str(), Drawing.Points.size())
+                : Compose("%s · %zu controls", Stem.c_str(), Drawing.Points.size()));
             RearmSketchTool(State, RepeatKind, RepeatCentre, RepeatSegment, RepeatForm, RepeatSides);
         }
         return;
@@ -1929,6 +1953,7 @@ void FinishDrawingSession(SketcherWorkspaceStatus& State, bool ClosedCondition)
     {
         Drawing.ActiveCondition = false;
         SketcherCommandOutcome Outcome {};
+        const std::string Stem = DrawingCaptionStem(false);
         if (State.DrawingAutoSplit || State.DrawingAutoSurface)
         {
             const auto Trace = MakeSketcherControlTrace(Lifted, Drawing.Kind, Drawing.Form, ClosedCondition);
@@ -1939,11 +1964,11 @@ void FinishDrawingSession(SketcherWorkspaceStatus& State, bool ClosedCondition)
                 return;
             }
             Outcome = Trace.Arc ? DrawSketcherSketch(State.Document, *Trace.Arc)
-                                : DrawSketcherProjectedCurve(State.Document, Trace.Curve, ClosedCondition, State.DrawingAutoSplit, State.DrawingIntersectionTolerance, State.DrawingAutoSurface);
+                                : DrawSketcherProjectedCurve(State.Document, Trace.Curve, ClosedCondition, State.DrawingAutoSplit, State.DrawingIntersectionTolerance, State.DrawingAutoSurface, Stem);
         }
         else
         {
-            Outcome = DrawSketcherSpaceCurve(State.Document, Lifted, ClosedCondition, Drawing.Form);
+            Outcome = DrawSketcherSpaceCurve(State.Document, Lifted, ClosedCondition, Drawing.Form, Stem);
         }
         if (Outcome.AcceptedCondition) State.FocusedStep = State.Document.Tree.Steps.back().Label;
         Conclude(State, Outcome);
@@ -7297,30 +7322,58 @@ void DrawSweepOutline(SketcherWorkspaceStatus& State, ImDrawList* Canvas, const 
 }
 
 // J / Inspector Join: two or more picked sketches join into the first picked (touching or not: one sketch, several
-// profiles); otherwise the focused sketch (else the newest) welds with every coplanar sketch touching it.
+// All selected curve-like steps (both 2D Sketch and 3D/planar SpaceCurve) eligible for Join (Ctrl+J / J).
+[[nodiscard]] std::vector<std::string> SelectedJoinableCurveLabels(const SketcherDocument& Document)
+{
+    std::vector<std::string> Labels;
+    for (const std::string& Label : Document.Selection.Curves)
+    {
+        for (const FeatureStep& Step : Document.Tree.Steps)
+        {
+            if (Step.Label == Label && (Step.Kind == FeatureStepCategory::Sketch || Step.Kind == FeatureStepCategory::SpaceCurve))
+            {
+                Labels.push_back(Label);
+                break;
+            }
+        }
+    }
+    return Labels;
+}
+
+// profiles); otherwise the focused curve/sketch (else the newest) welds with every touching curve/sketch.
 void JoinSketches(SketcherWorkspaceStatus& State)
 {
-    const std::vector<std::string> Picked = SelectedSketchLabels(State.Document);
+    const std::vector<std::string> Picked = SelectedJoinableCurveLabels(State.Document);
     if (Picked.size() >= 2)
     {
         const SketcherCommandOutcome Outcome = JoinSketcherSketches(State.Document, Picked);
         if (Outcome.AcceptedCondition)
         {
-            // The first picked sketch carries the join, unless a later step reads it (kept hidden): then the join is the
-            // new last step.
-            State.FocusedStep = SketcherCurveHiddenCondition(State.Document, Picked.front()) ? State.Document.Tree.Steps.back().Label : Picked.front();
-            State.Document.Selection.Curves = { State.FocusedStep };
+            const std::string Result = !State.Document.Selection.Curves.empty()
+                ? State.Document.Selection.Curves.front()
+                : (SketcherCurveHiddenCondition(State.Document, Picked.front()) ? State.Document.Tree.Steps.back().Label : Picked.front());
+            State.FocusedStep = Result;
+            State.Document.Selection.Curves = { Result };
         }
         Conclude(State, Outcome);
         return;
     }
-    std::string Base = FocusedSketchCondition(State) ? State.FocusedStep : std::string{};
-    if (Base.empty()) for (auto Step = State.Document.Tree.Steps.rbegin(); Step != State.Document.Tree.Steps.rend() && Base.empty(); ++Step) if (Step->Kind == FeatureStepCategory::Sketch) Base = Step->Label;
-    if (Base.empty()) { Announce(State, "Join (J) needs sketches: draw some first"); return; }
+    std::string Base;
+    if (Picked.size() == 1) Base = Picked.front();
+    else if (FocusedSketchCondition(State)) Base = State.FocusedStep;
+    if (Base.empty())
+    {
+        for (auto Step = State.Document.Tree.Steps.rbegin(); Step != State.Document.Tree.Steps.rend() && Base.empty(); ++Step)
+            if (Step->Kind == FeatureStepCategory::Sketch || Step->Kind == FeatureStepCategory::SpaceCurve) Base = Step->Label;
+    }
+    if (Base.empty()) { Announce(State, "Join (Ctrl+J / J) needs curves or sketches: draw some first"); return; }
     const std::vector<std::string> Group = SketcherJoinCandidates(State.Document, Base);
-    if (Group.size() < 2) { Announce(State, "Join (J): no other sketch touches " + CaptionOf(State.Document, Base) + " (draw from its ends, or across it)"); return; }
+    if (Group.size() < 2) { Announce(State, "Join (Ctrl+J / J): select 2+ curves/sketches or draw touching curves next to " + CaptionOf(State.Document, Base)); return; }
     const SketcherCommandOutcome Outcome = JoinSketcherSketches(State.Document, Group);
-    if (Outcome.AcceptedCondition) State.FocusedStep = Base;
+    if (Outcome.AcceptedCondition)
+    {
+        State.FocusedStep = !State.Document.Selection.Curves.empty() ? State.Document.Selection.Curves.front() : Base;
+    }
     Conclude(State, Outcome);
 }
 
@@ -9328,32 +9381,49 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
     const ImGuiIO& Io   = ImGui::GetIO();
     const double   Lead = BevelHandleLead * Frame.WorldPerPixel;
     const OrbitRay Ray  = CastOrbitRay(Frame, Local.x, Local.y);
+    const auto EffectiveClampCeiling = [&](const SketcherBlendFit& Fit, BlendProfile Shape, bool ClampOn) -> double
+    {
+        if (!ClampOn) return 0.0;
+        const auto& Merges = Shape == BlendProfile::Chamfer ? Fit.ChamferMerges : Fit.FilletMerges;
+        double Best = 0.0;
+        for (const double Merge : Merges)
+            if (Merge > 1.0e-6 && (Best == 0.0 || Merge < Best)) Best = Merge;
+        if (Best <= 0.0 && Fit.Span > 1.0e-6) Best = Fit.Span;
+        return Best;
+    };
     if (Bevel.DragHandle >= 0 && Bevel.DragHandle < int(Bevel.Handles.size()))
     {
         const SketcherBlendHandle& Handle = Bevel.Handles[size_t(Bevel.DragHandle)];
-        const std::optional<double> Parameter = Bevel.DragScreenCondition ? std::optional<double>((Io.MousePos.x - Bevel.DragLast) * Frame.WorldPerPixel)
-                                                                          : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
+        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
+        const bool UseScreen = Bevel.DragScreenCondition || RayAlign > 0.90;
+        const std::optional<double> Parameter = UseScreen ? std::optional<double>((Io.MousePos.x - Bevel.DragLast) * Frame.WorldPerPixel)
+                                                          : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
         if (Parameter)
         {
             // Along the bisector the grip stays under the pointer: the bevel's mid-line moves with it, so pushing the
             // grip into the body deepens the bevel (depth / rate = size); a grip facing the camera sizes by pointer x.
-            const double Moved = (*Parameter - Bevel.DragOrigin) * (Io.KeyShift ? 0.1 : 1.0);   // [len] - Grip travel
-            double Size = Bevel.DragScreenCondition ? Bevel.DragSize + Moved : Bevel.DragSize - Moved / BevelHandleDepthRate(Bevel, Bevel.DragHandle);
+            const double Moved = (UseScreen ? *Parameter : (*Parameter - Bevel.DragOrigin)) * (Io.KeyShift ? 0.1 : 1.0);   // [len] - Grip travel
+            double Size = UseScreen ? Bevel.DragSize + Moved : Bevel.DragSize - Moved / BevelHandleDepthRate(Bevel, Bevel.DragHandle);
             Size = std::max(1.0e-3, Io.KeyCtrl ? std::round(Size * 1.0e6) * 1.0e-6 : std::round(Size * 1.0e3) * 1.0e-3);
             // Detent (the report "when we bevel and edges / vertices come close together they must merge"): within a few
             // pixels of a size where the rails meet a neighbour edge or each other, the size sits exactly on it, so the
             // modeller fuses them (one ridge, one apex) instead of leaving a sliver face. Ctrl drags free.
-            if (Bevel.DragHandle == 0 && !Io.KeyCtrl && Bevel.Verb == SketcherSessionVerb::Blend)
+            if (!Io.KeyCtrl && Bevel.Verb == SketcherSessionVerb::Blend)
             {
-                const double Rate = Bevel.DragScreenCondition ? 1.0 : std::max(0.2, BevelHandleDepthRate(Bevel, 0));
+                const double Rate = UseScreen ? 1.0 : std::max(0.2, BevelHandleDepthRate(Bevel, Bevel.DragHandle));
                 const double Band = BevelMergeBand * Frame.WorldPerPixel / Rate;            // [len] - Size caught
                 for (const double Merge : Bevel.Shape == BlendProfile::Chamfer ? Bevel.Fit.ChamferMerges : Bevel.Fit.FilletMerges)
                 {
                     if (std::abs(Size - Merge) > Band) continue;
-                    if (Size != Merge) ++Bevel.MergeSnaps;
+                    if (Bevel.DragHandle == 0 && Size != Merge) ++Bevel.MergeSnaps;
                     Size = Merge;
                     break;
                 }
+            }
+            if (Bevel.DragHandle > 0)
+            {
+                const double ClampMax = EffectiveClampCeiling(Bevel.Fit, Bevel.Shape, Bevel.ClampOverlapEnabled);
+                if (ClampMax > 1.0e-6 && Size > ClampMax) Size = ClampMax;
             }
             Size = BoundBevelValue(State, Bevel.DragHandle, Size);                           // Stops at the largest accepted size
             if (Bevel.DragHandle == 0) Bevel.Size = Size;
@@ -9386,11 +9456,19 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
     if (Bevel.HoverHandle >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         const SketcherBlendHandle& Handle = Bevel.Handles[size_t(Bevel.HoverHandle)];
+        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
+        const bool   UseScreen = Facing || RayAlign > 0.90;
         Bevel.DragHandle          = Bevel.HoverHandle;
-        Bevel.DragScreenCondition = Facing;
+        Bevel.DragScreenCondition = UseScreen;
         Bevel.DragLast            = Io.MousePos.x;
-        Bevel.DragOrigin          = Facing ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
-        Bevel.DragSize        = BevelHandleSize(Bevel, Bevel.HoverHandle);
+        Bevel.DragOrigin          = UseScreen ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
+        double StartDragSize      = BevelHandleSize(Bevel, Bevel.HoverHandle);
+        if (Bevel.DragHandle > 0)
+        {
+            const double ClampMax = EffectiveClampCeiling(Bevel.Fit, Bevel.Shape, Bevel.ClampOverlapEnabled);
+            if (ClampMax > 1.0e-6 && StartDragSize > ClampMax) StartDragSize = ClampMax;
+        }
+        Bevel.DragSize        = StartDragSize;
         Bevel.PinnedCondition = true;                                                        // The handles drive the size from now on
         if (Bevel.DragHandle > 0)
         {
@@ -9455,23 +9533,37 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
     const ImGuiIO& Io   = ImGui::GetIO();
     const double   Lead = BevelHandleLead * Frame.WorldPerPixel;
     const OrbitRay Ray  = CastOrbitRay(Frame, Local.x, Local.y);
+    const auto EffectiveClampCeiling = [&]() -> double
+    {
+        if (!Controls.ClampOverlapEnabled) return 0.0;
+        const auto& Merges = Controls.Shape == BlendProfile::Chamfer ? Controls.Fit.ChamferMerges : Controls.Fit.FilletMerges;
+        double Best = 0.0;
+        for (const double Merge : Merges)
+            if (Merge > 1.0e-6 && (Best == 0.0 || Merge < Best)) Best = Merge;
+        if (Best <= 0.0 && Controls.Fit.Span > 1.0e-6) Best = Controls.Fit.Span;
+        return Best;
+    };
 
     if (Controls.DragHandle >= 0 && Controls.DragHandle < int(Controls.Handles.size()))
     {
         const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.DragHandle)];
-        const std::optional<double> Parameter = Controls.DragScreenCondition
+        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
+        const bool UseScreen = Controls.DragScreenCondition || RayAlign > 0.90;
+        const std::optional<double> Parameter = UseScreen
             ? std::optional<double>((Io.MousePos.x - Controls.DragLast) * Frame.WorldPerPixel)
             : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
         if (Parameter)
         {
-            const double Moved = (*Parameter - Controls.DragOrigin) * (Io.KeyShift ? 0.1 : 1.0);
-            double Size = Controls.DragScreenCondition
+            const double Moved = (UseScreen ? *Parameter : (*Parameter - Controls.DragOrigin)) * (Io.KeyShift ? 0.1 : 1.0);
+            double Size = UseScreen
                 ? Controls.DragSize + Moved
                 : Controls.DragSize - Moved / PersistentBevelHandleDepthRate(Controls, Controls.DragHandle);
             Size = std::max(1.0e-3, Io.KeyCtrl ? std::round(Size * 1.0e6) * 1.0e-6 : std::round(Size * 1.0e3) * 1.0e-3);
-            if (Controls.DragHandle == 0 && !Io.KeyCtrl)
+            const double Reach = Controls.Shape == BlendProfile::Chamfer ? Controls.Fit.ChamferReach : Controls.Fit.FilletReach;
+            if (Reach > 1.0e-6 && Size > Reach) Size = Reach;
+            if (!Io.KeyCtrl)
             {
-                const double Rate = Controls.DragScreenCondition ? 1.0 : std::max(0.2, PersistentBevelHandleDepthRate(Controls, 0));
+                const double Rate = UseScreen ? 1.0 : std::max(0.2, PersistentBevelHandleDepthRate(Controls, Controls.DragHandle));
                 const double Band = BevelMergeBand * Frame.WorldPerPixel / Rate;
                 for (const double Merge : Controls.Shape == BlendProfile::Chamfer ? Controls.Fit.ChamferMerges : Controls.Fit.FilletMerges)
                 {
@@ -9481,6 +9573,11 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
                         break;
                     }
                 }
+            }
+            if (Controls.DragHandle > 0)
+            {
+                const double ClampMax = EffectiveClampCeiling();
+                if (ClampMax > 1.0e-6 && Size > ClampMax) Size = ClampMax;
             }
 
             const double CurrentSize = PersistentBevelHandleSize(Controls, Controls.DragHandle);
@@ -9562,11 +9659,19 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
     if (Controls.HoverHandle >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.HoverHandle)];
+        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
+        const bool   UseScreen = Facing || RayAlign > 0.90;
         Controls.DragHandle           = Controls.HoverHandle;
-        Controls.DragScreenCondition  = Facing;
+        Controls.DragScreenCondition  = UseScreen;
         Controls.DragLast             = Io.MousePos.x;
-        Controls.DragOrigin           = Facing ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
-        Controls.DragSize             = PersistentBevelHandleSize(Controls, Controls.HoverHandle);
+        Controls.DragOrigin           = UseScreen ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
+        double StartDragSize          = PersistentBevelHandleSize(Controls, Controls.HoverHandle);
+        if (Controls.DragHandle > 0)
+        {
+            const double ClampMax = EffectiveClampCeiling();
+            if (ClampMax > 1.0e-6 && StartDragSize > ClampMax) StartDragSize = ClampMax;
+        }
+        Controls.DragSize             = StartDragSize;
         Controls.DragMutatedCondition = false;
         Controls.DragHistoryRecorded  = false;
         if (Controls.DragHandle > 0) Controls.FocusCorner = Controls.DragHandle;
@@ -10380,7 +10485,15 @@ void DrawDrawingPreview(SketcherWorkspaceStatus& State, ImDrawList* Canvas, cons
     {
         // A 3D curve in the making: the through-curve in space, its points as dots (the live one white).
         std::vector<ImVec2> Pixels;
-        for (const Vector3& Sample : SampleThroughCurve(Lifted, false, Drawing.Form, 24)) { ImVec2 Out; if (ProjectWorldPoint(State, Frame, Sample, Out)) Pixels.push_back(Out); }
+        if (Drawing.Kind == SketcherDrawingCategory::Line)
+        {
+            for (const Vector3& Pt : Lifted) { ImVec2 Out; if (ProjectWorldPoint(State, Frame, Pt, Out)) Pixels.push_back(Out); }
+        }
+        else
+        {
+            const int AdaptiveSteps = std::clamp(int(Lifted.size()) * 16, 32, 256);
+            for (const Vector3& Sample : SampleThroughCurve(Lifted, false, Drawing.Form, AdaptiveSteps)) { ImVec2 Out; if (ProjectWorldPoint(State, Frame, Sample, Out)) Pixels.push_back(Out); }
+        }
         if (Pixels.size() >= 2) Canvas->AddPolyline(Pixels.data(), int(Pixels.size()), ActiveColour, 2.0f);
         for (size_t Index = 0; Index < Lifted.size(); ++Index)
         {
@@ -10471,16 +10584,110 @@ NurbsCurveDefinition DisplayedDefinition(const SketcherWorkspaceStatus& State, c
     return Shown;
 }
 
-std::vector<ImVec2> ProjectFittedCurve(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, const NurbsCurveDefinition& Definition)
+std::vector<ImVec2> ProjectFittedCurve(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, const NurbsCurveDefinition& Definition, bool* AllProjected = nullptr)
 {
-    const NurbsDomain   Domain = MeasureNurbsCurveDomain(Definition);
     std::vector<ImVec2> Pixels;
-    for (int Index = 0; Index <= CurveSamples; ++Index)
+    bool EveryPointProjected = true;
+
+    // Degree-1 curves (Line / Polyline) have exact straight segments between poles: never sample across corners!
+    if (Definition.Degree <= 1)
     {
-        ImVec2 Pixel;
-        const double τ = Domain.Low + (Domain.High - Domain.Low) * Index / CurveSamples;
-        if (ProjectWorldPoint(State, Frame, EvaluateNurbsCurve(Definition, τ).Position, Pixel)) Pixels.push_back(Pixel);
+        Pixels.reserve(Definition.Poles.size());
+        for (const Vector3& Pole : Definition.Poles)
+        {
+            ImVec2 Pixel;
+            if (ProjectWorldPoint(State, Frame, Pole, Pixel)) Pixels.push_back(Pixel);
+            else EveryPointProjected = false;
+        }
+        if (AllProjected) *AllProjected = EveryPointProjected && Pixels.size() >= 2;
+        return Pixels;
     }
+
+    const NurbsDomain Domain = MeasureNurbsCurveDomain(Definition);
+    std::vector<double> Spans;
+    Spans.push_back(Domain.Low);
+    for (double Knot : Definition.Knots)
+    {
+        if (Knot > Spans.back() + 1.0e-12 && Knot < Domain.High - 1.0e-12) Spans.push_back(Knot);
+    }
+    if (Domain.High > Spans.back() + 1.0e-12) Spans.push_back(Domain.High);
+    if (Spans.size() < 2)
+    {
+        if (AllProjected) *AllProjected = false;
+        return Pixels;
+    }
+
+    // Seed enough initial intervals per knot span (at least 6, scaled for long single-span curves like Bezier)
+    // and then adaptively subdivide in screen space until every chord deviates by < 0.6 px.
+    constexpr float  MaxChordErrorPx = 0.60f;
+    constexpr int    MaxSubdivDepth  = 8;
+    constexpr size_t MaxPoints       = 4096;
+    const int BaseSubsPerSpan = std::clamp(int(std::ceil(24.0 / double(std::max<size_t>(1, Spans.size() - 1)))), 6, 32);
+
+    auto AppendPoint = [&](const ImVec2& Pt)
+    {
+        if (Pixels.empty() || std::hypot(Pt.x - Pixels.back().x, Pt.y - Pixels.back().y) > 0.15f)
+        {
+            Pixels.push_back(Pt);
+        }
+    };
+
+    auto Subdivide = [&](auto&& Self, double T0, const ImVec2& P0, bool Ok0, double T1, const ImVec2& P1, bool Ok1, int Depth) -> void
+    {
+        if (Pixels.size() >= MaxPoints) return;
+        const double Tm = 0.5 * (T0 + T1);
+        ImVec2 Pm;
+        const bool Okm = ProjectWorldPoint(State, Frame, EvaluateNurbsCurve(Definition, Tm).Position, Pm);
+        if (!Okm) EveryPointProjected = false;
+
+        bool NeedSplit = false;
+        if (Depth < MaxSubdivDepth && (T1 - T0) > 1.0e-9)
+        {
+            if (Ok0 && Ok1 && Okm)
+            {
+                const float Dx = P1.x - P0.x;
+                const float Dy = P1.y - P0.y;
+                const float Len = std::hypot(Dx, Dy);
+                const float ChordErr = Len > 1.0e-4f
+                    ? std::fabs((Pm.x - P0.x) * Dy - (Pm.y - P0.y) * Dx) / Len
+                    : std::hypot(Pm.x - P0.x, Pm.y - P0.y);
+                // Also split very long screen chords so S-curves with an inflection near the midpoint never flatten.
+                if (ChordErr > MaxChordErrorPx || (Depth < 3 && Len > 48.0f)) NeedSplit = true;
+            }
+            else if (Ok0 != Ok1 && Depth < 4)
+            {
+                NeedSplit = true;
+            }
+        }
+        if (NeedSplit)
+        {
+            Self(Self, T0, P0, Ok0, Tm, Pm, Okm, Depth + 1);
+            Self(Self, Tm, Pm, Okm, T1, P1, Ok1, Depth + 1);
+        }
+        else
+        {
+            if (Okm) AppendPoint(Pm);
+            if (Ok1) AppendPoint(P1);
+        }
+    };
+
+    for (size_t SpanIdx = 0; SpanIdx + 1 < Spans.size(); ++SpanIdx)
+    {
+        const double A = Spans[SpanIdx];
+        const double B = Spans[SpanIdx + 1];
+        for (int Step = 0; Step < BaseSubsPerSpan; ++Step)
+        {
+            const double T0 = A + (B - A) * double(Step) / double(BaseSubsPerSpan);
+            const double T1 = A + (B - A) * double(Step + 1) / double(BaseSubsPerSpan);
+            ImVec2 P0, P1;
+            const bool Ok0 = ProjectWorldPoint(State, Frame, EvaluateNurbsCurve(Definition, T0).Position, P0);
+            const bool Ok1 = ProjectWorldPoint(State, Frame, EvaluateNurbsCurve(Definition, T1).Position, P1);
+            if (!Ok0 || !Ok1) EveryPointProjected = false;
+            if (SpanIdx == 0 && Step == 0 && Ok0) Pixels.push_back(P0);
+            Subdivide(Subdivide, T0, P0, Ok0, T1, P1, Ok1, 0);
+        }
+    }
+    if (AllProjected) *AllProjected = EveryPointProjected && Pixels.size() >= 2;
     return Pixels;
 }
 
@@ -10614,9 +10821,10 @@ bool PickSplineSpan(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Fram
         {
             double Distance=1e100; ImVec2 A,B;
             if(ProjectWorldPoint(State,Frame,D.Poles[I],A) && ProjectWorldPoint(State,Frame,D.Poles[I+1],B)) Distance=Gap(A,B);
-            for(int J=0;J<16;++J)
-                if(ProjectWorldPoint(State,Frame,EvaluateNurbsCurve(D,T[I]+(T[I+1]-T[I])*J/16.0).Position,A) &&
-                   ProjectWorldPoint(State,Frame,EvaluateNurbsCurve(D,T[I]+(T[I+1]-T[I])*(J+1)/16.0).Position,B)) Distance=std::min(Distance,Gap(A,B));
+            const int SpanSubs = D.Degree <= 1 ? 1 : 24;
+            for(int J=0;J<SpanSubs;++J)
+                if(ProjectWorldPoint(State,Frame,EvaluateNurbsCurve(D,T[I]+(T[I+1]-T[I])*J/double(SpanSubs)).Position,A) &&
+                   ProjectWorldPoint(State,Frame,EvaluateNurbsCurve(D,T[I]+(T[I+1]-T[I])*(J+1)/double(SpanSubs)).Position,B)) Distance=std::min(Distance,Gap(A,B));
             if(Distance<Best) {Best=Distance;Label=Name;Span=I;}
         }
     }
@@ -14444,8 +14652,9 @@ void SelectInBox(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, 
     {
         const CurveFitOutcome* Fit = Step.Kind == FeatureStepCategory::SpaceCurve ? FindFittedCurve(State.Document, Step.Label) : nullptr;
         if (!Fit || !CurveReachableCondition(State.Document, Step.Label)) continue;
-        const std::vector<ImVec2> Pixels = ProjectFittedCurve(State, Frame, *Fit->Curve.Definition);
-        if (int(Pixels.size()) != CurveSamples + 1) continue;                               // Partly off screen / behind the eye
+        bool AllProjected = false;
+        const std::vector<ImVec2> Pixels = ProjectFittedCurve(State, Frame, *Fit->Curve.Definition, &AllProjected);
+        if (!AllProjected || Pixels.size() < 2) continue;                                   // Partly off screen / behind the eye
         const bool Inside = std::all_of(Pixels.begin(), Pixels.end(), [&](ImVec2 Pixel) { return Pixel.x >= Low.x && Pixel.x <= High.x && Pixel.y >= Low.y && Pixel.y <= High.y; });
         if (!Inside) continue;
         const bool Member = CurveOrder(State, Step.Label) > 0;
@@ -18561,11 +18770,11 @@ void DrawSelectionToolCards(SketcherWorkspaceStatus& State)
                                    || (Selection.Curves.size() == 1 && (!Selection.Bodies.empty() || !Selection.Faces.empty()));
         if (PressButton(State, "Loft  (L)###CurveLoft", RowSpan(), CanLoftSelection)) LoftSelectedCurves(State);
         ImGui::SameLine();
-        const size_t Sketches = SelectedSketchLabels(State.Document).size();
-        if (PressButton(State, "Join  (J)###CurveJoin", RowSpan(), Sketches >= 2 && !State.Bevel.ActiveCondition)) JoinSketches(State);
+        const size_t Joinable = SelectedJoinableCurveLabels(State.Document).size();
+        if (PressButton(State, "Join  (Ctrl+J)###CurveJoin", RowSpan(), Joinable >= 2 && !State.Bevel.ActiveCondition)) JoinSketches(State);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", Sketches >= 2 ? "Join the picked sketches into one (in pick order); a sketch a body still reads is kept hidden"
-                                                  : "Shift-click two or more coplanar sketches to join them");
+            ImGui::SetTooltip("%s", Joinable >= 2 ? "Join the picked curves / polylines / sketches into one (Ctrl+J or J); coplanar curves merge into an extrudable 2D sketch"
+                                                  : "Shift-click two or more curves, polylines, or sketches to join them (Ctrl+J)");
         // Wrap / project round a curve (a label round a can: text + circle), or the flat Flow along it (a new sketch).
         {
             static const char* const ModeLabels[] = { "Wrap###FlowWrap", "Project###FlowProject", "Flat###FlowFlat" };
@@ -22015,6 +22224,7 @@ void ApplyShortcuts(SketcherWorkspaceStatus& State)
         if (Pressed(ImGuiKey_C)) CopyBodies(State);                                         // edit:copy
         if (Pressed(ImGuiKey_V)) PasteBodies(State);                                        // edit:paste
         if (Pressed(ImGuiKey_H)) ChangeVisibility(State, SketcherVisibilityVerb::InvertHidden);   // invert-hidden
+        if (Pressed(ImGuiKey_J) && !Shift && !Alternate) JoinSketches(State);                   // Ctrl+J: join selected curves / polylines / sketches
         if (Pressed(ImGuiKey_G)) Announce(State, "Group: not available");
         if (Pressed(ImGuiKey_D)) { if(Shift) SubdividePickedSpline(State); else OpenTransformSession(State, SketcherTransformVerb::Move, true); }
         if (Pressed(ImGuiKey_1) || Pressed(ImGuiKey_2) || Pressed(ImGuiKey_3) || Pressed(ImGuiKey_4)) Announce(State, "Selection convert: not available yet");

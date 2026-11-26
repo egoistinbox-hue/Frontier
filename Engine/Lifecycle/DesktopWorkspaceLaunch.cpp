@@ -1615,6 +1615,7 @@ int LaunchDesktopWorkspace(
                      !Io.WantTextInput &&
                      !DesktopWindow.CloseRequested())
             {
+                DesktopWindow.WaitOperatingEventsTimeout(0.016);
                 continue;
             }
         }

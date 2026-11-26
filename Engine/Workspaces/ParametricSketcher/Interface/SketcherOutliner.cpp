@@ -86,17 +86,40 @@ std::string CaptionOfStep(const SketcherDocument& Document, const std::string& L
     return Found != Document.Captions.end() && !Found->second.empty() ? Found->second : Label;
 }
 
-// WorkspacePanel.js FigureIcon: the glyph of a sketch follows its curves.
-IconSymbol SketchIcon(const SketchModel& Sketch)
+// WorkspacePanel.js FigureIcon: the glyph of a sketch follows its tool/caption and curves.
+IconSymbol SketchIcon(const SketchModel& Sketch, const std::string& Caption = {})
 {
+    auto StartsWithCI = [&](const char* Prefix) -> bool
+    {
+        size_t I = 0;
+        for (; Prefix[I] != '\0' && I < Caption.size(); ++I)
+        {
+            if (std::tolower(static_cast<unsigned char>(Caption[I])) != std::tolower(static_cast<unsigned char>(Prefix[I]))) return false;
+        }
+        return Prefix[I] == '\0';
+    };
+    if (StartsWithCI("Polyline"))  return IconSymbol::SketcherPolyline;
+    if (StartsWithCI("Line"))      return IconSymbol::SketcherEdge;
+    if (StartsWithCI("Slot"))      return IconSymbol::SketcherSlot;
+    if (StartsWithCI("Polygon"))   return IconSymbol::SketcherPolygon;
+    if (StartsWithCI("Rectangle")) return IconSymbol::SketcherRectangle;
+    if (StartsWithCI("Centre rect")) return IconSymbol::SketcherCentrerect;
+    if (StartsWithCI("Circle"))    return IconSymbol::SketcherCircle;
+    if (StartsWithCI("Arc"))       return IconSymbol::SketcherArc;
+    if (StartsWithCI("Hermite"))   return IconSymbol::SketcherHermite;
+    if (StartsWithCI("Bezier"))    return IconSymbol::SketcherBezier;
+    if (StartsWithCI("NURBS"))     return IconSymbol::SketcherNurbs;
+    if (StartsWithCI("Cubic") || StartsWithCI("Spline")) return IconSymbol::SketcherCurve;
+
     int Lines = 0;
+    int Arcs  = 0;
     for (const SketchCurve& Curve : Sketch.Curves)
     {
         if (Curve.Construction) continue;
         switch (Curve.Kind)
         {
         case SketchCurveCategory::Circle: return IconSymbol::SketcherCircle;
-        case SketchCurveCategory::Arc:    return IconSymbol::SketcherArc;
+        case SketchCurveCategory::Arc:    ++Arcs; break;
         case SketchCurveCategory::Spline:
             switch (Curve.Form)
             {
@@ -108,7 +131,45 @@ IconSymbol SketchIcon(const SketchModel& Sketch)
         case SketchCurveCategory::Line: ++Lines; break;
         }
     }
-    return Lines == 4 ? IconSymbol::SketcherRectangle : Lines > 1 ? IconSymbol::SketcherPolyline : IconSymbol::SketcherEdge;
+    if (Arcs == 2 && Lines == 2) return IconSymbol::SketcherSlot;
+    if (Arcs > 0) return IconSymbol::SketcherArc;
+    if (Lines == 4 && Sketch.Points.size() == 4) return IconSymbol::SketcherRectangle;
+    return Lines > 1 ? IconSymbol::SketcherPolyline : IconSymbol::SketcherEdge;
+}
+
+IconSymbol SpaceCurveIcon(const SketcherDocument& Document, const FeatureStep& Step, const std::string& Caption)
+{
+    auto StartsWithCI = [&](const char* Prefix) -> bool
+    {
+        size_t I = 0;
+        for (; Prefix[I] != '\0' && I < Caption.size(); ++I)
+        {
+            if (std::tolower(static_cast<unsigned char>(Caption[I])) != std::tolower(static_cast<unsigned char>(Prefix[I]))) return false;
+        }
+        return Prefix[I] == '\0';
+    };
+    if (StartsWithCI("Polyline")) return IconSymbol::SketcherPolyline;
+    if (StartsWithCI("Line"))     return IconSymbol::SketcherEdge;
+    if (StartsWithCI("Hermite"))  return IconSymbol::SketcherHermite;
+    if (StartsWithCI("Bezier"))   return IconSymbol::SketcherBezier;
+    if (StartsWithCI("NURBS"))    return IconSymbol::SketcherNurbs;
+    if (StartsWithCI("Spline") || StartsWithCI("Cubic")) return IconSymbol::SketcherCurve;
+    if (StartsWithCI("Arc"))      return IconSymbol::SketcherArc;
+    if (StartsWithCI("Circle"))   return IconSymbol::SketcherCircle;
+    if (StartsWithCI("Rectangle")) return IconSymbol::SketcherRectangle;
+    if (StartsWithCI("Polygon"))  return IconSymbol::SketcherPolygon;
+    if (StartsWithCI("Slot"))     return IconSymbol::SketcherSlot;
+
+    const auto FitIt = Document.Regeneration.Curves.find(Step.Label);
+    if (FitIt != Document.Regeneration.Curves.end() && FitIt->second.Curve.Definition)
+    {
+        const auto& Def = *FitIt->second.Curve.Definition;
+        if (Def.Degree <= 1)
+        {
+            return Def.Poles.size() <= 2 ? IconSymbol::SketcherEdge : IconSymbol::SketcherPolyline;
+        }
+    }
+    return IconSymbol::SketcherNurbs;
 }
 
 // .icon-button: 28 px circle, #888 glyph; hover #292929 / #fff.
@@ -183,10 +244,11 @@ std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus
         {
             // Extruded / revolved sketches stay listed, so their leftover lines can be hidden or locked too.
             const auto Solved = Document.Regeneration.Sketches.find(Step.Label);
+            const std::string RawCaption = Figure.Name;
             if (SketcherSketchConsumedCondition(Document, Step.Label)) Figure.Name += " sketch";
             const auto Order         = std::find(Picked.Curves.begin(), Picked.Curves.end(), Step.Label);
             Figure.Source            = SketcherFigureSource::Sketch;
-            Figure.Icon              = SketchIcon(Solved != Document.Regeneration.Sketches.end() ? Solved->second : Step.Sketch);
+            Figure.Icon              = SketchIcon(Solved != Document.Regeneration.Sketches.end() ? Solved->second : Step.Sketch, RawCaption);
             Figure.Rank              = Order == Picked.Curves.end() ? -1 : int(Order - Picked.Curves.begin());
             Figure.SelectedCondition = Figure.Rank >= 0
                                     || (State.FocusedStep == Step.Label && Picked.Bodies.empty() && Picked.Faces.empty() && Picked.Edges.empty());
@@ -196,7 +258,7 @@ std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus
         {
             const auto Order = std::find(Picked.Curves.begin(), Picked.Curves.end(), Step.Label);
             Figure.Source            = SketcherFigureSource::SpaceCurve;
-            Figure.Icon              = IconSymbol::SketcherNurbs;
+            Figure.Icon              = SpaceCurveIcon(Document, Step, Figure.Name);
             Figure.Rank              = Order == Picked.Curves.end() ? -1 : int(Order - Picked.Curves.begin());
             Figure.SelectedCondition = Figure.Rank >= 0;
         }
@@ -509,6 +571,7 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
     const float Pitch      = Outliner.CompactEnabled ? CompactHeight : RowHeight;
     const float Limit      = std::max(80.0f, FooterTop - CaptionHeight - Y);
     const float EmptyBlock = 18.0f + 2.0f * 18.0f + 18.0f;                                   // .empty-note: padding 18, two 1.8 em lines
+    const float TotalRowsHeight = std::max(Shown.empty() ? EmptyBlock : Pitch * float(Shown.size()), 1.0f);
     const float RowsHeight = Outliner.FoldedEnabled ? 0.0f : std::clamp(Shown.empty() ? EmptyBlock : Pitch * float(Shown.size()), 80.0f, Limit);
     if (RowsHeight > 0.0f)
     {
@@ -518,20 +581,28 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 6.0f);
         ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(1, 1, 1, 0.12f));
-        ImGui::BeginChild("SceneRows", ImVec2(Width, RowsHeight), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+        ImGui::SetNextWindowContentSize(ImVec2(0.0f, TotalRowsHeight));
+        ImGui::BeginChild("SceneRows", ImVec2(Width, RowsHeight), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoNav);
         ImDrawList* const RowsDrawList = ImGui::GetWindowDrawList();
         const float RowsTop = ImGui::GetCursorScreenPos().y;
         const float ScrollY = ImGui::GetScrollY();
+        ImGui::Dummy(ImVec2(1.0f, TotalRowsHeight));
 
         // Mirror Frontier Editor's OutlinerPanel RetainedCanvasCache: when the cursor is outside the rows viewport
         // and content/scroll/layout haven't changed, replay the cached ImDrawList in ~3 us with zero layout/shaping!
         thread_local RetainedCanvasCache RowsCanvasCache {};
+        thread_local float               LastObservedScrollY = -1.0f;
         const Rectangle2D RowsBounds { Left, Y, Width, RowsHeight };
         const ImVec2 MousePos = ImGui::GetIO().MousePos;
         const Point2D MousePt { MousePos.x, MousePos.y };
         const bool PointerInRows =
             MousePos.x >= Left && MousePos.x <= (Left + Width) &&
             MousePos.y >= Y    && MousePos.y <= (Y + RowsHeight);
+        const bool ScrollingNow = std::fabs(ScrollY - LastObservedScrollY) > 0.01f || std::fabs(ImGui::GetIO().MouseWheel) > 1.0e-4f;
+        LastObservedScrollY = ScrollY;
+        const bool RowsWindowHovered =
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+            !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
         uint64_t RowsSig = RetainedCanvasCache::MixBounds(0x5011DAC00711E402ull, RowsBounds, 1.0f);
         RowsSig = RetainedCanvasCache::MixHash(RowsSig, FiguresSig);
         RowsSig = RetainedCanvasCache::MixHash(RowsSig, static_cast<uint64_t>(Outliner.Filter + 16));
@@ -539,7 +610,7 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
         RowsSig = RetainedCanvasCache::MixHash(RowsSig, static_cast<uint64_t>(std::llround(ScrollY * 4.0f)));
         RowsSig = MixString(RowsSig, Query);
 
-        const bool ForceRowsRebuild = PointerInRows || ImGui::IsAnyMouseDown() || ImGui::GetIO().MouseWheel != 0.0f;
+        const bool ForceRowsRebuild = PointerInRows || RowsWindowHovered || ScrollingNow || ImGui::IsAnyMouseDown();
         const bool ReplayedRows =
             RowsDrawList != nullptr &&
             RowsCanvasCache.QueryReusableStationary(RowsSig, RowsBounds, MousePt, ForceRowsRebuild) &&
@@ -566,7 +637,7 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
         }
         else
         {
-            const bool CaptureNow = RowsDrawList != nullptr && !PointerInRows && !ImGui::IsAnyMouseDown();
+            const bool CaptureNow = RowsDrawList != nullptr && !PointerInRows && !RowsWindowHovered && !ScrollingNow && !ImGui::IsAnyMouseDown();
             if (CaptureNow)
             {
                 RowsCanvasCache.BeginCapture(RowsDrawList);
@@ -578,6 +649,23 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
                 Rows.Text(Left + 18.0f, RowsTop + 18.0f + 9.0f, 10.0f, Ink(MutedInk), "No matching geometry.");
                 Rows.Text(Left + 18.0f, RowsTop + 18.0f + 27.0f, 10.0f, Ink(MutedInk), "Construct a shape or open a document.");
             }
+            const bool CanHitRow = RowsWindowHovered && MousePos.x < (Left + Width - 8.0f) && MousePos.y >= Y && MousePos.y <= (Y + RowsHeight);
+            const bool LeftClicked = CanHitRow && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+            auto HitExtent = [&](const std::string& Key, const PlaneExtent& Extent) -> SketcherPress
+            {
+                State.Widgets.Record(Key, ImVec2(Extent.MinimumX, Extent.MinimumY), ImVec2(Extent.MaximumX, Extent.MaximumY));
+                SketcherPress Press {};
+                if (CanHitRow &&
+                    MousePos.x >= Extent.MinimumX && MousePos.x <= Extent.MaximumX &&
+                    MousePos.y >= Extent.MinimumY && MousePos.y <= Extent.MaximumY)
+                {
+                    Press.HoveredCondition = true;
+                    Press.ClickedCondition = LeftClicked;
+                    Press.HeldCondition    = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+                    Press.DoubleCondition  = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                }
+                return Press;
+            };
             const float ViewMinY = Y - Pitch;
             const float ViewMaxY = Y + RowsHeight + Pitch;
             for (size_t Index = 0; Index < Shown.size(); ++Index)
@@ -590,7 +678,7 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
                 const float           Opacity = Figure.HiddenCondition ? 0.45f : 1.0f;            // .hidden-figure
                 const PlaneExtent     Eye     = Spanning(Row.MaximumX - 1.0f - 9.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
                 const PlaneExtent     Lock    = Spanning(Eye.MinimumX - 2.0f - 23.0f, Centre - 11.5f, 23.0f, 23.0f);
-                const SketcherPress   Press   = PressSketcherRegion(State.Widgets, "Figure:" + Figure.Key, PlaneExtent{ Row.MinimumX, Row.MinimumY, Lock.MinimumX - 4.0f, Row.MaximumY });
+                const SketcherPress   Press   = HitExtent("Figure:" + Figure.Key, PlaneExtent{ Row.MinimumX, Row.MinimumY, Lock.MinimumX - 4.0f, Row.MaximumY });
                 const bool            Active  = Figure.SelectedCondition && Figure.Rank == 0;
                 const ColorQuad       Accent  = Active ? Ink(ActiveInk) : Ink(SelectedInk);
                 if (Figure.SelectedCondition)
@@ -613,12 +701,12 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
                                                       SketcherWeight::Light, 0.5f);
                 Rows.TextClipped(RowCursor, Centre, Lock.MinimumX - 9.0f - TagWidth - 9.0f - RowCursor, 11.0f, ControlKit::Faded(Ink(TextInk), Opacity), Figure.Name.c_str(),
                                  SketcherWeight::Regular);
-                const SketcherPress Toggle = PressSketcherRegion(State.Widgets, "Visibility:" + Figure.Key, Eye);
+                const SketcherPress Toggle = HitExtent("Visibility:" + Figure.Key, Eye);
                 if (Toggle.HoveredCondition) Rows.Box(Eye, Ink(HoverFill), 11.5f);
                 const ColorQuad EyeInk = Toggle.HoveredCondition ? Ink(0xffffff) : Ink(0x858585);
                 Rows.Icon(Figure.HiddenCondition ? IconSymbol::SketcherHidden : IconSymbol::SketcherEye, Eye.MinimumX + 4.5f, Eye.MinimumY + 4.5f, 14.0f,
                           ControlKit::Faded(EyeInk, Opacity));
-                const SketcherPress Latch = PressSketcherRegion(State.Widgets, "Lock:" + Figure.Key, Lock);
+                const SketcherPress Latch = HitExtent("Lock:" + Figure.Key, Lock);
                 if (Latch.HoveredCondition) Rows.Box(Lock, Ink(HoverFill), 11.5f);
                 const ColorQuad LockInk = Latch.HoveredCondition ? Ink(0xffffff) : Figure.LockedCondition ? Ink(0xffd24d) : Ink(0x858585, 0.55f);
                 LockGlyph(Rows, 0.5f * (Lock.MinimumX + Lock.MaximumX), 0.5f * (Lock.MinimumY + Lock.MaximumY), Figure.LockedCondition, ControlKit::Faded(LockInk, Opacity));
@@ -679,8 +767,6 @@ SketcherOutlinerIntent ConstructSketcherOutliner(SketcherWorkspaceStatus& State,
                 GlobalOutlinerCanvasCaptures.fetch_add(1ull, std::memory_order_relaxed);
             }
         }
-        ImGui::SetCursorScreenPos(ImVec2(Left, RowsTop));
-        ImGui::Dummy(ImVec2(1.0f, std::max(Shown.empty() ? EmptyBlock : Pitch * float(Shown.size()), 1.0f)));
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(2);

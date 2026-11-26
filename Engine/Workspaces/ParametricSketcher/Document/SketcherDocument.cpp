@@ -104,6 +104,32 @@ constexpr double Pi = std::numbers::pi;
     }
 }
 
+// Next free 3-digit zero-padded caption ("Polyline 001", "Bezier 002", …) for curve & sketch tools.
+[[nodiscard]] std::string NextPaddedCaption(const SketcherDocument& Document, const std::string& Stem)
+{
+    for (int Ordinal = 1;; ++Ordinal)
+    {
+        char Buffer[16];
+        std::snprintf(Buffer, sizeof(Buffer), "%03d", Ordinal);
+        const std::string Caption = Stem + " " + Buffer;
+        const bool UsedCondition  = std::any_of(Document.Captions.begin(), Document.Captions.end(),
+                                                [&](const auto& Entry) { return Entry.second == Caption; });
+        if (!UsedCondition) return Caption;
+    }
+}
+
+[[nodiscard]] std::string SplineToolStem(SketchSplineForm Form)
+{
+    switch (Form)
+    {
+    case SketchSplineForm::Hermite:     return "Hermite";
+    case SketchSplineForm::Bezier:      return "Bezier";
+    case SketchSplineForm::Nurbs:       return "NURBS";
+    case SketchSplineForm::CubicSpline: return "Spline";
+    }
+    return "Curve";
+}
+
 struct TileAuthoring
 {
     FeatureTree&       Tree;
@@ -539,7 +565,7 @@ SketcherCommandOutcome RunAppearanceCommand(SketcherDocument& Document, const st
 //    of existing steps: WatchFrom) a step at or after WatchFrom that regenerated before now refuses.
 template <typename Change>
 SketcherCommandOutcome RunCommand(SketcherDocument& Document, const std::string& Label, bool CaptureCondition, Change&& Apply,
-                                  size_t WatchFrom = std::numeric_limits<size_t>::max())
+                                  size_t WatchFrom = std::numeric_limits<size_t>::max(), bool PushUndo = true)
 {
     FRONTIER_TRACE_SCOPE("Command", Label);
     const auto                  Start         = std::chrono::steady_clock::now();
@@ -565,9 +591,18 @@ SketcherCommandOutcome RunCommand(SketcherDocument& Document, const std::string&
         return Outcome;
     }
     FRONTIER_TRACE("Command", "accepted · " + std::to_string(Document.Tree.Steps.size()) + " step(s) · " + std::to_string(Document.Regeneration.Bodies.size()) + " body(ies)");
-    Document.UndoEntries.push_back(std::move(Before));
-    Document.RedoEntries.clear();
-    TrimHistoryReplay(Document);
+    if (PushUndo)
+    {
+        Document.UndoEntries.push_back(std::move(Before));
+        Document.RedoEntries.clear();
+        TrimHistoryReplay(Document);
+    }
+    else if (!Document.UndoEntries.empty())
+    {
+        // Live continuous drag: keep the single pre-drag snapshot and update its caption to the latest value.
+        Document.UndoEntries.back().Label = Label;
+        Document.RedoEntries.clear();
+    }
     Outcome.AcceptedCondition = true;
     Outcome.Milliseconds      = ElapsedMs(Start);
     return Outcome;
@@ -1292,7 +1327,16 @@ SketcherCommandOutcome UpdateSketcherBlendStep(SketcherDocument& Document, const
 {
     const std::string Stem  = Request.Shape == BlendProfile::Fillet ? "Fillet" : "Chamfer";
     const std::string Label = "Edit " + Stem + " " + FormatAmount(Request.Size);
-    return RunCommand(Document, Label, RecordUndo, [&]() -> std::string
+    size_t WatchFrom = 0;
+    for (size_t Idx = 0; Idx < Document.Tree.Steps.size(); ++Idx)
+    {
+        if (Document.Tree.Steps[Idx].Label == StepLabel && Document.Tree.Steps[Idx].Kind == FeatureStepCategory::Blend)
+        {
+            WatchFrom = Idx;
+            break;
+        }
+    }
+    return RunCommand(Document, Label, false, [&]() -> std::string
     {
         if (Request.Size <= 0.0) return "the blend size must be positive";
         if (Request.EndSize.has_value() && Request.VertexSizes.empty() && !(*Request.EndSize > 0.0)) return "the end blend size must be positive";
@@ -1377,7 +1421,7 @@ SketcherCommandOutcome UpdateSketcherBlendStep(SketcherDocument& Document, const
             TargetStep->AnchorSizes.clear();
         }
         return {};
-    });
+    }, WatchFrom, RecordUndo);
 }
 
 // 💡 Where a direct edit (face change, reshape) of body Owner goes in the history: before the body's trailing fillets /
@@ -1760,8 +1804,12 @@ std::string ComposeSketcherSketch(const SketcherDrawingRequest& Request, SketchM
 
 SketcherCommandOutcome DrawSketcherSketch(SketcherDocument& Document, const SketcherDrawingRequest& Request)
 {
-    const std::string Stem    = Request.Kind == SketcherDrawingCategory::Curve ? std::string("Curve") : SketcherDrawingLabel(Request.Kind);
-    const std::string Caption = NextCaption(Document, Stem);
+    std::string Stem;
+    if (Request.Kind == SketcherDrawingCategory::Curve) Stem = SplineToolStem(Request.Form);
+    else if (Request.Kind == SketcherDrawingCategory::Line) Stem = Request.Points.size() > 2 ? "Polyline" : "Line";
+    else if (Request.Kind == SketcherDrawingCategory::Rectangle && Request.CentreCondition) Stem = "Centre Rect";
+    else Stem = SketcherDrawingLabel(Request.Kind);
+    const std::string Caption = NextPaddedCaption(Document, Stem);
     const char*       FormTag = Request.Kind == SketcherDrawingCategory::Curve ? SketchSplineFormLabel(Request.Form) : nullptr;
     return RunCommand(Document, Caption + (FormTag ? std::string(" · ") + FormTag : std::string{}), false, [&]() -> std::string
     {
@@ -2502,9 +2550,10 @@ namespace
     }
 }
 
-SketcherCommandOutcome DrawSketcherSpaceCurve(SketcherDocument& Document, const std::vector<Vector3>& Points, bool ClosedCondition, SketchSplineForm Form)
+SketcherCommandOutcome DrawSketcherSpaceCurve(SketcherDocument& Document, const std::vector<Vector3>& Points, bool ClosedCondition, SketchSplineForm Form, const std::string& CaptionStem)
 {
-    const std::string Caption = NextCaption(Document, "Curve");
+    const std::string Stem    = CaptionStem.empty() ? SplineToolStem(Form) : CaptionStem;
+    const std::string Caption = NextPaddedCaption(Document, Stem);
     std::string       Label;
     SketcherCommandOutcome Outcome = RunCommand(Document, Caption + " · 3D curve through " + std::to_string(Points.size()) + " points", false, [&]() -> std::string
     {
@@ -2549,10 +2598,15 @@ namespace
     std::string SplitCrossingsInPlace(SketcherDocument&, double, const std::string& Only = {}, bool RetireSubdividedNetworks = false);
     std::string BuildLoopsInPlace(SketcherDocument&, double, bool OnlyUnbuilt, int* BuiltCount = nullptr);
 }
-SketcherCommandOutcome DrawSketcherProjectedCurve(SketcherDocument& Document, const NurbsCurve& Curve, bool Closed, bool AutoSplit, double IntersectionTolerance, bool AutoSurface)
+SketcherCommandOutcome DrawSketcherProjectedCurve(SketcherDocument& Document, const NurbsCurve& Curve, bool Closed, bool AutoSplit, double IntersectionTolerance, bool AutoSurface, const std::string& CaptionStem)
 {
     std::string Label;
-    SketcherCommandOutcome Outcome = RunCommand(Document, "Draw surface trace", false, [&]() -> std::string
+    const std::string ResolvedStem = !CaptionStem.empty()
+        ? CaptionStem
+        : (Curve.Definition && Curve.Definition->Degree <= 1
+            ? (Curve.Definition->Poles.size() <= 2 ? std::string("Line Trace") : std::string("Polyline Trace"))
+            : std::string("NURBS Trace"));
+    SketcherCommandOutcome Outcome = RunCommand(Document, "Draw " + ResolvedStem, false, [&]() -> std::string
     {
         if (!Curve.Definition || Curve.Definition->Poles.size() < 2) return "surface trace has no fitted curve";
         const auto& Definition = *Curve.Definition;
@@ -2560,7 +2614,7 @@ SketcherCommandOutcome DrawSketcherProjectedCurve(SketcherDocument& Document, co
             return "surface trace must be a non-rational B-spline";
         if (Closed && Distance(Definition.Poles.front(), Definition.Poles.back()) > 1.0e-8) return "surface trace is not closed";
         ExactThrough Exact{ Definition.Poles, Definition.Knots };
-        Label = AppendSpaceCurveStep(Document, Definition.Poles, Closed, NextCaption(Document, "Surface trace"), Exact);
+        Label = AppendSpaceCurveStep(Document, Definition.Poles, Closed, NextPaddedCaption(Document, ResolvedStem), Exact);
         const double EffectiveTol = ComputeEffectiveCrossingTolerance(Document, IntersectionTolerance);
         if (AutoSplit)
         {
@@ -5296,60 +5350,462 @@ SketcherCommandOutcome JoinSketcherSketches(SketcherDocument& Document, const st
 {
     std::vector<std::string> Captions;
     for (const std::string& Label : Sketches) Captions.push_back(Label);
-    return RunCommand(Document, "Join (" + ListCaptions(Document, Captions) + ")", false, [&]() -> std::string
+    std::string ResultLabel;
+    SketcherCommandOutcome Outcome = RunCommand(Document, "Join (" + ListCaptions(Document, Captions) + ")", false, [&]() -> std::string
     {
-        if (Sketches.size() < 2) return "pick two or more sketches to join";
-        const FeatureStep* First = FindStep(Document, Sketches.front());
-        if (!First || First->Kind != FeatureStepCategory::Sketch) return "no sketch step labelled " + Sketches.front();
-        const OrthonormalBasis Base   = ElevatedPlane(Document.Tree, *First);
-        SketchModel            Joined = SolvedSketch(Document, *First);
-        for (size_t Index = 1; Index < Sketches.size(); ++Index)
+        if (Sketches.size() < 2) return "pick two or more curves or sketches to join";
+
+        // Validate labels & reject duplicates; allow both 2D Sketches and SpaceCurves.
+        std::vector<const FeatureStep*> Steps;
+        Steps.reserve(Sketches.size());
+        bool AllSketches = true;
+        bool AnySketch   = false;
+        for (size_t Index = 0; Index < Sketches.size(); ++Index)
         {
-            const FeatureStep* Other = FindStep(Document, Sketches[Index]);
-            if (!Other || Other->Kind != FeatureStepCategory::Sketch) return "no sketch step labelled " + Sketches[Index];
-            if (Sketches[Index] == Sketches.front()) return SketcherBodyCaption(Document, Sketches[Index]) + " is picked twice";
-            const OrthonormalBasis Plane = ElevatedPlane(Document.Tree, *Other);
-            const Vector3          Apart = Plane.Origin - Base.Origin;
-            if (std::fabs(Dot(Plane.ZAxis, Base.ZAxis)) < 1.0 - 1.0e-9 || std::fabs(Dot(Apart, Base.ZAxis)) > 1.0e-9 * std::max(1.0, Length(Apart)))
-                return SketcherBodyCaption(Document, Other->Label) + " is not in the plane of " + SketcherBodyCaption(Document, First->Label);
-            SketchPlacement Placement;
-            Placement.Origin = { Dot(Apart, Base.XAxis), Dot(Apart, Base.YAxis) };
-            Placement.XAxis  = { Dot(Plane.XAxis, Base.XAxis), Dot(Plane.XAxis, Base.YAxis) };
-            Placement.YAxis  = { Dot(Plane.YAxis, Base.XAxis), Dot(Plane.YAxis, Base.YAxis) };
-            const double Join = 1.0e-9 * std::max({ 1.0, MeasureSketchScale(Joined), MeasureSketchScale(SolvedSketch(Document, *Other)) });
-            const SketchJoinOutcome Outcome = JoinSketchModels(Joined, SolvedSketch(Document, *Other), Placement, Join);
-            if (!Outcome.Refusal.empty()) return Outcome.Refusal;
-            Joined = Outcome.Sketch;
+            for (size_t Prev = 0; Prev < Index; ++Prev)
+                if (Sketches[Index] == Sketches[Prev]) return SketcherBodyCaption(Document, Sketches[Index]) + " is picked twice";
+            const FeatureStep* Step = FindStep(Document, Sketches[Index]);
+            if (!Step || (Step->Kind != FeatureStepCategory::Sketch && Step->Kind != FeatureStepCategory::SpaceCurve))
+                return "no sketch or curve step labelled " + Sketches[Index];
+            if (Step->Kind == FeatureStepCategory::Sketch) AnySketch = true;
+            else AllSketches = false;
+            Steps.push_back(Step);
         }
-        // A sketch a later step reads stays (hidden) so that step keeps its input; the others merge away.
-        std::set<std::string>& Hidden = Document.Appearance.HiddenCurves;
-        const auto Keep = std::find_if(Document.Tree.Steps.begin(), Document.Tree.Steps.end(), [&](const FeatureStep& Step) { return Step.Label == Sketches.front(); });
-        if (SketcherSketchReferencedCondition(Document, Sketches.front()))
+
+        const auto StepReferencedCondition = [&](const std::string& Label) -> bool
         {
-            std::string Stem = SketcherBodyCaption(Document, Sketches.front());
-            while (!Stem.empty() && std::isdigit(static_cast<unsigned char>(Stem.back()))) Stem.pop_back();
-            FeatureStep Copy = *Keep;
-            Copy.Label  = "Sketch#" + std::to_string(NextStepOrdinal(Document.Tree));
-            Copy.Sketch = std::move(Joined);
-            Document.Captions[Copy.Label] = NextCaption(Document, Stem.empty() ? std::string("Sketch") : Stem);
-            Hidden.insert(Sketches.front());
-            Document.Tree.Steps.push_back(std::move(Copy));
-        }
-        else Keep->Sketch = std::move(Joined);
-        for (size_t Index = 1; Index < Sketches.size(); ++Index)
+            return SketcherSketchReferencedCondition(Document, Label);
+        };
+
+        // Fast path: all selected items are 2D Sketch steps (preserves exact legacy behavior).
+        if (AllSketches)
         {
-            if (SketcherSketchReferencedCondition(Document, Sketches[Index]))
+            const FeatureStep*     First  = Steps.front();
+            const OrthonormalBasis Base   = ElevatedPlane(Document.Tree, *First);
+            SketchModel            Joined = SolvedSketch(Document, *First);
+            for (size_t Index = 1; Index < Steps.size(); ++Index)
             {
-                Hidden.insert(Sketches[Index]);
+                const FeatureStep*     Other = Steps[Index];
+                const OrthonormalBasis Plane = ElevatedPlane(Document.Tree, *Other);
+                const Vector3          Apart = Plane.Origin - Base.Origin;
+                if (std::fabs(Dot(Plane.ZAxis, Base.ZAxis)) < 1.0 - 1.0e-9 || std::fabs(Dot(Apart, Base.ZAxis)) > 1.0e-9 * std::max(1.0, Length(Apart)))
+                    return SketcherBodyCaption(Document, Other->Label) + " is not in the plane of " + SketcherBodyCaption(Document, First->Label);
+                SketchPlacement Placement;
+                Placement.Origin = { Dot(Apart, Base.XAxis), Dot(Apart, Base.YAxis) };
+                Placement.XAxis  = { Dot(Plane.XAxis, Base.XAxis), Dot(Plane.XAxis, Base.YAxis) };
+                Placement.YAxis  = { Dot(Plane.YAxis, Base.XAxis), Dot(Plane.YAxis, Base.YAxis) };
+                const double Join = 1.0e-6 * std::max({ 1.0, MeasureSketchScale(Joined), MeasureSketchScale(SolvedSketch(Document, *Other)) });
+                const SketchJoinOutcome JoinedOut = JoinSketchModels(Joined, SolvedSketch(Document, *Other), Placement, Join);
+                if (!JoinedOut.Refusal.empty()) return JoinedOut.Refusal;
+                Joined = JoinedOut.Sketch;
+            }
+            std::set<std::string>& Hidden = Document.Appearance.HiddenCurves;
+            const auto Keep = std::find_if(Document.Tree.Steps.begin(), Document.Tree.Steps.end(), [&](const FeatureStep& Step) { return Step.Label == Sketches.front(); });
+            if (StepReferencedCondition(Sketches.front()))
+            {
+                std::string Stem = SketcherBodyCaption(Document, Sketches.front());
+                while (!Stem.empty() && (std::isdigit(static_cast<unsigned char>(Stem.back())) || Stem.back() == ' ')) Stem.pop_back();
+                FeatureStep Copy = *Keep;
+                Copy.Label  = "Sketch#" + std::to_string(NextStepOrdinal(Document.Tree));
+                Copy.Sketch = std::move(Joined);
+                Document.Captions[Copy.Label] = NextPaddedCaption(Document, Stem.empty() ? std::string("Joined") : Stem);
+                Hidden.insert(Sketches.front());
+                ResultLabel = Copy.Label;
+                Document.Tree.Steps.push_back(std::move(Copy));
+            }
+            else
+            {
+                Keep->Sketch = std::move(Joined);
+                ResultLabel  = Keep->Label;
+            }
+            for (size_t Index = 1; Index < Sketches.size(); ++Index)
+            {
+                if (StepReferencedCondition(Sketches[Index]))
+                {
+                    Hidden.insert(Sketches[Index]);
+                    continue;
+                }
+                std::erase_if(Document.Tree.Steps, [&](const FeatureStep& Step) { return Step.Label == Sketches[Index]; });
+                Document.Captions.erase(Sketches[Index]);
+            }
+            for (const std::string& Label : Sketches)
+                if (Hidden.contains(Label) || !FindStep(Document, Label)) std::erase(Document.Selection.Curves, Label);
+            return {};
+        }
+
+        // Extract 3D definitions for every SpaceCurve participant.
+        struct SpaceCurvePart
+        {
+            std::string          Label;
+            NurbsCurveDefinition Definition;
+            bool                 LinearOnly = false;
+        };
+        std::map<std::string, SpaceCurvePart> SpaceParts;
+        std::vector<Vector3> All3DPoints;
+        bool AllSpaceLinear = true;
+
+        for (const FeatureStep* Step : Steps)
+        {
+            if (Step->Kind != FeatureStepCategory::SpaceCurve) continue;
+            SpaceCurvePart Part;
+            Part.Label = Step->Label;
+            const auto FitIt = Document.Regeneration.Curves.find(Step->Label);
+            if (FitIt != Document.Regeneration.Curves.end() && FitIt->second.Curve.Definition && FitIt->second.Curve.Definition->Poles.size() >= 2)
+            {
+                Part.Definition = *FitIt->second.Curve.Definition;
+            }
+            else if (Step->Points.size() >= 2)
+            {
+                Part.Definition.Degree = 1;
+                Part.Definition.Poles  = Step->Points;
+                Part.Definition.Weights.assign(Step->Points.size(), 1.0);
+                Part.Definition.Knots.assign(2, 0.0);
+                const int Spans = int(Step->Points.size()) - 1;
+                for (int K = 1; K < Spans; ++K) Part.Definition.Knots.push_back(double(K) / double(Spans));
+                Part.Definition.Knots.insert(Part.Definition.Knots.end(), 2, 1.0);
+            }
+            else
+            {
+                return SketcherBodyCaption(Document, Step->Label) + " has no curve geometry to join";
+            }
+            Part.LinearOnly = Part.Definition.Degree <= 1;
+            if (!Part.LinearOnly) AllSpaceLinear = false;
+            for (const Vector3& Pole : Part.Definition.Poles) All3DPoints.push_back(Pole);
+            SpaceParts.emplace(Step->Label, std::move(Part));
+        }
+
+        // Compute world bounding span across all participants.
+        double Span = 1.0;
+        if (!All3DPoints.empty())
+        {
+            Vector3 Lo = All3DPoints.front(), Hi = All3DPoints.front();
+            for (const Vector3& Pt : All3DPoints)
+            {
+                Lo.X = std::min(Lo.X, Pt.X); Lo.Y = std::min(Lo.Y, Pt.Y); Lo.Z = std::min(Lo.Z, Pt.Z);
+                Hi.X = std::max(Hi.X, Pt.X); Hi.Y = std::max(Hi.Y, Pt.Y); Hi.Z = std::max(Hi.Z, Pt.Z);
+            }
+            Span = std::max(1.0, Distance(Lo, Hi));
+        }
+
+        // Determine candidate plane (from first Sketch if any, otherwise fit from SpaceCurve poles).
+        OrthonormalBasis Base {};
+        bool PlaneReady = false;
+        if (AnySketch)
+        {
+            for (const FeatureStep* Step : Steps)
+            {
+                if (Step->Kind == FeatureStepCategory::Sketch)
+                {
+                    Base       = ElevatedPlane(Document.Tree, *Step);
+                    PlaneReady = true;
+                    break;
+                }
+            }
+        }
+        else if (All3DPoints.size() >= 2)
+        {
+            Base.Origin = All3DPoints.front();
+            size_t FarA = 0;
+            double BestDist = 0.0;
+            for (size_t I = 1; I < All3DPoints.size(); ++I)
+            {
+                const double D = Distance(All3DPoints[I], Base.Origin);
+                if (D > BestDist) { BestDist = D; FarA = I; }
+            }
+            if (BestDist > 1.0e-9)
+            {
+                Base.XAxis = Normalize(All3DPoints[FarA] - Base.Origin);
+                Vector3 BestNormal {};
+                double  BestArea = 0.0;
+                for (const Vector3& Pt : All3DPoints)
+                {
+                    const Vector3 N = Cross(Base.XAxis, Pt - Base.Origin);
+                    const double  A = Length(N);
+                    if (A > BestArea) { BestArea = A; BestNormal = N; }
+                }
+                if (BestArea > 1.0e-8 * Span)
+                {
+                    Base.ZAxis = Normalize(BestNormal);
+                    Base.YAxis = Cross(Base.ZAxis, Base.XAxis);
+                    PlaneReady = true;
+                }
+                else
+                {
+                    // Collinear segments: build a clean plane containing the line (prefer world Z normal).
+                    const Vector3 Up = std::fabs(Base.XAxis.Z) < 0.99 ? Vector3{ 0.0, 0.0, 1.0 } : Vector3{ 0.0, 1.0, 0.0 };
+                    Base.YAxis = Normalize(Cross(Up, Base.XAxis));
+                    Base.ZAxis = Normalize(Cross(Base.XAxis, Base.YAxis));
+                    PlaneReady = true;
+                }
+            }
+        }
+
+        // Test whether every participant lies on Base within planar tolerance.
+        const double PlanarTol = std::max(1.0e-4, 1.0e-4 * Span);
+        bool Coplanar = PlaneReady;
+        if (Coplanar)
+        {
+            for (const FeatureStep* Step : Steps)
+            {
+                if (Step->Kind == FeatureStepCategory::Sketch)
+                {
+                    const OrthonormalBasis Plane = ElevatedPlane(Document.Tree, *Step);
+                    const Vector3          Apart = Plane.Origin - Base.Origin;
+                    if (std::fabs(Dot(Plane.ZAxis, Base.ZAxis)) < 1.0 - 1.0e-6 || std::fabs(Dot(Apart, Base.ZAxis)) > PlanarTol)
+                    {
+                        Coplanar = false;
+                        break;
+                    }
+                }
+                else
+                {
+                    const auto& Poles = SpaceParts.at(Step->Label).Definition.Poles;
+                    for (const Vector3& Pt : Poles)
+                    {
+                        if (std::fabs(Dot(Pt - Base.Origin, Base.ZAxis)) > PlanarTol)
+                        {
+                            Coplanar = false;
+                            break;
+                        }
+                    }
+                    if (!Coplanar) break;
+                }
+            }
+        }
+
+        std::set<std::string>& Hidden = Document.Appearance.HiddenCurves;
+
+        if (Coplanar)
+        {
+            // Convert every SpaceCurve into exact 2D Sketch primitives on Base and merge via JoinSketchModels.
+            const double JoinTol = std::max(1.0e-4, 1.0e-4 * Span);
+            auto ProjectTo2D = [&](const Vector3& Pt) -> Vector2
+            {
+                const Vector3 D = Pt - Base.Origin;
+                return { Dot(D, Base.XAxis), Dot(D, Base.YAxis) };
+            };
+            auto ConvertSpaceToSketch = [&](const SpaceCurvePart& Part) -> SketchModel
+            {
+                SketchModel Model;
+                const auto& Def = Part.Definition;
+                if (Def.Degree <= 1)
+                {
+                    std::vector<int> Indices;
+                    Indices.reserve(Def.Poles.size());
+                    for (size_t I = 0; I < Def.Poles.size(); ++I)
+                    {
+                        const Vector2 P2 = ProjectTo2D(Def.Poles[I]);
+                        if (I + 1 == Def.Poles.size() && Indices.size() >= 3 && Distance(P2, Model.Points[Indices.front()].Position) <= JoinTol)
+                        {
+                            Indices.push_back(Indices.front());
+                        }
+                        else
+                        {
+                            Indices.push_back(AppendSketchPoint(Model, P2));
+                        }
+                    }
+                    int Id = 1;
+                    for (size_t I = 0; I + 1 < Indices.size(); ++I)
+                    {
+                        if (Indices[I] != Indices[I + 1]) AppendSketchLine(Model, Indices[I], Indices[I + 1], Id++);
+                    }
+                    return Model;
+                }
+                std::vector<int> Indices;
+                Indices.reserve(Def.Poles.size());
+                for (size_t I = 0; I < Def.Poles.size(); ++I)
+                {
+                    const Vector2 P2 = ProjectTo2D(Def.Poles[I]);
+                    if (I + 1 == Def.Poles.size() && Indices.size() >= 3 && Distance(P2, Model.Points[Indices.front()].Position) <= JoinTol)
+                    {
+                        Indices.push_back(Indices.front());
+                    }
+                    else
+                    {
+                        Indices.push_back(AppendSketchPoint(Model, P2));
+                    }
+                }
+                const int CurveIdx = AppendSketchSpline(Model, Indices, SketchSplineForm::Nurbs, 1);
+                if (Def.Knots.size() == Def.Poles.size() + size_t(Def.Degree) + 1u && Def.Degree <= 15)
+                {
+                    Model.Curves[size_t(CurveIdx)].Knots = Def.Knots;
+                }
+                return Model;
+            };
+
+            SketchModel Joined;
+            bool HasFirst = false;
+            for (const FeatureStep* Step : Steps)
+            {
+                SketchModel     PartModel;
+                SketchPlacement Placement {};
+                if (Step->Kind == FeatureStepCategory::Sketch)
+                {
+                    const OrthonormalBasis Plane = ElevatedPlane(Document.Tree, *Step);
+                    const Vector3          Apart = Plane.Origin - Base.Origin;
+                    Placement.Origin = { Dot(Apart, Base.XAxis), Dot(Apart, Base.YAxis) };
+                    Placement.XAxis  = { Dot(Plane.XAxis, Base.XAxis), Dot(Plane.XAxis, Base.YAxis) };
+                    Placement.YAxis  = { Dot(Plane.YAxis, Base.XAxis), Dot(Plane.YAxis, Base.YAxis) };
+                    PartModel        = SolvedSketch(Document, *Step);
+                }
+                else
+                {
+                    PartModel = ConvertSpaceToSketch(SpaceParts.at(Step->Label));
+                }
+
+                if (!HasFirst)
+                {
+                    Joined   = PlaceSketchModel(PartModel, Placement);
+                    HasFirst = true;
+                }
+                else
+                {
+                    const SketchJoinOutcome JoinedOut = JoinSketchModels(Joined, PartModel, Placement, JoinTol);
+                    if (!JoinedOut.Refusal.empty()) return JoinedOut.Refusal;
+                    Joined = JoinedOut.Sketch;
+                }
+            }
+
+            FeatureStep MergedStep;
+            MergedStep.Kind  = FeatureStepCategory::Sketch;
+            MergedStep.Label = "Sketch#" + std::to_string(NextStepOrdinal(Document.Tree));
+            const double Elev = Dot(Base.Origin, Base.ZAxis);
+            MergedStep.Plane         = Base;
+            MergedStep.Plane.Origin  = Base.Origin - Base.ZAxis * Elev;
+            MergedStep.Elevation     = FeatureScalar{ Elev };
+            MergedStep.Sketch        = std::move(Joined);
+            const bool LinesOnly = !AnySketch && AllSpaceLinear;
+            Document.Captions[MergedStep.Label] = NextPaddedCaption(Document, LinesOnly ? "Polyline" : "Joined");
+            ResultLabel = MergedStep.Label;
+            Document.Tree.Steps.push_back(std::move(MergedStep));
+
+            for (const std::string& Label : Sketches)
+            {
+                if (StepReferencedCondition(Label))
+                {
+                    Hidden.insert(Label);
+                    continue;
+                }
+                std::erase_if(Document.Tree.Steps, [&](const FeatureStep& Step) { return Step.Label == Label; });
+                Document.Captions.erase(Label);
+            }
+            for (const std::string& Label : Sketches)
+                if (Hidden.contains(Label) || !FindStep(Document, Label)) std::erase(Document.Selection.Curves, Label);
+            return {};
+        }
+
+        // Non-coplanar 3D curves: join SpaceCurves end-to-end into one unified 3D SpaceCurve.
+        if (AnySketch) return "cannot join a 2D sketch with non-coplanar 3D curves";
+
+        std::vector<std::vector<Vector3>> Chains;
+        Chains.reserve(Steps.size());
+        for (const FeatureStep* Step : Steps)
+        {
+            const auto& Part = SpaceParts.at(Step->Label);
+            if (AllSpaceLinear)
+            {
+                Chains.push_back(Part.Definition.Poles);
+            }
+            else
+            {
+                const NurbsDomain Domain = MeasureNurbsCurveDomain(Part.Definition);
+                const int Subs = std::clamp(int(Part.Definition.Poles.size()) * 16, 24, 256);
+                std::vector<Vector3> Poly;
+                Poly.reserve(size_t(Subs + 1));
+                for (int K = 0; K <= Subs; ++K)
+                {
+                    const double T = Domain.Low + (Domain.High - Domain.Low) * double(K) / double(Subs);
+                    Poly.push_back(EvaluateNurbsCurve(Part.Definition, T).Position);
+                }
+                Chains.push_back(std::move(Poly));
+            }
+        }
+
+        // Greedily connect chains end-to-end by nearest matching endpoint.
+        const double WeldTol = std::max(1.0e-3, 1.0e-3 * Span);
+        std::vector<bool> Used(Chains.size(), false);
+        std::vector<Vector3> Combined = Chains.front();
+        Used[0] = true;
+        for (size_t Added = 1; Added < Chains.size(); ++Added)
+        {
+            int    BestIdx   = -1;
+            int    BestMode  = 0; // 0: back->front, 1: back->back(rev), 2: front->back(prepend), 3: front->front(rev+prepend)
+            double BestDist  = std::numeric_limits<double>::infinity();
+            for (size_t C = 0; C < Chains.size(); ++C)
+            {
+                if (Used[C] || Chains[C].size() < 2) continue;
+                const double D0 = Distance(Combined.back(),  Chains[C].front());
+                const double D1 = Distance(Combined.back(),  Chains[C].back());
+                const double D2 = Distance(Combined.front(), Chains[C].back());
+                const double D3 = Distance(Combined.front(), Chains[C].front());
+                if (D0 < BestDist) { BestDist = D0; BestIdx = int(C); BestMode = 0; }
+                if (D1 < BestDist) { BestDist = D1; BestIdx = int(C); BestMode = 1; }
+                if (D2 < BestDist) { BestDist = D2; BestIdx = int(C); BestMode = 2; }
+                if (D3 < BestDist) { BestDist = D3; BestIdx = int(C); BestMode = 3; }
+            }
+            if (BestIdx < 0) break;
+            Used[size_t(BestIdx)] = true;
+            std::vector<Vector3> Piece = Chains[size_t(BestIdx)];
+            if (BestMode == 1 || BestMode == 3) std::reverse(Piece.begin(), Piece.end());
+            if (BestMode == 0 || BestMode == 1)
+            {
+                const size_t StartIdx = Distance(Combined.back(), Piece.front()) <= WeldTol ? 1u : 0u;
+                Combined.insert(Combined.end(), Piece.begin() + ptrdiff_t(StartIdx), Piece.end());
+            }
+            else
+            {
+                const size_t EndTrim = Distance(Piece.back(), Combined.front()) <= WeldTol ? 1u : 0u;
+                Piece.resize(Piece.size() - EndTrim);
+                Piece.insert(Piece.end(), Combined.begin(), Combined.end());
+                Combined = std::move(Piece);
+            }
+        }
+        if (Combined.size() < 2) return "joined curve has fewer than 2 points";
+
+        const bool Closed3D = Combined.size() >= 4 && Distance(Combined.front(), Combined.back()) <= WeldTol;
+        if (Closed3D) Combined.back() = Combined.front();
+
+        if (AllSpaceLinear)
+        {
+            std::vector<double> LinearKnots(2, 0.0);
+            const int Spans = int(Combined.size()) - 1;
+            for (int K = 1; K < Spans; ++K) LinearKnots.push_back(double(K) / double(Spans));
+            LinearKnots.insert(LinearKnots.end(), 2, 1.0);
+            ExactThrough Exact{ Combined, std::move(LinearKnots) };
+            ResultLabel = AppendSpaceCurveStep(Document, Combined, Closed3D, NextPaddedCaption(Document, "Polyline"), Exact);
+        }
+        else
+        {
+            CurveFitSettings Settings;
+            Settings.Tolerance = std::max(1.0e-4, Span * 2.0e-4);
+            Settings.Fairing   = 1.0e-8;
+            Settings.SpanLimit = std::clamp(int(Combined.size()) / 4, 24, 128);
+            const CurveFitOutcome Fitted = FitSpaceCurve(Combined, Settings);
+            if (!Fitted.Refusal.empty() || !Fitted.Curve.Definition || Fitted.Curve.Definition->Poles.size() < 2)
+                return Fitted.Refusal.empty() ? "could not fit joined 3D curve" : Fitted.Refusal;
+            ExactThrough Exact{ Fitted.Curve.Definition->Poles, Fitted.Curve.Definition->Knots };
+            ResultLabel = AppendSpaceCurveStep(Document, Fitted.Curve.Definition->Poles, Closed3D, NextPaddedCaption(Document, "Joined"), Exact);
+        }
+
+        for (const std::string& Label : Sketches)
+        {
+            if (StepReferencedCondition(Label))
+            {
+                Hidden.insert(Label);
                 continue;
             }
-            std::erase_if(Document.Tree.Steps, [&](const FeatureStep& Step) { return Step.Label == Sketches[Index]; });
-            Document.Captions.erase(Sketches[Index]);
+            std::erase_if(Document.Tree.Steps, [&](const FeatureStep& Step) { return Step.Label == Label; });
+            Document.Captions.erase(Label);
         }
         for (const std::string& Label : Sketches)
             if (Hidden.contains(Label) || !FindStep(Document, Label)) std::erase(Document.Selection.Curves, Label);
         return {};
     }, 0);
+    if (Outcome.AcceptedCondition && !ResultLabel.empty())
+    {
+        Document.Selection.Curves = { ResultLabel };
+    }
+    return Outcome;
 }
 
 SketcherCommandOutcome FlowSketcherSketches(SketcherDocument& Document, const SketcherRailDeformRequest& Request)
@@ -5457,7 +5913,46 @@ std::vector<std::string> SketcherJoinCandidates(const SketcherDocument& Document
 {
     std::vector<std::string> Group;
     const FeatureStep* First = FindStep(Document, Sketch);
-    if (!First || First->Kind != FeatureStepCategory::Sketch) return Group;
+    if (!First || (First->Kind != FeatureStepCategory::Sketch && First->Kind != FeatureStepCategory::SpaceCurve)) return Group;
+    if (First->Kind == FeatureStepCategory::SpaceCurve)
+    {
+        auto EndpointsOf = [&](const FeatureStep& Step) -> std::pair<Vector3, Vector3>
+        {
+            const auto FitIt = Document.Regeneration.Curves.find(Step.Label);
+            if (FitIt != Document.Regeneration.Curves.end() && FitIt->second.Curve.Definition && FitIt->second.Curve.Definition->Poles.size() >= 2)
+                return { FitIt->second.Curve.Definition->Poles.front(), FitIt->second.Curve.Definition->Poles.back() };
+            if (Step.Points.size() >= 2) return { Step.Points.front(), Step.Points.back() };
+            return {};
+        };
+        Group.push_back(Sketch);
+        std::vector<std::pair<Vector3, Vector3>> MemberEnds{ EndpointsOf(*First) };
+        std::vector<std::pair<std::string, std::pair<Vector3, Vector3>>> Pending;
+        for (const FeatureStep& Step : Document.Tree.Steps)
+        {
+            if (Step.Kind != FeatureStepCategory::SpaceCurve || Step.Label == Sketch || Document.Appearance.HiddenCurves.contains(Step.Label)) continue;
+            Pending.emplace_back(Step.Label, EndpointsOf(Step));
+        }
+        const double Tol = 1.0e-3;
+        for (bool Grown = true; Grown;)
+        {
+            Grown = false;
+            for (auto It = Pending.begin(); It != Pending.end(); ++It)
+            {
+                const bool Touch = std::any_of(MemberEnds.begin(), MemberEnds.end(), [&](const auto& M)
+                {
+                    return Distance(M.first, It->second.first) <= Tol || Distance(M.first, It->second.second) <= Tol
+                        || Distance(M.second, It->second.first) <= Tol || Distance(M.second, It->second.second) <= Tol;
+                });
+                if (!Touch) continue;
+                Group.push_back(It->first);
+                MemberEnds.push_back(It->second);
+                Pending.erase(It);
+                Grown = true;
+                break;
+            }
+        }
+        return Group;
+    }
     const OrthonormalBasis   Base = ElevatedPlane(Document.Tree, *First);
     std::vector<SketchModel> Members{ SolvedSketch(Document, *First) };
     Group.push_back(Sketch);

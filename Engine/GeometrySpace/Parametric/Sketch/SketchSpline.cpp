@@ -495,9 +495,52 @@ std::vector<Vector2> SampleSketchCurve(const SketchModel& Sketch, const SketchCu
             return Samples;
         }
         const std::vector<double> Breaks = CollectSketchSplineBreaks(Resolved.Curve);
+        double Chord = 0.0;
+        for (size_t I = 1; I < Curve.Points.size(); ++I)
+        {
+            Chord += Distance(Position(Curve.Points[I - 1]), Position(Curve.Points[I]));
+        }
+        const double     ChordTol  = std::max(1.0e-5, Chord * 2.5e-4);
+        constexpr int    BaseSubs  = 12;
+        constexpr int    MaxDepth  = 6;
+        constexpr size_t MaxPoints = 1024;
+
+        auto Subdivide = [&](auto&& Self, double T0, const Vector2& P0, double T1, const Vector2& P1, int Depth) -> void
+        {
+            if (Samples.size() >= MaxPoints) return;
+            const double  Tm = 0.5 * (T0 + T1);
+            const Vector2 Pm = EvaluateSketchSpline(Resolved.Curve, Tm).Position;
+            const double  Dx = P1.X - P0.X;
+            const double  Dy = P1.Y - P0.Y;
+            const double  Len = std::hypot(Dx, Dy);
+            const double  Err = Len > 1.0e-12
+                ? std::fabs((Pm.X - P0.X) * Dy - (Pm.Y - P0.Y) * Dx) / Len
+                : Distance(Pm, P0);
+            if (Depth < MaxDepth && Err > ChordTol)
+            {
+                Self(Self, T0, P0, Tm, Pm, Depth + 1);
+                Self(Self, Tm, Pm, T1, P1, Depth + 1);
+            }
+            else
+            {
+                Samples.push_back(Pm);
+                Samples.push_back(P1);
+            }
+        };
+
         for (size_t Piece = 0; Piece + 1 < Breaks.size(); ++Piece)
         {
-            for (int Index = Piece == 0 ? 0 : 1; Index <= 16; ++Index) Samples.push_back(EvaluateSketchSpline(Resolved.Curve, Breaks[Piece] + (Breaks[Piece + 1] - Breaks[Piece]) * Index / 16.0).Position);
+            const double A = Breaks[Piece];
+            const double B = Breaks[Piece + 1];
+            for (int Step = 0; Step < BaseSubs; ++Step)
+            {
+                const double  T0 = A + (B - A) * double(Step) / double(BaseSubs);
+                const double  T1 = A + (B - A) * double(Step + 1) / double(BaseSubs);
+                const Vector2 P0 = EvaluateSketchSpline(Resolved.Curve, T0).Position;
+                const Vector2 P1 = EvaluateSketchSpline(Resolved.Curve, T1).Position;
+                if (Piece == 0 && Step == 0) Samples.push_back(P0);
+                Subdivide(Subdivide, T0, P0, T1, P1, 0);
+            }
         }
         return Samples;
     }
@@ -511,7 +554,7 @@ std::vector<Vector2> SampleSketchCurve(const SketchModel& Sketch, const SketchCu
         Sweep = std::atan2(End.Y, End.X) - First;
         while (Sweep <= 0.0) Sweep += 2.0 * std::numbers::pi;
     }
-    const int Count = std::max(4, static_cast<int>(std::ceil(64.0 * Sweep / (2.0 * std::numbers::pi))));
+    const int Count = std::clamp(static_cast<int>(std::ceil(96.0 * Sweep / (2.0 * std::numbers::pi))), 16, 192);
     for (int Sample = 0; Sample <= Count; ++Sample)
     {
         const double Angle = First + Sweep * Sample / Count;

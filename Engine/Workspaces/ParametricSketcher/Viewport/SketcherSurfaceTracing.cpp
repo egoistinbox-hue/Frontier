@@ -94,7 +94,7 @@ SketcherControlTrace MakeSketcherControlTrace(const std::vector<Vector3>& Contro
         CurveFitSettings Settings;
         Settings.Tolerance = std::max(1.0e-5, Chord * 2.5e-4);
         Settings.Fairing   = 1.0e-10;
-        Settings.SpanLimit = 48;
+        Settings.SpanLimit = std::max(48, int(Controls.size()) * 2);
         const CurveFitOutcome Fitted = FitSpaceCurve(Seed, Settings);
         if (!Fitted.Refusal.empty() || !Fitted.Curve.Definition)
         {
@@ -105,7 +105,7 @@ SketcherControlTrace MakeSketcherControlTrace(const std::vector<Vector3>& Contro
         Exact.Poles.front() = Controls.front();
         Exact.Poles.back()  = Closed ? Controls.front() : Controls.back();
         Result.Curve.Definition = std::make_shared<NurbsCurveDefinition>(std::move(Exact));
-        const int Samples = std::max(32, int(Controls.size()) * 16);
+        const int Samples = std::clamp(int(Controls.size()) * 24, 48, 512);
         for (int I = 0; I <= Samples; ++I)
             Result.Samples.push_back(EvaluateNurbsCurve(*Result.Curve.Definition, double(I) / Samples).Position);
         return Result;
@@ -121,9 +121,16 @@ SketcherControlTrace MakeSketcherControlTrace(const std::vector<Vector3>& Contro
     for (int I = 1; I < Spans; ++I) Definition.Knots.push_back(double(I) / Spans);
     Definition.Knots.insert(Definition.Knots.end(), Degree + 1, 1.0);
     Result.Curve.Definition = std::make_shared<NurbsCurveDefinition>(std::move(Definition));
-    const int Samples = std::max(32, int(Controls.size()) * 16);
-    for (int I = 0; I <= Samples; ++I)
-        Result.Samples.push_back(EvaluateNurbsCurve(*Result.Curve.Definition, double(I) / Samples).Position);
+    if (Degree <= 1)
+    {
+        Result.Samples = Controls;
+    }
+    else
+    {
+        const int Samples = std::clamp(int(Controls.size()) * 24, 48, 512);
+        for (int I = 0; I <= Samples; ++I)
+            Result.Samples.push_back(EvaluateNurbsCurve(*Result.Curve.Definition, double(I) / Samples).Position);
+    }
     return Result;
 }
 
@@ -194,9 +201,9 @@ SketcherControlTrace ConstructReferenceConformingTrace(const SketcherDocument& D
         return std::nullopt;
     };
 
-    constexpr int DenseCount = 64;
+    const int DenseCount = std::clamp(int(Controls.size()) * 16, 64, 512);
     std::vector<Vector3> Conformed;
-    Conformed.reserve(DenseCount + 1);
+    Conformed.reserve(size_t(DenseCount + 1));
 
     int HitSamples = 0;
     double MaxLift = 0.0;
@@ -247,12 +254,12 @@ SketcherControlTrace ConstructReferenceConformingTrace(const SketcherDocument& D
     CurveFitSettings Settings;
     Settings.Tolerance = std::max(2.0e-4, TotalChord * 4.0e-4);
     Settings.Fairing   = 1.0e-7;
-    Settings.SpanLimit = 18;
+    Settings.SpanLimit = std::clamp(int(Controls.size()) * 3, 18, 96);
     CurveFitOutcome Fitted = FitSpaceCurve(Conformed, Settings);
     if (!Fitted.Refusal.empty() || !Fitted.Curve.Definition || Fitted.Curve.Definition->Poles.size() < 2)
     {
         Settings.Tolerance = std::max(1.0e-3, TotalChord * 2.0e-3);
-        Settings.SpanLimit = 28;
+        Settings.SpanLimit = std::clamp(int(Controls.size()) * 4, 28, 128);
         Fitted = FitSpaceCurve(Conformed, Settings);
     }
     if (!Fitted.Refusal.empty() || !Fitted.Curve.Definition || Fitted.Curve.Definition->Poles.size() < 2)

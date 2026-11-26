@@ -876,7 +876,8 @@ struct SketcherStepReading;
                                                                           GeometrySpace::Parametric::SketchSplineForm Form = GeometrySpace::Parametric::SketchSplineForm::Hermite, int PerSpan = 48,
                                                                           const std::vector<double>& Knots = {});
 [[nodiscard]] SketcherCommandOutcome DrawSketcherSpaceCurve(SketcherDocument& Document, const std::vector<GeometrySpace::Parametric::Vector3>& Points, bool ClosedCondition,
-                                                            GeometrySpace::Parametric::SketchSplineForm Form = GeometrySpace::Parametric::SketchSplineForm::Hermite);
+                                                            GeometrySpace::Parametric::SketchSplineForm Form = GeometrySpace::Parametric::SketchSplineForm::Hermite,
+                                                            const std::string& CaptionStem = "");
 
 // Control editing is local and atomic: never falls back to whole-object deletion.
 // First curve is the guide; the existing target keeps its label and selects side/extent.
@@ -903,7 +904,7 @@ struct SketcherSpaceLoopPreview
 [[nodiscard]] SketcherCommandOutcome DeleteSketcherCurveSpans(SketcherDocument&, const std::string&, const std::vector<int>&);
 
 // An exact non-rational B-spline: persist supplied poles / knots without fitting, one undo entry.
-[[nodiscard]] SketcherCommandOutcome DrawSketcherProjectedCurve(SketcherDocument& Document, const GeometrySpace::Parametric::NurbsCurve& Curve, bool Closed, bool AutoSplit = false, double IntersectionTolerance = 0.001, bool AutoSurface = false);
+[[nodiscard]] SketcherCommandOutcome DrawSketcherProjectedCurve(SketcherDocument& Document, const GeometrySpace::Parametric::NurbsCurve& Curve, bool Closed, bool AutoSplit = false, double IntersectionTolerance = 0.001, bool AutoSurface = false, const std::string& CaptionStem = "");
 
 // 💡 Sketch points moved off their plane (the 3D gizmo on mode-1 points in a 3D view): every curve through one becomes a
 //    3D curve of the same form through its points (Points of Sketch → Targets, in the world; Plane: the sketch's placed

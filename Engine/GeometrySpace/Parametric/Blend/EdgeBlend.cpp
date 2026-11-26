@@ -654,6 +654,145 @@ namespace
                 Sheet = *Clamped.Sheet;
                 Outcome.Statistics.ClampedSides += (MustClamp[0] ? 1 : 0) + (MustClamp[1] ? 1 : 0);
             }
+
+            // Variable-size convex straight planar sheets: clamp each end's requested size against the tightest blocking
+            // edge/vertex on its two planar supports so dragging a corner handle on a bevel that reaches the opposite
+            // edge smoothly tapers and merges instead of triggering a cliff-overflow refusal.
+            for (size_t Idx = 0; Idx < Outcome.Sheets.size(); ++Idx)
+            {
+                EdgeBlendSheet& Sheet = Outcome.Sheets[Idx];
+                if (!Sheet.ConvexCondition || !Sheet.VariableCondition() || Sheet.LawCondition()) continue;
+                const EdgeProfile& Profile = Partition.Edges.Resolve(Sheet.Edge);
+                if (Profile.Start == Profile.End || !std::holds_alternative<StraightLine>(Partition.Curves.Resolve(Profile.Curve))) continue;
+                if (!std::holds_alternative<PlaneSurface>(SurfaceOf(Sheet.Faces[0])) || !std::holds_alternative<PlaneSurface>(SurfaceOf(Sheet.Faces[1]))) continue;
+
+                const auto&   Line    = std::get<StraightLine>(Partition.Curves.Resolve(Profile.Curve));
+                const Vector3 Dir     = Normalize(Line.Direction);
+                const Vector3 StartP  = Partition.Vertices.Resolve(Profile.Start).Position;
+                const Vector3 EndP    = Partition.Vertices.Resolve(Profile.End).Position;
+                const double  EdgeLen = Distance(StartP, EndP);
+                if (!(EdgeLen > 1.0e-7 * Scale)) continue;
+
+                // Recover the exact start/end sizes requested on this edge.
+                double ReqStart = Settings.Size;
+                double ReqEnd   = Settings.EndSize.value_or(Settings.Size);
+                if (!Settings.AnchorSizes.empty() && Settings.AnchorSizes.size() == Settings.SizeAnchors.size())
+                {
+                    const auto SizeAt = [&](VertexToken Vertex)
+                    {
+                        const auto Found = std::find(Settings.SizeAnchors.begin(), Settings.SizeAnchors.end(), Vertex);
+                        return Found == Settings.SizeAnchors.end() ? Settings.Size : Settings.AnchorSizes[size_t(Found - Settings.SizeAnchors.begin())];
+                    };
+                    ReqStart = SizeAt(Profile.Start);
+                    ReqEnd   = SizeAt(Profile.End);
+                }
+                else if (Settings.EndSize && !Settings.SizeAnchors.empty())
+                {
+                    const auto Anchored = [&](VertexToken Vertex) { return std::find(Settings.SizeAnchors.begin(), Settings.SizeAnchors.end(), Vertex) != Settings.SizeAnchors.end(); };
+                    if (Anchored(Profile.End) && !Anchored(Profile.Start)) std::swap(ReqStart, ReqEnd);
+                }
+
+                // Compute inward planar directions on both support faces.
+                const double  Middle  = 0.5 * (Profile.IntervalLow + Profile.IntervalHigh);
+                const Vector3 MidPos  = EvaluateCurve(Partition.Curves.Resolve(Profile.Curve), Middle).Position;
+                Vector3 Normals[2];
+                Vector3 Inw[2];
+                for (int Side = 0; Side < 2; ++Side)
+                {
+                    Normals[Side] = EvaluateOutwardNormal(Partition, Sheet.Faces[Side], MidPos);
+                }
+                for (int Side = 0; Side < 2; ++Side)
+                {
+                    const FinProfile& Fin   = Partition.Fins.Resolve(Sheet.Fins[Side]);
+                    const Vector3     FDir  = Dir * (Fin.Sense == Orientation::Forward ? 1.0 : -1.0);
+                    Vector3           Cand  = Normalize(Cross(Normals[Side], FDir));
+                    if (Dot(Cand, Normals[1 - Side]) > 0.0) Cand = Cand * -1.0;
+                    Inw[Side] = Cand;
+                }
+
+                const double HalfTan        = std::tan(0.5 * Sheet.Dihedral);
+                const double SetbackPerSize = (Settings.Profile == BlendProfile::Chamfer) ? 1.0 : (HalfTan > 1.0e-9 ? (1.0 / HalfTan) : 1.0);
+                const double MaxReqSetback  = std::max(ReqStart, ReqEnd) * SetbackPerSize;
+
+                double Limit[2] = { std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity() };
+                for (int Side = 0; Side < 2; ++Side)
+                {
+                    if (Smooths.count({ Sheet.Edge.Slot, Side }) != 0) continue;
+                    const FaceProfile& Rec = Partition.Faces.Resolve(Sheet.Faces[Side]);
+                    for (LoopToken Loop : Rec.Loops)
+                    {
+                        Partition.EnumerateLoopFins(Loop, [&](FinToken Fin)
+                        {
+                            const EdgeToken    Other = Partition.Fins.Resolve(Fin).Edge;
+                            if (Other == Sheet.Edge) return;
+                            const EdgeProfile& Op    = Partition.Edges.Resolve(Other);
+                            if (Op.Start == Op.End) return;
+
+                            const Vector3 Pa = Partition.Vertices.Resolve(Op.Start).Position;
+                            const Vector3 Pb = Partition.Vertices.Resolve(Op.End).Position;
+                            const double  Da = Dot(Pa - StartP, Inw[Side]);
+                            const double  Db = Dot(Pb - StartP, Inw[Side]);
+
+                            if (const auto* Across = std::get_if<StraightLine>(&Partition.Curves.Resolve(Op.Curve));
+                                Across && std::fabs(std::fabs(Dot(Normalize(Across->Direction), Dir)) - 1.0) <= 1.0e-9)
+                            {
+                                const double Width = 0.5 * (Da + Db);
+                                if (Width > 1.0e-7 * Scale)
+                                {
+                                    const double Bound = (SheetIndex.count(Other.Slot) != 0) ? (0.5 * Width) : Width;
+                                    if (Bound < Limit[Side]) Limit[Side] = Bound;
+                                }
+                                return;
+                            }
+                            for (const Vector3& Pt : { Pa, Pb })
+                            {
+                                const double Perp = Dot(Pt - StartP, Inw[Side]);
+                                if (!(Perp > 1.0e-7 * Scale)) continue;
+                                const double Along = Dot(Pt - StartP, Dir);
+                                if (Along < -Tolerance || Along > EdgeLen + Tolerance) continue;
+                                if (Perp < Limit[Side]) Limit[Side] = Perp;
+                            }
+                        });
+                    }
+                }
+
+                const double TightLimit = std::min(Limit[0], Limit[1]);
+                if (!std::isfinite(TightLimit) || !(TightLimit > 1.0e-7 * Scale)) continue;
+                const double MaxAllowedSize = TightLimit / SetbackPerSize;
+                const double Snap           = std::max(10.0 * Agreement, 0.002 * MaxAllowedSize);
+
+                const bool ClampStart = ReqStart >= MaxAllowedSize - Snap;
+                const bool ClampEnd   = ReqEnd   >= MaxAllowedSize - Snap;
+                if (!ClampStart && !ClampEnd) continue;
+
+                const double FinalStart = ClampStart ? MaxAllowedSize : ReqStart;
+                const double FinalEnd   = ClampEnd   ? MaxAllowedSize : ReqEnd;
+                const bool   Side0Hit   = std::isfinite(Limit[0]) && MaxReqSetback >= Limit[0] - std::max(10.0 * Agreement, 0.002 * Limit[0]);
+                const bool   Side1Hit   = std::isfinite(Limit[1]) && MaxReqSetback >= Limit[1] - std::max(10.0 * Agreement, 0.002 * Limit[1]);
+
+                if (std::fabs(FinalStart - FinalEnd) <= 1.0e-7 * Scale)
+                {
+                    const double FinalD = FinalStart * SetbackPerSize;
+                    EdgeBlendSheetOutcome Clamped = ResolveClampedPlanarBlendSheet(
+                        Partition, Sheet.Edge, Settings, FinalD, FinalD, Side0Hit, Side1Hit);
+                    if (!Clamped.Sheet) continue;
+                    Sheet = *Clamped.Sheet;
+                }
+                else
+                {
+                    BlendSettings ClampedSettings = Settings;
+                    ClampedSettings.Size          = FinalStart;
+                    ClampedSettings.EndSize       = FinalEnd;
+                    ClampedSettings.SizeAnchors.clear();
+                    ClampedSettings.AnchorSizes.clear();
+                    EdgeBlendSheetOutcome Clamped = ResolveEdgeBlendSheet(Partition, Sheet.Edge, ClampedSettings);
+                    if (!Clamped.Sheet) continue;
+                    Sheet = *Clamped.Sheet;
+                    Sheet.ClampedSides[0] = Side0Hit;
+                    Sheet.ClampedSides[1] = Side1Hit;
+                }
+                Outcome.Statistics.ClampedSides += (Sheet.ClampedSides[0] ? 1 : 0) + (Sheet.ClampedSides[1] ? 1 : 0);
+            }
         }
 
         [[nodiscard]] int EndAt(EdgeToken Edge, VertexToken Vertex) const { return Partition.Edges.Resolve(Edge).Start == Vertex ? 0 : 1; }

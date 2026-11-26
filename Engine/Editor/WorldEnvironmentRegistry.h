@@ -12,9 +12,12 @@
 #include "Engine/Components/Panes/OutlinerPanel.h"
 #include "Engine/Components/Panes/ViewportPanel.h"
 #include "Engine/GeometricRaster/GlobalIllumination/TieredWorldRenderSequence.h"
+#include "Engine/World/CategoryInstances.h"
+#include "Engine/World/WorldInstanceRegister.h"
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -42,11 +45,12 @@ enum class WorldEnvironmentCategory : uint8_t
 
 struct RegisteredEnvironmentEntry
 {
-    OutlinerSlotToken        Token          {};                                       // [id]  - Bound Outliner row token
-    WorldEnvironmentCategory Category       = WorldEnvironmentCategory::Atmosphere;   // [-]   - Authoritative environment category
-    uint32_t                 MoonSlotIndex  = 0u;                                     // [idx] - Dedicated index in Moons[0..5] when Category == Moon
-    std::string              Title          {};                                       // [-]   - Current display title
-    bool                     LastVisible    = true;                                   // [-]   - Cached effective visibility from last sync
+    OutlinerSlotToken             Token          {};                                       // [id]  - Bound Outliner row token
+    WorldEnvironmentCategory      Category       = WorldEnvironmentCategory::Atmosphere;   // [-]   - Authoritative environment category
+    uint32_t                      MoonSlotIndex  = 0u;                                     // [idx] - Dedicated index in Moons[0..5] when Category == Moon
+    std::string                   Title          {};                                       // [-]   - Current display title
+    bool                          LastVisible    = true;                                   // [-]   - Cached effective visibility from last sync
+    World::CategoryInstanceHandle InstanceHandle {};                                       // [-]   - RAII Constructor/Destructor handle in WorldInstanceRegister
 };
 
 struct EnvironmentUndoEntry
@@ -82,8 +86,18 @@ public:
     static constexpr uint32_t MaximumMoonCount = 6u; // [count] - Matches WorldAtmosphereConfiguration::Moons size
 
     WorldEnvironmentRegistry() noexcept = default;
+    ~WorldEnvironmentRegistry() noexcept { Reset(); }
 
-    // Resets internal bindings without mutating external scene data
+    WorldEnvironmentRegistry(const WorldEnvironmentRegistry&)            = delete;
+    WorldEnvironmentRegistry& operator=(const WorldEnvironmentRegistry&) = delete;
+
+    // Binds an optional WorldInstanceRegister so every environment entry owns a live RAII CategoryInstanceHandle
+    void BindWorldRegister(World::WorldInstanceRegister* TargetRegister) noexcept;
+
+    // Binds an optional callback invoked whenever an environment Outliner entry is removed/pruned (e.g. Inspector cleanup)
+    void BindRemovalCallback(std::function<void(OutlinerSlotToken)> Callback) noexcept;
+
+    // Resets internal bindings (runs RAII destructors for any bound CategoryInstanceHandles)
     void Reset() noexcept;
 
     // Adopts active atmosphere/sun/clouds/moon/stars flags already present in a loaded WorldScene into 1 default Environment folder
@@ -160,11 +174,17 @@ public:
 private:
     [[nodiscard]] const RegisteredEnvironmentEntry* FindRegistered(OutlinerSlotToken Token) const noexcept;
     [[nodiscard]] uint32_t                          AllocateFreeMoonSlot() const noexcept;
+    [[nodiscard]] World::CategoryInstanceHandle     ConstructWorldHandle(
+        WorldEnvironmentCategory                         Category,
+        uint32_t                                         MoonSlotIndex,
+        const GeometricRaster::WorldSceneSpecification&  Scene) const;
     void                                            RefreshDuplicateProtection(OutlinerPanel& Outliner) const noexcept;
     void                                            ApplyBaselineSolarRadiance(
         GeometricRaster::WorldSceneSpecification& Scene,
         bool                                      SunActive) noexcept;
 
+    World::WorldInstanceRegister*           BoundWorldRegister       = nullptr;                         // [-]   - Optional WorldInstanceRegister for RAII handles
+    std::function<void(OutlinerSlotToken)>  OnEntryRemoved           {};                                // [-]   - Optional cleanup callback (e.g. Inspector)
     OutlinerSlotToken                       EnvironmentFolderToken   {};                                // [id]  - Single default "Environment" folder
     std::vector<RegisteredEnvironmentEntry> RegisteredSlots          {};                                // [-]   - Active environment registrations
     std::vector<EnvironmentUndoRecord>      UndoStack                {};                                // [-]   - Undo snapshots for clean Ctrl+Z restore

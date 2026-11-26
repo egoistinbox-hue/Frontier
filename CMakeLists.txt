@@ -1711,6 +1711,7 @@ if(BUILD_TESTING)
     if(FRONTIER_PROFILE STREQUAL "Editor")
         frontier_register_exhibit(SketcherWorkspaceValidation           Exhibits/ParametricSketcher/SketcherWorkspaceValidation.cpp)
         frontier_register_exhibit(WorldInstanceEditorBridgeValidation   Exhibits/WorldInstanceEditorBridgeValidation.cpp)
+        frontier_register_exhibit(OutlinerWorldLifecycleValidation      Exhibits/OutlinerWorldLifecycleValidation.cpp)
     endif()
 endif()
 

@@ -371,6 +371,15 @@ void EditorLifecycle::PopulateWorldSceneSession(uint32_t RenderWidthPx, uint32_t
         return;
     }
 
+    // Destroy prior scene's RAII handles, Outliner/Inspector bindings & stale per-entry state before loading the new scene!
+    EnvironmentRegistry.Reset();
+    EnvironmentRegistry.BindWorldRegister(nullptr);
+    InstanceEditorBridge.Unbind();
+    SceneSyncBridge.ClearBindings();
+    WorldRegister.ClearAll();
+    Inspectors.AccessInstances().Clear();
+    LastOutlinerVisibilitySig = 0ull;
+
     ShowcaseBundle     = std::make_unique<GeometricRaster::ShowcaseWorldSceneBundle>();
     ShowcaseRenderer   = std::make_unique<GeometricRaster::TieredWorldRenderSequence>();
     CachedWorldRgba8.clear();
@@ -495,21 +504,26 @@ void EditorLifecycle::PopulateWorldSceneSession(uint32_t RenderWidthPx, uint32_t
         GeometricRaster::RegisterShowcaseGalleryInOutliner(Panes->Outliner, *ShowcaseBundle, true);
     }
 
-    // Protect primary Editor camera from accidental deletion & adopt scene environment into single Environment folder
+    // Protect primary Editor camera from accidental deletion
     if (OutlinerRecordEntry* CamRec = Panes->Outliner.AccessEntry(ShowcaseBundle->EditorCameraToken))
     {
         CamRec->RemovalProtected = true;
         CamRec->RemovalReason    = "Primary editor camera cannot be removed";
     }
+
+    // Bind WorldInstanceRegister <-> OutlinerPanel <-> InspectorInstanceRegister BEFORE adopting environment/instances
+    // so every active world body owns a real RAII CategoryInstanceHandle whose destructor cleans World, Outliner & Inspector!
+    const auto EraseInspectorOnRemoval = [this](OutlinerSlotToken RemovedSlot)
+    {
+        Inspectors.AccessInstances().EraseEntry(RemovedSlot);
+    };
+    InstanceEditorBridge.BindOutliner(WorldRegister, Panes->Outliner, EraseInspectorOnRemoval);
+    EnvironmentRegistry.BindWorldRegister(&WorldRegister);
+    EnvironmentRegistry.BindRemovalCallback(EraseInspectorOnRemoval);
     EnvironmentRegistry.AdoptInitialSceneState(Panes->Outliner, ShowcaseBundle->Scene, &Panes->Viewport.AccessDisplaySettings());
     EnvironmentRegistry.RefreshViewportConstructRegistry(Panes->Viewport);
-
-    // Bind WorldInstanceRegister <-> OutlinerPanel and adopt loaded scene atmosphere/celestials into SoA registers
-    InstanceEditorBridge.Unbind();
-    SceneSyncBridge.ClearBindings();
-    WorldRegister.ClearAll();
-    InstanceEditorBridge.BindOutliner(WorldRegister, Panes->Outliner);
     InstanceEditorBridge.AdoptWorldSceneIntoRegister(WorldRegister, ShowcaseBundle->Scene);
+    (void)Inspectors.AccessInstances().PruneOrphanedEntries(Panes->Outliner);
 
     // Wire Construct modal -> WorldEnvironmentRegistry
     Panes->Viewport.ConfigureConstructApplyCallback(
@@ -2932,9 +2946,15 @@ bool EditorLifecycle::ExecuteExternalDesktopTick(double Δt)
             LastOutlinerVisibilitySig     = OutlinerVisSig;
 
             // Re-apply standalone multi-instance inspector bindings so user edits and multi-instance rigs stay authoritative
+            if (OutlinerVisChanged)
+            {
+                (void)InstanceEditorBridge.ReconcileDeletedOutlinerSlots();
+                (void)Inspectors.AccessInstances().PruneOrphanedEntries(Panes->Outliner);
+            }
             const bool InspectorEdited = PendingInteractionSceneSync || OutlinerVisChanged;
             if (InspectorEdited || EnvRegistryChanged)
             {
+                (void)Inspectors.AccessInstances().PruneOrphanedEntries(Panes->Outliner);
                 Inspectors.AccessInstances().CombineIntoScene(
                     Panes->Outliner,
                     ShowcaseBundle->Scene,

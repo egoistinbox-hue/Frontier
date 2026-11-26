@@ -109,10 +109,98 @@ bool WorldEnvironmentRegistry::ResolveCategoryFromRegistryKey(
 //                                                LIFECYCLE & ADOPTION
 //------------------------------------------------------------------------------------------------------------------------
 
+void WorldEnvironmentRegistry::BindWorldRegister(World::WorldInstanceRegister* TargetRegister) noexcept
+{
+    if (BoundWorldRegister != TargetRegister)
+    {
+        for (RegisteredEnvironmentEntry& Reg : RegisteredSlots)
+        {
+            Reg.InstanceHandle.Release();
+        }
+        BoundWorldRegister = TargetRegister;
+    }
+}
+
+void WorldEnvironmentRegistry::BindRemovalCallback(std::function<void(OutlinerSlotToken)> Callback) noexcept
+{
+    OnEntryRemoved = std::move(Callback);
+}
+
+World::CategoryInstanceHandle WorldEnvironmentRegistry::ConstructWorldHandle(
+    WorldEnvironmentCategory                        Category,
+    uint32_t                                        MoonSlotIndex,
+    const GeometricRaster::WorldSceneSpecification& Scene) const
+{
+    if (BoundWorldRegister == nullptr)
+    {
+        return {};
+    }
+
+    const auto& Atmo = Scene.Atmosphere;
+    switch (Category)
+    {
+        case WorldEnvironmentCategory::Atmosphere:
+        {
+            World::AtmosphereInstanceParameters Params{};
+            Params.RayleighScaleMeters    = Atmo.Medium.RayleighScaleHeightMeters;
+            Params.MieScaleMeters         = Atmo.Medium.MieScaleHeightMeters;
+            Params.OzoneDensityMultiplier = Atmo.Medium.OzoneStrength;
+            Params.ObserverAltitudeMeters = Atmo.Medium.ObserverAltitudeMeters;
+            Params.VisibilityEnabled      = Atmo.Medium.AtmosphereEnabled;
+            World::AtmosphereInstance Instance(*BoundWorldRegister, Params);
+            return Instance;
+        }
+        case WorldEnvironmentCategory::Sun:
+        {
+            World::SolarInstanceParameters Params{};
+            Params.AzimuthDegrees         = Atmo.Solar.ManualAzimuthDegrees;
+            Params.ElevationDegrees       = Atmo.Solar.ManualElevationDegrees;
+            Params.AngularDiameterDegrees = Atmo.Solar.AngularDiameterDegrees;
+            Params.IntensityMultiplier    = Atmo.Solar.SolarIntensityMultiplier;
+            Params.CycleAnimationEnabled  = Atmo.Solar.CycleAnimationEnabled;
+            Params.DayCycleSpeedDegreesS  =
+                (Atmo.Solar.DayDurationHours > 1.0e-3f) ? (360.0f / (Atmo.Solar.DayDurationHours * 3600.0f)) : 0.0f;
+            Params.VisibilityEnabled      = Atmo.Solar.SolarEnabled;
+            World::SolarInstance Instance(*BoundWorldRegister, Params);
+            return Instance;
+        }
+        case WorldEnvironmentCategory::Clouds:
+        {
+            World::CloudInstanceParameters Params{};
+            Params.BaseAltitudeMeters  = Atmo.Clouds.CloudFloorMeters;
+            Params.ThicknessMeters     = Atmo.Clouds.LayerThicknessMeters;
+            Params.DensityFraction     = Atmo.Clouds.CloudFraction;
+            Params.WindSpeedMetersPerS = Atmo.Clouds.WindSpeedMetersPerSecond;
+            Params.VisibilityEnabled   = Atmo.Clouds.CloudsEnabled;
+            World::CloudInstance Instance(*BoundWorldRegister, Params);
+            return Instance;
+        }
+        case WorldEnvironmentCategory::Moon:
+        {
+            const uint32_t ClampedSlot = std::min<uint32_t>(MoonSlotIndex, MaximumMoonCount - 1u);
+            const auto& Moon = Atmo.Moons[ClampedSlot];
+            World::LunarInstanceParameters Params{};
+            Params.MoonSlotOrdinal        = ClampedSlot;
+            Params.RightAscensionDegrees  = Moon.AzimuthDegrees;
+            Params.DeclinationDegrees     = Moon.ElevationDegrees;
+            Params.AngularDiameterDegrees = Moon.AngularDiameterDegrees;
+            Params.PhaseAngleDegrees      = Moon.SynodicPhaseFraction * 360.0f;
+            Params.OrbitalRateDegreesPerS = 0.0f;
+            Params.AlbedoReflectance      = 0.136f;
+            Params.VisibilityEnabled      = Moon.Visible;
+            World::LunarInstance Instance(*BoundWorldRegister, Params);
+            return Instance;
+        }
+        case WorldEnvironmentCategory::Stars:
+        default:
+            return {};
+    }
+}
+
 void WorldEnvironmentRegistry::Reset() noexcept
 {
     EnvironmentFolderToken = {};
-    RegisteredSlots.clear();
+    RegisteredSlots.clear(); // Executes RAII ~CategoryInstanceHandle() for every bound environment instance
     UndoStack.clear();
     CachedSolarIrradiance  = { 5.40f, 5.12f, 4.72f };
     CachedFallbackSky      = { 0.0f, 0.0f, 0.0f };
@@ -135,57 +223,184 @@ void WorldEnvironmentRegistry::AdoptInitialSceneState(
     CachedFallbackSky   = Scene.SkyRadiance;
     FallbackSkyCaptured = true;
 
-    const auto AdoptExistingByTag = [&](WorldEnvironmentCategory Category, uint32_t MoonSlot = 0u) -> bool
+    const auto& Atmo = Scene.Atmosphere;
+
+    // Helper: prune ALL phantom Outliner rows for an environment tag that does NOT exist in Scene.Atmosphere!
+    const auto PrunePhantomByTag = [&](std::string_view Tag)
+    {
+        std::vector<OutlinerSlotToken> Phantoms{};
+        for (const OutlinerRecordEntry& Entry : Outliner.QueryEntries())
+        {
+            if (Entry.DomainTag == Tag)
+            {
+                Phantoms.push_back(Entry.Token);
+            }
+        }
+        for (const OutlinerSlotToken Tok : Phantoms)
+        {
+            if (OutlinerRecordEntry* Mut = Outliner.AccessEntry(Tok))
+            {
+                Mut->RemovalProtected = false;
+            }
+            (void)Outliner.DeleteSlot(Tok);
+            if (OnEntryRemoved)
+            {
+                OnEntryRemoved(Tok);
+            }
+        }
+    };
+
+    const auto AdoptExistingSingleton = [&](WorldEnvironmentCategory Category) -> bool
     {
         const char* ExpectedTag = QueryDomainTag(Category);
         for (const OutlinerRecordEntry& Entry : Outliner.QueryEntries())
         {
             if (Entry.DomainTag == ExpectedTag)
             {
-                RegisteredSlots.push_back({ Entry.Token, Category, MoonSlot, Entry.Title, Entry.VisibilityEnabled });
+                RegisteredEnvironmentEntry Reg{};
+                Reg.Token          = Entry.Token;
+                Reg.Category       = Category;
+                Reg.MoonSlotIndex  = 0u;
+                Reg.Title          = Entry.Title;
+                Reg.LastVisible    = Entry.VisibilityEnabled;
+                Reg.InstanceHandle = ConstructWorldHandle(Category, 0u, Scene);
+                RegisteredSlots.push_back(std::move(Reg));
                 return true;
             }
         }
         return false;
     };
 
-    const auto& Atmo = Scene.Atmosphere;
-    if (!AdoptExistingByTag(WorldEnvironmentCategory::Atmosphere) && Atmo.Medium.AtmosphereEnabled)
+    // Strict World-Existence Invariant: adopt/create ONLY what is actually enabled in Scene; prune phantoms!
+    if (Atmo.Medium.AtmosphereEnabled)
     {
-        RegisterCategory(WorldEnvironmentCategory::Atmosphere, "Atmosphere", Outliner, Scene, DisplaySettings);
+        if (!AdoptExistingSingleton(WorldEnvironmentCategory::Atmosphere))
+        {
+            RegisterCategory(WorldEnvironmentCategory::Atmosphere, "Atmosphere", Outliner, Scene, DisplaySettings);
+        }
     }
-    if (!AdoptExistingByTag(WorldEnvironmentCategory::Sun) && Atmo.Solar.SolarEnabled)
+    else
     {
-        RegisterCategory(WorldEnvironmentCategory::Sun, "Sun", Outliner, Scene, DisplaySettings);
+        PrunePhantomByTag("env:atmosphere");
     }
-    if (!AdoptExistingByTag(WorldEnvironmentCategory::Clouds) && Atmo.Clouds.CloudsEnabled)
+
+    if (Atmo.Solar.SolarEnabled)
     {
-        RegisterCategory(WorldEnvironmentCategory::Clouds, "Clouds", Outliner, Scene, DisplaySettings);
+        if (!AdoptExistingSingleton(WorldEnvironmentCategory::Sun))
+        {
+            RegisterCategory(WorldEnvironmentCategory::Sun, "Sun", Outliner, Scene, DisplaySettings);
+        }
     }
-    if (!AdoptExistingByTag(WorldEnvironmentCategory::Moon, 0u))
+    else
     {
+        PrunePhantomByTag("env:sun");
+    }
+
+    if (Atmo.Clouds.CloudsEnabled)
+    {
+        if (!AdoptExistingSingleton(WorldEnvironmentCategory::Clouds))
+        {
+            RegisterCategory(WorldEnvironmentCategory::Clouds, "Clouds", Outliner, Scene, DisplaySettings);
+        }
+    }
+    else
+    {
+        PrunePhantomByTag("env:clouds");
+    }
+
+    if (!Atmo.LocalCloud.LocalEnabled)
+    {
+        PrunePhantomByTag("env:local-cloud");
+    }
+
+    // Moons [0..5]: adopt only up to the exact number of visible moons in Scene; prune any excess/phantom Moon rows!
+    {
+        std::vector<uint32_t> VisibleMoonSlots{};
         for (uint32_t SlotIdx = 0u; SlotIdx < MaximumMoonCount; ++SlotIdx)
         {
             if (Atmo.Moons[SlotIdx].Visible)
             {
-                const std::string MoonTitle = (SlotIdx == 0u) ? "Moon" : ("Moon " + std::to_string(SlotIdx + 1u));
-                const OutlinerSlotToken FolderToken = EnsureEnvironmentFolder(Outliner);
-                OutlinerRecordEntry Record{};
-                Record.Title              = MoonTitle;
-                Record.Subtitle           = QueryCategorySubtitle(WorldEnvironmentCategory::Moon);
-                Record.Category           = QueryFallbackSlotCategory(WorldEnvironmentCategory::Moon);
-                Record.EnclosingToken     = FolderToken;
-                Record.VisibilityEnabled  = true;
-                Record.Expanded           = true;
-                Record.DomainTag          = QueryDomainTag(WorldEnvironmentCategory::Moon);
-                const OutlinerSlotToken Issued = Outliner.ConstructDirectEntry(std::move(Record));
-                RegisteredSlots.push_back({ Issued, WorldEnvironmentCategory::Moon, SlotIdx, MoonTitle, true });
+                VisibleMoonSlots.push_back(SlotIdx);
             }
         }
+
+        std::vector<OutlinerSlotToken> ExistingMoonTokens{};
+        for (const OutlinerRecordEntry& Entry : Outliner.QueryEntries())
+        {
+            if (Entry.DomainTag == "env:moon")
+            {
+                ExistingMoonTokens.push_back(Entry.Token);
+            }
+        }
+
+        const std::size_t AdoptCount = std::min(VisibleMoonSlots.size(), ExistingMoonTokens.size());
+        for (std::size_t I = 0u; I < AdoptCount; ++I)
+        {
+            const OutlinerSlotToken Tok = ExistingMoonTokens[I];
+            const uint32_t SlotIdx      = VisibleMoonSlots[I];
+            const OutlinerRecordEntry* Entry = Outliner.FindEntry(Tok);
+            RegisteredEnvironmentEntry Reg{};
+            Reg.Token          = Tok;
+            Reg.Category       = WorldEnvironmentCategory::Moon;
+            Reg.MoonSlotIndex  = SlotIdx;
+            Reg.Title          = (Entry != nullptr) ? Entry->Title : ((SlotIdx == 0u) ? "Moon" : ("Moon " + std::to_string(SlotIdx + 1u)));
+            Reg.LastVisible    = true;
+            Reg.InstanceHandle = ConstructWorldHandle(WorldEnvironmentCategory::Moon, SlotIdx, Scene);
+            RegisteredSlots.push_back(std::move(Reg));
+        }
+
+        // Prune any phantom Moon rows that have no matching visible moon in Scene!
+        for (std::size_t I = AdoptCount; I < ExistingMoonTokens.size(); ++I)
+        {
+            const OutlinerSlotToken PhantomTok = ExistingMoonTokens[I];
+            if (OutlinerRecordEntry* Mut = Outliner.AccessEntry(PhantomTok))
+            {
+                Mut->RemovalProtected = false;
+            }
+            (void)Outliner.DeleteSlot(PhantomTok);
+            if (OnEntryRemoved)
+            {
+                OnEntryRemoved(PhantomTok);
+            }
+        }
+
+        // Create Outliner rows + RAII handles for any visible scene moons not yet in Outliner
+        for (std::size_t I = AdoptCount; I < VisibleMoonSlots.size(); ++I)
+        {
+            const uint32_t SlotIdx      = VisibleMoonSlots[I];
+            const std::string MoonTitle = (SlotIdx == 0u) ? "Moon" : ("Moon " + std::to_string(SlotIdx + 1u));
+            const OutlinerSlotToken FolderToken = EnsureEnvironmentFolder(Outliner);
+            OutlinerRecordEntry Record{};
+            Record.Title             = MoonTitle;
+            Record.Subtitle          = QueryCategorySubtitle(WorldEnvironmentCategory::Moon);
+            Record.Category          = QueryFallbackSlotCategory(WorldEnvironmentCategory::Moon);
+            Record.EnclosingToken    = FolderToken;
+            Record.VisibilityEnabled = true;
+            Record.Expanded          = true;
+            Record.DomainTag         = QueryDomainTag(WorldEnvironmentCategory::Moon);
+            const OutlinerSlotToken Issued = Outliner.ConstructDirectEntry(std::move(Record));
+
+            RegisteredEnvironmentEntry Reg{};
+            Reg.Token          = Issued;
+            Reg.Category       = WorldEnvironmentCategory::Moon;
+            Reg.MoonSlotIndex  = SlotIdx;
+            Reg.Title          = MoonTitle;
+            Reg.LastVisible    = true;
+            Reg.InstanceHandle = ConstructWorldHandle(WorldEnvironmentCategory::Moon, SlotIdx, Scene);
+            RegisteredSlots.push_back(std::move(Reg));
+        }
     }
-    if (!AdoptExistingByTag(WorldEnvironmentCategory::Stars) && Atmo.Stars.StarfieldEnabled)
+
+    if (Atmo.Stars.StarfieldEnabled)
     {
-        RegisterCategory(WorldEnvironmentCategory::Stars, "Stars", Outliner, Scene, DisplaySettings);
+        if (!AdoptExistingSingleton(WorldEnvironmentCategory::Stars))
+        {
+            RegisterCategory(WorldEnvironmentCategory::Stars, "Stars", Outliner, Scene, DisplaySettings);
+        }
+    }
+    else
+    {
+        PrunePhantomByTag("env:stars");
     }
 
     RefreshDuplicateProtection(Outliner);
@@ -320,7 +535,14 @@ OutlinerSlotToken WorldEnvironmentRegistry::RegisterCategory(
     const OutlinerSlotToken Issued = Outliner.ConstructDirectEntry(std::move(Record));
     Outliner.SelectSingle(Issued);
 
-    RegisteredSlots.push_back({ Issued, Category, AssignedMoonSlot, FinalTitle, true });
+    RegisteredEnvironmentEntry Reg{};
+    Reg.Token          = Issued;
+    Reg.Category       = Category;
+    Reg.MoonSlotIndex  = AssignedMoonSlot;
+    Reg.Title          = FinalTitle;
+    Reg.LastVisible    = true;
+    Reg.InstanceHandle = ConstructWorldHandle(Category, AssignedMoonSlot, Scene);
+    RegisteredSlots.push_back(std::move(Reg));
     RefreshDuplicateProtection(Outliner);
     SyncToWorld(Outliner, Scene, DisplaySettings);
     return Issued;
@@ -592,8 +814,15 @@ uint32_t WorldEnvironmentRegistry::UnregisterSlots(
         EnvironmentFolderToken = {};
     }
 
-    // Delete all requested non-protected Outliner slots
+    // Delete all requested non-protected Outliner slots and notify Inspector removal hook
     uint32_t RemovedCount = 0u;
+    for (const OutlinerSlotToken Tok : Expanded)
+    {
+        if (OnEntryRemoved)
+        {
+            OnEntryRemoved(Tok);
+        }
+    }
     for (const OutlinerSlotToken Tok : Tokens)
     {
         if (Outliner.DeleteSlot(Tok))
@@ -687,7 +916,14 @@ bool WorldEnvironmentRegistry::UndoLastRemoval(
         }
 
         const OutlinerSlotToken Issued = Outliner.ConstructDirectEntry(std::move(OutlinerRec));
-        RegisteredSlots.push_back({ Issued, Snap.Category, MoonSlot, Snap.Title, Snap.Visibility });
+        RegisteredEnvironmentEntry Reg{};
+        Reg.Token          = Issued;
+        Reg.Category       = Snap.Category;
+        Reg.MoonSlotIndex  = MoonSlot;
+        Reg.Title          = Snap.Title;
+        Reg.LastVisible    = Snap.Visibility;
+        Reg.InstanceHandle = ConstructWorldHandle(Snap.Category, MoonSlot, Scene);
+        RegisteredSlots.push_back(std::move(Reg));
         LastRestored = Issued;
     }
 
@@ -710,14 +946,22 @@ bool WorldEnvironmentRegistry::SyncToWorld(
     GeometricRaster::WorldSceneSpecification& Scene,
     ViewportDisplaySettings*                  DisplaySettings)
 {
-    // Prune any tokens removed outside the registry
+    // Prune any tokens removed outside the registry (executes RAII ~CategoryInstanceHandle() + Inspector cleanup!)
     RegisteredSlots.erase(
         std::remove_if(
             RegisteredSlots.begin(),
             RegisteredSlots.end(),
             [&](const RegisteredEnvironmentEntry& Reg) noexcept
             {
-                return Outliner.FindEntry(Reg.Token) == nullptr;
+                if (Outliner.FindEntry(Reg.Token) == nullptr)
+                {
+                    if (OnEntryRemoved)
+                    {
+                        OnEntryRemoved(Reg.Token);
+                    }
+                    return true;
+                }
+                return false;
             }),
         RegisteredSlots.end());
 

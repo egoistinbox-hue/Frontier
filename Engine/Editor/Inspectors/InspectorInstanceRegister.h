@@ -421,6 +421,12 @@ public:
     ImportedGeometryData&         AccessImportedGeometry(OutlinerSlotToken Token, const OutlinerRecordEntry& Entry, const GeometricRaster::WorldSceneSpecification& Scene);
     ProceduralGeometryData&       AccessProceduralGeometry(OutlinerSlotToken Token, const OutlinerRecordEntry& Entry, const GeometricRaster::WorldSceneSpecification& Scene);
 
+    // Removes any Inspector instance state whose OutlinerSlotToken no longer exists in Outliner (prevents ghost Inspector entries)
+    uint32_t PruneOrphanedEntries(const OutlinerPanel& Outliner) noexcept;
+
+    // Total number of live per-entry Inspector records across all categories
+    [[nodiscard]] uint32_t QueryTrackedEntryCount() const noexcept;
+
     // Combines ALL visible Outliner instances across ALL folders into WorldSceneSpecification & ViewportDisplaySettings
     void CombineIntoScene(
         const OutlinerPanel&                      Outliner,

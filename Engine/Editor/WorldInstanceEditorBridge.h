@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -46,11 +47,15 @@ public:
     WorldInstanceEditorBridge& operator=(const WorldInstanceEditorBridge&) = delete;
 
     void BindOutliner(
-        World::WorldInstanceRegister& TargetRegister,
-        OutlinerPanel&                TargetOutliner);
+        World::WorldInstanceRegister&          TargetRegister,
+        OutlinerPanel&                         TargetOutliner,
+        std::function<void(OutlinerSlotToken)> OnOutlinerSlotRemoved = {});
 
     void Unbind() noexcept;
     void ReleaseManagedInstances() noexcept;
+
+    // Reconciles any Outliner rows deleted externally so their RAII CategoryInstanceHandles are immediately destroyed
+    uint32_t ReconcileDeletedOutlinerSlots() noexcept;
 
     // Adopts active atmosphere, solar, lunar & cloud participants from a loaded WorldScene into SoA registers
     void AdoptWorldSceneIntoRegister(
@@ -112,6 +117,7 @@ private:
 
     World::WorldInstanceRegister*                   BoundRegister         = nullptr; // [-] - Bound world instance register
     OutlinerPanel*                                  BoundOutliner         = nullptr; // [-] - Bound Editor Outliner panel
+    std::function<void(OutlinerSlotToken)>          OnSlotRemovedCallback {};        // [-] - Optional cleanup callback (e.g. Inspector)
     std::unordered_map<uint32_t, OutlinerSlotToken> InstanceToOutlinerMap {};        // [-] - Instance SlotIndex -> OutlinerSlotToken
     std::unordered_map<uint32_t, World::InstanceToken> OutlinerToInstanceMap {};     // [-] - Outliner Identifier -> InstanceToken
 

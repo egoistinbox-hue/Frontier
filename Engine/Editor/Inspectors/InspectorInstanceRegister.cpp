@@ -134,9 +134,75 @@ LunarInstanceData& InspectorInstanceRegister::AccessLunar(
     if (Inserted)
     {
         It->second.Moon = Scene.Atmosphere.Moons[std::min<uint32_t>(SeedSlot, 5u)];
-        It->second.Moon.Visible = true;
     }
     return It->second;
+}
+
+uint32_t InspectorInstanceRegister::PruneOrphanedEntries(const OutlinerPanel& Outliner) noexcept
+{
+    uint32_t Pruned = 0u;
+    const auto PruneMap = [&](auto& Map) noexcept
+    {
+        for (auto It = Map.begin(); It != Map.end(); )
+        {
+            const OutlinerSlotToken Tok{ static_cast<uint32_t>(It->first) };
+            if (Outliner.FindEntry(Tok) == nullptr)
+            {
+                It = Map.erase(It);
+                ++Pruned;
+            }
+            else
+            {
+                ++It;
+            }
+        }
+    };
+
+    PruneMap(Atmospheres);
+    PruneMap(Suns);
+    PruneMap(Clouds);
+    PruneMap(LocalClouds);
+    PruneMap(Moons);
+    PruneMap(Starfields);
+    PruneMap(Winds);
+    PruneMap(HeightFogs);
+    PruneMap(AtmosphericFogs);
+    PruneMap(LocalFogs);
+    PruneMap(GodRays);
+    PruneMap(Precipitations);
+    PruneMap(Rainbows);
+    PruneMap(Cameras);
+    PruneMap(CameraSettingsEntries);
+    PruneMap(LensFlares);
+    PruneMap(MotionBlurs);
+    PruneMap(Exposures);
+    PruneMap(PointLights);
+    PruneMap(SpotLights);
+    PruneMap(IesLights);
+    PruneMap(AreaLights);
+    PruneMap(TubeLights);
+    PruneMap(LedLights);
+    PruneMap(LedStrips);
+    PruneMap(EnvironmentLights);
+    PruneMap(PostProcesses);
+    PruneMap(AnalyticPrimitives);
+    PruneMap(NativeGeometries);
+    PruneMap(ImportedGeometries);
+    PruneMap(ProceduralGeometries);
+    return Pruned;
+}
+
+uint32_t InspectorInstanceRegister::QueryTrackedEntryCount() const noexcept
+{
+    return static_cast<uint32_t>(
+        Atmospheres.size() + Suns.size() + Clouds.size() + LocalClouds.size() + Moons.size() +
+        Starfields.size() + Winds.size() + HeightFogs.size() + AtmosphericFogs.size() +
+        LocalFogs.size() + GodRays.size() + Precipitations.size() + Rainbows.size() +
+        Cameras.size() + CameraSettingsEntries.size() + LensFlares.size() + MotionBlurs.size() +
+        Exposures.size() + PointLights.size() + SpotLights.size() + IesLights.size() +
+        AreaLights.size() + TubeLights.size() + LedLights.size() + LedStrips.size() +
+        EnvironmentLights.size() + PostProcesses.size() + AnalyticPrimitives.size() +
+        NativeGeometries.size() + ImportedGeometries.size() + ProceduralGeometries.size());
 }
 
 StarfieldInstanceData& InspectorInstanceRegister::AccessStarfield(

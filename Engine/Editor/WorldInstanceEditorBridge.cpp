@@ -55,13 +55,15 @@ ConstructSlotCategory WorldInstanceEditorBridge::ResolveOutlinerCategory(World::
 }
 
 void WorldInstanceEditorBridge::BindOutliner(
-    World::WorldInstanceRegister& TargetRegister,
-    OutlinerPanel&                TargetOutliner)
+    World::WorldInstanceRegister&          TargetRegister,
+    OutlinerPanel&                         TargetOutliner,
+    std::function<void(OutlinerSlotToken)> OnOutlinerSlotRemoved)
 {
     Unbind();
 
-    BoundRegister = &TargetRegister;
-    BoundOutliner = &TargetOutliner;
+    BoundRegister         = &TargetRegister;
+    BoundOutliner         = &TargetOutliner;
+    OnSlotRemovedCallback = std::move(OnOutlinerSlotRemoved);
 
     World::EditorSurfaceAdapter Adapter{};
     Adapter.RegisterEditorEntry = [this](const World::EditorInstanceRegistrationDescriptor& Descriptor)
@@ -112,6 +114,10 @@ void WorldInstanceEditorBridge::BindOutliner(
             }
             (void)BoundOutliner->DeleteSlot(OutlinerSlot);
         }
+        if (OnSlotRemovedCallback && OutlinerSlot.Valid())
+        {
+            OnSlotRemovedCallback(OutlinerSlot);
+        }
     };
 
     Adapter.AssignEditorVisibility = [this](World::InstanceToken Token, bool VisibilityEnabled)
@@ -145,14 +151,53 @@ void WorldInstanceEditorBridge::Unbind() noexcept
 
     InstanceToOutlinerMap.clear();
     OutlinerToInstanceMap.clear();
-    BoundRegister = nullptr;
-    BoundOutliner = nullptr;
+    OnSlotRemovedCallback = {};
+    BoundRegister         = nullptr;
+    BoundOutliner         = nullptr;
 }
 
 void WorldInstanceEditorBridge::ReleaseManagedInstances() noexcept
 {
     ManagedHandles.clear();
     DocumentModelsBySlot.clear();
+}
+
+uint32_t WorldInstanceEditorBridge::ReconcileDeletedOutlinerSlots() noexcept
+{
+    if (BoundOutliner == nullptr || OutlinerToInstanceMap.empty())
+    {
+        return 0u;
+    }
+
+    std::vector<World::InstanceToken> OrphanedInstances{};
+    std::vector<OutlinerSlotToken>    OrphanedSlots{};
+    for (const auto& [SlotId, InstToken] : OutlinerToInstanceMap)
+    {
+        const OutlinerSlotToken SlotTok{ SlotId };
+        if (BoundOutliner->FindEntry(SlotTok) == nullptr)
+        {
+            OrphanedInstances.push_back(InstToken);
+            OrphanedSlots.push_back(SlotTok);
+        }
+    }
+
+    uint32_t Reclaimed = 0u;
+    for (std::size_t I = 0u; I < OrphanedInstances.size(); ++I)
+    {
+        if (RemoveManagedInstance(OrphanedInstances[I]))
+        {
+            ++Reclaimed;
+        }
+        else if (BoundRegister != nullptr && BoundRegister->ReclaimInstanceSlot(OrphanedInstances[I]))
+        {
+            ++Reclaimed;
+        }
+        else if (OnSlotRemovedCallback)
+        {
+            OnSlotRemovedCallback(OrphanedSlots[I]);
+        }
+    }
+    return Reclaimed;
 }
 
 void WorldInstanceEditorBridge::AdoptWorldSceneIntoRegister(
@@ -163,19 +208,20 @@ void WorldInstanceEditorBridge::AdoptWorldSceneIntoRegister(
 
     const GeometricRaster::WorldAtmosphereConfiguration& Atmo = Scene.Atmosphere;
 
-    // Adopt Atmosphere medium (Production constructor: avoids duplicating WorldEnvironmentRegistry Outliner rows)
+    // Strict World-Existence Invariant: adopt ONLY features that genuinely exist in Scene & aren't already owned!
+    if (Atmo.Medium.AtmosphereEnabled && TargetRegister.AccessAtmosphereRegister().QueryActiveCount() == 0u)
     {
         World::AtmosphereInstanceParameters Params{};
         Params.RayleighScaleMeters    = Atmo.Medium.RayleighScaleHeightMeters;
         Params.MieScaleMeters         = Atmo.Medium.MieScaleHeightMeters;
         Params.OzoneDensityMultiplier = Atmo.Medium.OzoneStrength;
         Params.ObserverAltitudeMeters = Atmo.Medium.ObserverAltitudeMeters;
-        Params.VisibilityEnabled      = Atmo.Medium.AtmosphereEnabled;
+        Params.VisibilityEnabled      = true;
         World::AtmosphereInstance Instance(TargetRegister, Params);
         ManagedHandles.push_back(std::move(Instance));
     }
 
-    // Adopt Solar body
+    if (Atmo.Solar.SolarEnabled && TargetRegister.AccessSolarRegister().QueryActiveCount() == 0u)
     {
         World::SolarInstanceParameters Params{};
         Params.AzimuthDegrees         = Atmo.Solar.ManualAzimuthDegrees;
@@ -185,43 +231,45 @@ void WorldInstanceEditorBridge::AdoptWorldSceneIntoRegister(
         Params.CycleAnimationEnabled  = Atmo.Solar.CycleAnimationEnabled;
         Params.DayCycleSpeedDegreesS  =
             (Atmo.Solar.DayDurationHours > 1.0e-3f) ? (360.0f / (Atmo.Solar.DayDurationHours * 3600.0f)) : 0.0f;
-        Params.VisibilityEnabled      = Atmo.Solar.SolarEnabled;
+        Params.VisibilityEnabled      = true;
         World::SolarInstance Instance(TargetRegister, Params);
         ManagedHandles.push_back(std::move(Instance));
     }
 
-    // Adopt Cloud deck
+    if (Atmo.Clouds.CloudsEnabled && TargetRegister.AccessCloudRegister().QueryActiveCount() == 0u)
     {
         World::CloudInstanceParameters Params{};
         Params.BaseAltitudeMeters  = Atmo.Clouds.CloudFloorMeters;
         Params.ThicknessMeters     = Atmo.Clouds.LayerThicknessMeters;
         Params.DensityFraction     = Atmo.Clouds.CloudFraction;
         Params.WindSpeedMetersPerS = Atmo.Clouds.WindSpeedMetersPerSecond;
-        Params.VisibilityEnabled   = Atmo.Clouds.CloudsEnabled;
+        Params.VisibilityEnabled   = true;
         World::CloudInstance Instance(TargetRegister, Params);
         ManagedHandles.push_back(std::move(Instance));
     }
 
-    // Adopt active Lunar bodies [0..5]
-    for (uint32_t SlotIndex = 0u; SlotIndex < static_cast<uint32_t>(Atmo.Moons.size()); ++SlotIndex)
+    if (TargetRegister.AccessLunarRegister().QueryActiveCount() == 0u)
     {
-        const GeometricRaster::LunarBodyConfiguration& Moon = Atmo.Moons[SlotIndex];
-        if (!Moon.Visible)
+        for (uint32_t SlotIndex = 0u; SlotIndex < static_cast<uint32_t>(Atmo.Moons.size()); ++SlotIndex)
         {
-            continue;
-        }
+            const GeometricRaster::LunarBodyConfiguration& Moon = Atmo.Moons[SlotIndex];
+            if (!Moon.Visible)
+            {
+                continue;
+            }
 
-        World::LunarInstanceParameters Params{};
-        Params.MoonSlotOrdinal        = SlotIndex;
-        Params.RightAscensionDegrees  = Moon.AzimuthDegrees;
-        Params.DeclinationDegrees     = Moon.ElevationDegrees;
-        Params.AngularDiameterDegrees = Moon.AngularDiameterDegrees;
-        Params.PhaseAngleDegrees      = Moon.SynodicPhaseFraction * 360.0f;
-        Params.OrbitalRateDegreesPerS = 0.0f;
-        Params.AlbedoReflectance      = 0.136f;
-        Params.VisibilityEnabled      = Moon.Visible;
-        World::LunarInstance Instance(TargetRegister, Params);
-        ManagedHandles.push_back(std::move(Instance));
+            World::LunarInstanceParameters Params{};
+            Params.MoonSlotOrdinal        = SlotIndex;
+            Params.RightAscensionDegrees  = Moon.AzimuthDegrees;
+            Params.DeclinationDegrees     = Moon.ElevationDegrees;
+            Params.AngularDiameterDegrees = Moon.AngularDiameterDegrees;
+            Params.PhaseAngleDegrees      = Moon.SynodicPhaseFraction * 360.0f;
+            Params.OrbitalRateDegreesPerS = 0.0f;
+            Params.AlbedoReflectance      = 0.136f;
+            Params.VisibilityEnabled      = true;
+            World::LunarInstance Instance(TargetRegister, Params);
+            ManagedHandles.push_back(std::move(Instance));
+        }
     }
 
     // Flush initial adoption RequireRebuild bits so idle Edit Mode starts with zero redundant work

@@ -194,8 +194,10 @@ bool ParseBotanicalTomlOverlay(
 
     if (const auto* f = root["Fern"].as_table())
     {
+        ReadScalar(f, "DetailTier", sp.Fern.DetailTier);
         ReadScalar(f, "CrownRadiusMeters", sp.Fern.CrownRadiusMeters);
         ReadScalar(f, "CaudexHeightMeters", sp.Fern.CaudexHeightMeters);
+        ReadScalar(f, "RamentaDensity", sp.Fern.RamentaDensity);
         ReadScalar(f, "FrondCount", sp.Fern.FrondCount);
         ReadScalar(f, "FrondLengthMeters", sp.Fern.FrondLengthMeters);
         ReadScalar(f, "FrondLengthVar", sp.Fern.FrondLengthVar);
@@ -211,14 +213,27 @@ bool ParseBotanicalTomlOverlay(
         ReadScalar(f, "CrosierHeightMeters", sp.Fern.CrosierHeightMeters);
         ReadScalar(f, "CrosierTurns", sp.Fern.CrosierTurns);
         ReadScalar(f, "PinnaPairs", sp.Fern.PinnaPairs);
+        ReadScalar(f, "PinnulePairs", sp.Fern.PinnulePairs);
         ReadScalar(f, "PinnaAngleDeg", sp.Fern.PinnaAngleDeg);
         ReadScalar(f, "Auricle", sp.Fern.Auricle);
         ReadScalar(f, "SerrationDepth", sp.Fern.SerrationDepth);
+        ReadScalar(f, "SerrationCount", sp.Fern.SerrationCount);
+        ReadScalar(f, "LaminaThicknessMm", sp.Fern.LaminaThicknessMm);
+        ReadScalar(f, "MidribRelief", sp.Fern.MidribRelief);
+        ReadScalar(f, "VeinRelief", sp.Fern.VeinRelief);
+        ReadScalar(f, "VeinCount", sp.Fern.VeinCount);
+        ReadScalar(f, "Bullation", sp.Fern.Bullation);
         ReadScalar(f, "LaminaCamber", sp.Fern.LaminaCamber);
+        ReadScalar(f, "EdgeUndulation", sp.Fern.EdgeUndulation);
+        ReadScalar(f, "TipCurl", sp.Fern.TipCurl);
+        ReadScalar(f, "SoriCoverage", sp.Fern.SoriCoverage);
+        ReadScalar(f, "SoriSizeMm", sp.Fern.SoriSizeMm);
+        ReadScalar(f, "Senescence", sp.Fern.Senescence);
     }
 
     if (const auto* p = root["Palm"].as_table())
     {
+        ReadScalar(p, "DetailTier", sp.Palm.DetailTier);
         ReadScalar(p, "TrunkLeanDeg", sp.Palm.TrunkLeanDeg);
         ReadScalar(p, "TrunkCurveDeg", sp.Palm.TrunkCurveDeg);
         ReadScalar(p, "BasalBole", sp.Palm.BasalBole);
@@ -230,22 +245,28 @@ bool ParseBotanicalTomlOverlay(
         ReadScalar(p, "FrondLengthMeters", sp.Palm.FrondLengthMeters);
         ReadScalar(p, "FrondWidthMeters", sp.Palm.FrondWidthMeters);
         ReadScalar(p, "FrondArchDeg", sp.Palm.FrondArchDeg);
+        ReadScalar(p, "SkirtFraction", sp.Palm.SkirtFraction);
         ReadScalar(p, "LeafletPairs", sp.Palm.LeafletPairs);
         ReadScalar(p, "PlumoseSplay", sp.Palm.PlumoseSplay);
         ReadBool(p, "ShowFruits", sp.Palm.ShowFruits);
         ReadScalar(p, "FruitBunches", sp.Palm.FruitBunches);
         ReadScalar(p, "FruitAbundance", sp.Palm.FruitAbundance);
+        ReadScalar(p, "FruitRipeness", sp.Palm.FruitRipeness);
     }
 
     if (const auto* tr = root["Tree"].as_table())
     {
+        ReadScalar(tr, "DetailTier", sp.Tree.DetailTier);
         ReadScalar(tr, "BranchLevels", sp.Tree.BranchLevels);
         ReadScalar(tr, "LimbCount", sp.Tree.LimbCount);
         ReadScalar(tr, "BranchAngleDeg", sp.Tree.BranchAngleDeg);
         ReadScalar(tr, "ForkTendency", sp.Tree.ForkTendency);
         ReadScalar(tr, "CanopyFlatten", sp.Tree.CanopyFlatten);
         ReadScalar(tr, "ButtressRelief", sp.Tree.ButtressRelief);
+        ReadScalar(tr, "RootLaterals", sp.Tree.RootLaterals);
+        ReadScalar(tr, "CollarFillet", sp.Tree.CollarFillet);
         ReadScalar(tr, "PipeConservation", sp.Tree.PipeConservation);
+        ReadBool(tr, "ShowLeaves", sp.Tree.ShowLeaves);
         ReadScalar(tr, "LeafDensity", sp.Tree.LeafDensity);
         ReadScalar(tr, "LeafSizeMeters", sp.Tree.LeafSizeMeters);
     }

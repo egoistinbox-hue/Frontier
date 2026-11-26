@@ -948,7 +948,7 @@ void BuildTreeGeometry(const BotanicalSpeciesDefinition& sp, uint32_t seed, uint
     meshCfg.CollarScale         = 1.28f;
     meshCfg.CollarLength        = 1.18f;
     meshCfg.CollarRings         = 2u;
-    meshCfg.CollarFillet        = 0.78f;
+    meshCfg.CollarFillet        = std::clamp(tp.CollarFillet, 0.20f, 0.98f);
     meshCfg.CollarMitre         = 0.52f;
     meshCfg.MinRadius           = 0.006f;
     meshCfg.CapTips             = true;
@@ -1013,8 +1013,8 @@ void BuildTreeGeometry(const BotanicalSpeciesDefinition& sp, uint32_t seed, uint
     float lobePhase = static_cast<float>(seed % 360u) * kDeg2Rad;
     float treeHeightEst = std::max(4.0f, sp.Trunk.HeightMeters);
     const float basalFlare = std::max(0.25f, sp.Trunk.FlareRatio - 1.0f);
-    const float buttressRelief = 0.42f;
-    const float forkTendency = 0.38f;
+    const float buttressRelief = std::clamp(tp.ButtressRelief, 0.0f, 0.85f);
+    const float forkTendency = std::clamp(tp.ForkTendency, 0.0f, 0.85f);
 
     auto evalShootRadius = [&](uint32_t stemId, uint32_t level, float s) -> float
     {
@@ -1547,6 +1547,7 @@ void BuildTreeGeometry(const BotanicalSpeciesDefinition& sp, uint32_t seed, uint
         return false;
     };
 
+    if (tp.ShowLeaves)
     for (const auto& lp : leafSpots)
     {
         if (!lp.Stem || isDroppedChain(lp.Stem.get()) || lp.Stem->Nodes.empty()) continue;

@@ -76,8 +76,10 @@ struct BotanicalRootsSection
 
 struct BotanicalFernSection
 {
+    uint32_t DetailTier          = 3u;
     float    CrownRadiusMeters   = 0.065f;
     float    CaudexHeightMeters  = 0.04f;
+    float    RamentaDensity      = 0.70f;
     uint32_t FrondCount          = 16u;
     float    FrondLengthMeters   = 0.82f;
     float    FrondLengthVar      = 0.16f;
@@ -93,14 +95,27 @@ struct BotanicalFernSection
     float    CrosierHeightMeters = 0.22f;
     float    CrosierTurns        = 2.6f;
     uint32_t PinnaPairs          = 26u;
+    uint32_t PinnulePairs        = 12u;
     float    PinnaAngleDeg       = 68.0f;
     float    Auricle             = 0.55f;
     float    SerrationDepth      = 0.09f;
+    uint32_t SerrationCount      = 16u;
+    float    LaminaThicknessMm   = 0.55f;
+    float    MidribRelief        = 0.90f;
+    float    VeinRelief          = 0.85f;
+    uint32_t VeinCount           = 14u;
+    float    Bullation           = 0.42f;
     float    LaminaCamber        = 0.28f;
+    float    EdgeUndulation      = 0.32f;
+    float    TipCurl             = 0.22f;
+    float    SoriCoverage        = 0.65f;
+    float    SoriSizeMm          = 1.40f;
+    float    Senescence          = 0.18f;
 };
 
 struct BotanicalPalmSection
 {
+    uint32_t DetailTier        = 3u;
     float    TrunkLeanDeg      = 6.5f;
     float    TrunkCurveDeg     = 10.0f;
     float    BasalBole         = 0.36f;
@@ -114,22 +129,28 @@ struct BotanicalPalmSection
     float    FrondArchDeg      = 72.0f;
     uint32_t LeafletPairs      = 30u;
     float    PlumoseSplay      = 0.18f;
+    float    SkirtFraction     = 0.0f;
     bool     ShowFruits        = true;
     uint32_t FruitBunches      = 6u;
     float    FruitAbundance    = 1.05f;
+    float    FruitRipeness     = 0.58f;
 };
 
 struct BotanicalTreeSection
 {
-    uint32_t BranchLevels     = 3u;
-    uint32_t LimbCount        = 11u;
+    uint32_t DetailTier       = 3u;
+    uint32_t BranchLevels     = 4u;
+    uint32_t LimbCount        = 15u;
     float    BranchAngleDeg   = 52.0f;
-    float    ForkTendency     = 0.44f;
-    float    CanopyFlatten    = 0.18f;
-    float    ButtressRelief   = 0.40f;
+    float    ForkTendency     = 0.42f;
+    float    CanopyFlatten    = 0.15f;
+    float    ButtressRelief   = 0.38f;
+    uint32_t RootLaterals     = 2u;
+    float    CollarFillet     = 0.76f;
     float    PipeConservation = 0.62f;
+    bool     ShowLeaves       = true;
     float    LeafDensity      = 1.0f;
-    float    LeafSizeMeters   = 0.22f;
+    float    LeafSizeMeters   = 0.24f;
 };
 
 struct BotanicalLeavesSection

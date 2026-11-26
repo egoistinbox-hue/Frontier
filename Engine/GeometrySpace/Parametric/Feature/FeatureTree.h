@@ -143,6 +143,7 @@ struct FeatureStep
     std::optional<FeatureScalar>    EndSize        = {};                                      // [len] - Blend: size at the far ends (empty = constant)
     std::vector<ConnectivityReference> SizeAnchors    = {};                                      // [-]   - Blend (variable): vertices that take Size, one per edge
     std::vector<FeatureScalar>      AnchorSizes    = {};                                      // [len] - Blend (per vertex): size at SizeAnchors[i] (empty: Size / EndSize)
+    bool                           ClampOverlapEnabled = false;                               // [-]   - Blend: clamp & merge at blocking vertices / opposing rails while other side continues beveling
     FaceOperationCategory              Operation      = FaceOperationCategory::Push;                 // [-]   - Face-operation verb
     FeatureScalar                   Amount         = {};                                      // [len|rad|-] - Distance / angle / factor (by verb)
     std::vector<ConnectivityReference> References     = {};                                      // [-]   - Blend: edges · face operation: faces

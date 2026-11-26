@@ -787,6 +787,7 @@ void SketcherRasterization::Destroy()
     BufferLayout       = VK_NULL_HANDLE;
     BufferSet          = VK_NULL_HANDLE;
     UploadedGeneration = UINT64_MAX;
+    LastStatesHash     = 0ull;
     Device             = nullptr;
 }
 
@@ -1207,7 +1208,19 @@ void SketcherRasterization::UploadMatcaps(const std::vector<SketcherPicture>& La
 
 void SketcherRasterization::AssignStates(const std::vector<uint32_t>& FaceStates, const std::vector<uint32_t>& EdgeStates)
 {
+    uint64_t StatesHash = 14695981039346656037ull;
+    auto Mix = [](uint64_t H, uint64_t V) noexcept -> uint64_t { H ^= V; H *= 1099511628211ull; return H; };
+    StatesHash = Mix(StatesHash, static_cast<uint64_t>(FaceStates.size()));
+    StatesHash = Mix(StatesHash, static_cast<uint64_t>(EdgeStates.size()));
+    for (uint32_t V : FaceStates) StatesHash = Mix(StatesHash, V);
+    for (uint32_t V : EdgeStates) StatesHash = Mix(StatesHash, V);
+    if (StatesHash == 0ull) StatesHash = 1ull;
+
     const bool ReshapeCondition = FaceStateBuffer.BufferHandle == VK_NULL_HANDLE || FaceStates.size() != FaceCount || EdgeStates.size() != EdgeCount;
+    if (!ReshapeCondition && StatesHash == LastStatesHash)
+    {
+        return;
+    }
     if (ReshapeCondition)
     {
         vkDeviceWaitIdle(Device->AccessDevice());
@@ -1240,6 +1253,7 @@ void SketcherRasterization::AssignStates(const std::vector<uint32_t>& FaceStates
     {
         std::memcpy(EdgeStateBuffer.HostAddress, EdgeStates.data(), 4u * EdgeStates.size());
     }
+    LastStatesHash = StatesHash;
 }
 
 void SketcherRasterization::Record(

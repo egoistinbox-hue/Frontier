@@ -201,6 +201,32 @@ struct SketcherBevelSession
     double                            AxisAnchorParameter = 0.0;                             // [len] - Axis parameter when it began
     double                            AxisAnchorValue = 0.0;                                 // [len] - Distance / depth when it began
     bool                              AxisAnchorFine  = false;                               // [-]   - Shift held when it began
+    bool                              ClampOverlapEnabled = true;                            // [-]   - Vertex-merge clamping on blocking vertices with continued unclamped bevel
+};
+
+// 📝 Persistent variable-bevel controls (blue uniform line + white corner lines) kept visible and editable AFTER
+//    committing a bevel. Dismissed only when switching to another bevel face, changing tool, Esc, or Undo.
+struct SketcherCommittedBevelControls
+{
+    bool                                ActiveCondition  = false;                            // [-]   - Blue + white bevel handles active on a committed Blend step
+    std::string                         StepLabel        = {};                               // [-]   - Feature step label (e.g. "Blend#1")
+    std::string                         BodyName         = {};                               // [-]   - Owning body name
+    GeometrySpace::Parametric::BlendProfile Shape        = GeometrySpace::Parametric::BlendProfile::Fillet;
+    std::vector<SketcherBlendHandle>    Handles          = {};                               // [-]   - [0] blue uniform handle, [1..] white corner handles
+    double                              Size             = 0.0;                              // [len] - Uniform bevel size
+    std::vector<double>                 CornerSizes      = {};                               // [len] - Per-handle corner override (0 = follows Size)
+    SketcherBlendFit                    Fit              = {};                               // [len] - Suggested start + blocking-vertex merge distances
+    bool                                ClampOverlapEnabled = true;                          // [-]   - Step clamp-merge mode
+    int                                 HoverHandle      = -1;                               // [idx] - Handle under cursor
+    int                                 DragHandle       = -1;                               // [idx] - Handle currently dragged
+    double                              DragOrigin       = 0.0;                              // [len] - Axis parameter at drag press
+    double                              DragSize         = 0.0;                              // [len] - Size at drag press
+    float                               DragLast         = 0.0f;                             // [px]  - Last cursor X for screen-facing drag
+    bool                                DragScreenCondition = false;                         // [-]   - Screen-X fallback when handle faces camera
+    bool                                DragMutatedCondition = false;                        // [-]   - Whether drag modified the step
+    bool                                DragHistoryRecorded  = false;                        // [-]   - Undo checkpoint pushed once per drag
+    int                                 FocusCorner      = -1;                               // [idx] - Last dragged corner handle
+    uint64_t                            DocumentRevision = 0ull;                             // [-]   - Document revision when handles were measured
 };
 
 // 📝 Drawing session (Shift+A line, Shift+Q rectangle, Shift+W circle, Shift+S curve; arc / slot from the Draw card):
@@ -901,19 +927,67 @@ struct SketcherRenderPhase
     int         Calls        = 0;                                                             // [-]  - Entries this frame
 };
 
+struct SketcherPhaseRollingStat
+{
+    const char* Name    = "";
+    double      LastMs  = 0.0;
+    double      AvgMs   = 0.0;
+    double      PeakMs  = 0.0;
+    int         Calls   = 0;
+};
+
+struct SketcherOperationTimingRecord
+{
+    std::string Category   = {};                                                               // [-]  - e.g. "Bevel", "Extrude", "Boolean", "Gizmo", "Render"
+    std::string Label      = {};                                                               // [-]  - Operation name
+    std::string Detail     = {};                                                               // [-]  - Extra metadata (vertex count, size, refusal)
+    double      DurationMs = 0.0;                                                              // [ms] - Measured wall duration
+    uint64_t    Frame      = 0ull;                                                             // [-]  - Frame number when recorded
+};
+
+struct SketcherOperationSummary
+{
+    std::string Category = {};
+    std::string Label    = {};
+    std::string LastDetail = {};
+    double      LastMs   = 0.0;
+    double      AvgMs    = 0.0;
+    double      PeakMs   = 0.0;
+    uint64_t    Calls    = 0ull;
+};
+
 struct SketcherRenderProfile
 {
-    std::vector<SketcherRenderPhase> Phases        = {};                                       // [-]  - This frame's phases (entry order)
-    double                          InterfaceMs   = 0.0;                                      // [ms] - DrawSketcherInterface, whole
-    double                          UploadMs      = 0.0;                                      // [ms] - Host: PrepareViewport (scene / matcap uploads)
-    double                          GpuWaitMs     = 0.0;                                      // [ms] - Host: fence wait for the previous frame
-    double                          SlowThreshold = 50.0;                                     // [ms] - Frame time that writes a trace line
-    uint64_t                        SlowFrames    = 0;                                        // [-]  - Lines written this session
-    double                          WorstMs       = 0.0;                                      // [ms] - Slowest frame this session
-    double                          LineGap       = 0.25;                                     // [s]  - Least time between two lines (a slow drag stays legible)
-    double                          LineSeconds   = -1.0e9;                                   // [s]  - When the last line was written
-    uint64_t                        Suppressed    = 0;                                        // [-]  - Slow frames since the last line (inside LineGap)
+    std::vector<SketcherRenderPhase>        Phases           = {};                             // [-]  - This frame's phases (entry order)
+    std::vector<SketcherPhaseRollingStat>   PhaseStats       = {};                             // [-]  - Rolling Avg/Peak per phase for F3 Profiler HUD
+    std::vector<SketcherOperationSummary>   OperationStats   = {};                             // [-]  - Aggregated per-operation timings (Bevel/Extrude/Boolean/etc.)
+    std::vector<SketcherOperationTimingRecord> RecentOperations = {};                          // [-]  - Ring buffer (newest last, capped at 64)
+    double                          InterfaceMs      = 0.0;                                    // [ms] - DrawSketcherInterface, whole
+    double                          UploadMs         = 0.0;                                    // [ms] - Host: scene / matcap / texture upload
+    double                          StateUploadMs    = 0.0;                                    // [ms] - Host: face/edge state buffer sync
+    double                          GpuRecordMs      = 0.0;                                    // [ms] - Host: Vulkan command buffer record + submit
+    double                          GpuWaitMs        = 0.0;                                    // [ms] - Host: GPU timeline fence wait
+    double                          ReadbackCopyMs   = 0.0;                                    // [ms] - Host: VRAM->CPU copy + ImGui pixel upload
+    double                          SmoothedFrameMs  = 0.0;                                    // [ms] - EMA smoothed total frame ms
+    uint64_t                        ViewportDraws    = 0ull;                                   // [-]  - Total Vulkan viewport raster submits
+    uint64_t                        ViewportCacheHits = 0ull;                                  // [-]  - Static viewport frames served from cached frame (0% GPU)
+    bool                            LastFrameCached  = false;                                  // [-]  - Whether the most recent frame hit the viewport cache
+    double                          SlowThreshold    = 50.0;                                   // [ms] - Frame time that writes a trace line
+    uint64_t                        SlowFrames       = 0;                                      // [-]  - Lines written this session
+    double                          WorstMs          = 0.0;                                    // [ms] - Slowest frame this session
+    double                          LineGap          = 0.25;                                   // [s]  - Least time between two lines (a slow drag stays legible)
+    double                          LineSeconds      = -1.0e9;                                 // [s]  - When the last line was written
+    uint64_t                        Suppressed       = 0;                                      // [-]  - Slow frames since the last line (inside LineGap)
 };
+
+// Records one modeling / engine operation timing sample into the always-on F3 Profiler HUD.
+void RecordSketcherOperationTiming(
+    SketcherRenderProfile& Profile,
+    uint64_t               FrameNumber,
+    const char*            Category,
+    const char*            Label,
+    double                 DurationMs,
+    const std::string&     Detail = {});
 
 // Adds the scope's duration to the named phase of Profile (one entry per name per frame).
 class SketcherPhaseClock
@@ -963,6 +1037,7 @@ struct SketcherWorkspaceStatus
     SketcherViewportStyle                 Style          = {};                               // [-]   - Viewport appearance
     SketcherPickMode                      PickMode       = SketcherPickMode::Any;            // [-]   - 2 / 3 / 4 / 5 (Plasticity)
     SketcherBevelSession                  Bevel          = {};                               // [-]   - B (blend) / E (extrude) session
+    SketcherCommittedBevelControls        BevelControls  = {};                               // [-]   - Persistent post-commit blue + white variable-bevel controls
     SketcherDrawingSession                Drawing        = {};                               // [-]   - Line / rectangle / circle / arc / slot / curve
     SketcherSplineSpans                   SplineSpans = {};
     SketcherPoleDrag                      PoleDrag       = {};                               // [-]   - Mode 1 pole drag
@@ -1015,6 +1090,7 @@ struct SketcherWorkspaceStatus
     bool                                  ConstructMenuAtPointer = false;                    // [-]   - Empty-space RMB anchors the catalogue at the pointer
     std::array<float, 2>                  ConstructMenuPointer = {};                         // [px]  - Requested viewport context-menu corner
     bool                                  TraceShown     = false;                            // [-]   - F12 operation trace panel (development builds)
+    bool                                  ProfilerShown  = false;                            // [-]   - F3 real-time per-operation & frame profiler HUD
     std::string                           TraceFilter    = {};                               // [-]   - Its substring filter
     SketcherOutlinerMode                 Outliner       = {};                               // [-]   - Scene search, filter chips, compact / folded
     bool                                  ViewportMaximizedEnabled = false;                  // [-]   - Scene panel spans the row (maximize button)

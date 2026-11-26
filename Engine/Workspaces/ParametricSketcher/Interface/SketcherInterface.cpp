@@ -232,6 +232,13 @@ void Announce(SketcherWorkspaceStatus& State, const std::string& RawMessage)
 
 void Conclude(SketcherWorkspaceStatus& State, const SketcherCommandOutcome& Outcome)
 {
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "Model",
+        Outcome.Label.empty() ? "Command" : Outcome.Label.c_str(),
+        Outcome.Milliseconds,
+        Outcome.AcceptedCondition ? "accepted" : ("refused: " + Outcome.Refusal));
     if (Outcome.AcceptedCondition)
     {
         RefreshSketcherScene(State, true);
@@ -702,8 +709,9 @@ void WriteBevelText(SketcherBevelSession& Bevel)
 [[nodiscard]] SketcherBlendRequest ComposeBlendRequest(const SketcherBevelSession& Bevel)
 {
     SketcherBlendRequest Request;
-    Request.Shape = Bevel.Shape;
-    Request.Size  = Bevel.Size;
+    Request.Shape               = Bevel.Shape;
+    Request.Size                = Bevel.Size;
+    Request.ClampOverlapEnabled = Bevel.ClampOverlapEnabled;
     if (Bevel.VariableEnabled)
     {
         Request.EndSize           = Bevel.EndSize;
@@ -712,6 +720,90 @@ void WriteBevelText(SketcherBevelSession& Bevel)
     for (size_t Index = 1; Index < Bevel.Handles.size() && Index < Bevel.CornerSizes.size(); ++Index)
         if (Bevel.CornerSizes[Index] > 0.0) Request.VertexSizes.push_back({ Bevel.Handles[Index].Vertex, Bevel.CornerSizes[Index] });
     return Request;
+}
+
+[[nodiscard]] bool HasCompetingBevelTool(const SketcherWorkspaceStatus& State) noexcept
+{
+    return State.Bevel.ActiveCondition
+        || State.Drawing.ActiveCondition
+        || State.Transform.ActiveCondition
+        || State.Knife.ActiveCondition
+        || State.Sweep.ActiveCondition
+        || State.Trim.ActiveCondition
+        || State.Fill.ActiveCondition
+        || State.Constrain.ActiveCondition
+        || State.Joint.ActiveCondition
+        || State.Boolean.ActiveCondition
+        || State.Measure.ActiveCondition
+        || State.DimensionTool.ActiveCondition
+        || State.SurfaceTraceEnabled;
+}
+
+void DismissPersistentBevelControls(SketcherWorkspaceStatus& State) noexcept
+{
+    State.BevelControls = {};
+}
+
+bool ActivatePersistentBevelControls(SketcherWorkspaceStatus& State, const std::string& StepLabel, int FocusCorner = -1)
+{
+    if (StepLabel.empty())
+    {
+        DismissPersistentBevelControls(State);
+        return false;
+    }
+    const SketcherBlendStepControls Measured = MeasureSketcherBlendStepControls(State.Document, StepLabel);
+    if (!Measured.ValidCondition || Measured.Handles.empty())
+    {
+        DismissPersistentBevelControls(State);
+        return false;
+    }
+    SketcherCommittedBevelControls& Controls = State.BevelControls;
+    Controls.ActiveCondition      = true;
+    Controls.StepLabel            = Measured.StepLabel;
+    Controls.BodyName             = Measured.BodyKey;
+    Controls.Shape                = Measured.Shape;
+    Controls.Handles              = Measured.Handles;
+    Controls.Size                 = Measured.Size;
+    Controls.CornerSizes          = Measured.CornerSizes;
+    Controls.Fit                  = Measured.Fit;
+    Controls.ClampOverlapEnabled  = Measured.ClampOverlapEnabled;
+    Controls.HoverHandle          = -1;
+    Controls.DragHandle           = -1;
+    Controls.DragMutatedCondition = false;
+    Controls.DragHistoryRecorded  = false;
+    Controls.FocusCorner          = (FocusCorner > 0 && FocusCorner < int(Controls.Handles.size())) ? FocusCorner : -1;
+    Controls.DocumentRevision     = State.Document.Revision;
+    return true;
+}
+
+void SyncPersistentBevelControls(SketcherWorkspaceStatus& State)
+{
+    SketcherCommittedBevelControls& Controls = State.BevelControls;
+    if (!Controls.ActiveCondition) return;
+    if (HasCompetingBevelTool(State))
+    {
+        DismissPersistentBevelControls(State);
+        return;
+    }
+    if (Controls.DocumentRevision == State.Document.Revision) return;
+    const int KeptFocus = Controls.FocusCorner;
+    const int KeptDrag  = Controls.DragHandle;
+    const SketcherBlendStepControls Measured = MeasureSketcherBlendStepControls(State.Document, Controls.StepLabel);
+    if (!Measured.ValidCondition || Measured.Handles.empty())
+    {
+        DismissPersistentBevelControls(State);
+        return;
+    }
+    Controls.BodyName            = Measured.BodyKey;
+    Controls.Shape               = Measured.Shape;
+    Controls.Handles             = Measured.Handles;
+    Controls.Size                = Measured.Size;
+    Controls.CornerSizes         = Measured.CornerSizes;
+    Controls.Fit                 = Measured.Fit;
+    Controls.ClampOverlapEnabled = Measured.ClampOverlapEnabled;
+    Controls.DocumentRevision    = State.Document.Revision;
+    if (KeptDrag >= int(Controls.Handles.size())) Controls.DragHandle = -1;
+    Controls.FocusCorner = (KeptFocus > 0 && KeptFocus < int(Controls.Handles.size())) ? KeptFocus : -1;
 }
 
 // 📝 Handles: re-measured when the picked edges change (a corner keeps its size while its vertex stays picked).
@@ -1164,9 +1256,22 @@ void ConfineBevelLimit(SketcherWorkspaceStatus& State, int Parameter, bool Accep
     if (!(Bevel.LimitCeiling > 0.0) || !(Bevel.LimitGood > 0.0) || AcceptedCondition) return;
     // A rejected asynchronous preview used to launch a visible binary search by repeatedly rewriting Size while the
     // pointer was stationary. That made tiny drags appear to run forward, backward and keep "settling". Hold immediately
-    // at the last accepted value instead: one deterministic correction, no autonomous motion on later frames.
-    const bool Settling       = Value != Bevel.LimitGood || Bevel.LimitProbeCondition;
-    Value                     = Bevel.LimitGood;
+    // at the last accepted value (or exact blocking-vertex merge size when ClampOverlapEnabled) instead.
+    double HoldValue = Bevel.LimitGood;
+    if (Parameter == 0 && Bevel.ClampOverlapEnabled && Bevel.Verb == SketcherSessionVerb::Blend)
+    {
+        const auto& Merges = Bevel.Shape == BlendProfile::Chamfer ? Bevel.Fit.ChamferMerges : Bevel.Fit.FilletMerges;
+        for (const double Merge : Merges)
+        {
+            if (Merge > Bevel.LimitGood + 1.0e-6 && Merge <= Bevel.LimitCeiling + 1.0e-6)
+            {
+                HoldValue = Merge;
+                break;
+            }
+        }
+    }
+    const bool Settling       = Value != HoldValue || Bevel.LimitProbeCondition;
+    Value                     = HoldValue;
     Bevel.LimitProbeCondition = false;
     if (Settling)
     {
@@ -1204,6 +1309,14 @@ bool FinishAsyncBevelPreview(SketcherWorkspaceStatus& State, bool WaitCondition)
     Bevel.Refusal            = Legible(Result.Refusal);
     Bevel.StageMs            = Result.Milliseconds;
     ++Bevel.StageCount;
+    static const char* AsyncVerbs[] = { "Bevel preview", "Extrude preview", "Profile preview", "Inset preview", "Corner preview" };
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "Preview",
+        AsyncVerbs[std::clamp(int(Result.Verb), 0, 4)],
+        Result.Milliseconds,
+        Bevel.Refusal.empty() ? Compose("size %s m", FormatLength(Result.Size).c_str()) : ("refused: " + Bevel.Refusal));
     if (Bevel.PreviewOutcome.AcceptedCondition && Bevel.Refusal.empty())
     {
         Bevel.GoodScene     = Bevel.PreviewScene;
@@ -1329,6 +1442,13 @@ void StageBevelPreview(SketcherWorkspaceStatus& State)
     }
     Bevel.StageMs = (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - Now) * 1.0e3;
     ++Bevel.StageCount;
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "Preview",
+        Verbs[std::clamp(int(Bevel.Verb), 0, 4)],
+        Bevel.StageMs,
+        Bevel.Refusal.empty() ? Compose("size %s m", FormatLength(Bevel.Size).c_str()) : ("refused: " + Bevel.Refusal));
     ConfineBevelLimit(State, Parameter, Outcome.AcceptedCondition && Bevel.Refusal.empty());
 }
 
@@ -1422,8 +1542,17 @@ void ApplyBevelSession(SketcherWorkspaceStatus& State)
         return;
     }
     const SketcherCommandOutcome Outcome = Run([&] { return BlendSketcherSelection(State.Document, Request); });
+    std::string CommittedBlendLabel;
     if (Outcome.AcceptedCondition)
     {
+        for (auto It = State.Document.Tree.Steps.rbegin(); It != State.Document.Tree.Steps.rend(); ++It)
+        {
+            if (It->Kind == FeatureStepCategory::Blend)
+            {
+                CommittedBlendLabel = It->Label;
+                break;
+            }
+        }
         SketcherRepeat Rep{};
         Rep.Kind  = SketcherRepeatCategory::Blend;
         Rep.Shape = Shape;
@@ -1441,6 +1570,12 @@ void ApplyBevelSession(SketcherWorkspaceStatus& State)
         }
     }
     Conclude(State, Outcome);
+    // Keep the blue uniform + white variable-bevel corner controls active AFTER committing the bevel
+    // so the user can keep refining uniform/corner sizes until selecting another bevel face or changing tool.
+    if (Outcome.AcceptedCondition && !CommittedBlendLabel.empty())
+    {
+        ActivatePersistentBevelControls(State, CommittedBlendLabel);
+    }
 }
 
 void CancelBevelSession(SketcherWorkspaceStatus& State)
@@ -6273,13 +6408,12 @@ void ResolveGizmoTarget(SketcherWorkspaceStatus& State)
 //    turns to the world axes first. Any other view shows the full 3D gizmo: picked sketch points get the arrow along their
 //    plane normal, the two upright plane quads and (several points) the tilting rings — moving them off the plane turns
 //    their curves into 3D curves (LiftSketcherSketchPoints).
-void FitGizmoToView(SketcherWorkspaceStatus& State)
+void FitGizmoPoseToCamera(SketcherGizmoSession& Gizmo, const OrbitCamera& Camera, bool FullXYZEnabled)
 {
-    SketcherGizmoSession& Gizmo = State.Gizmo;
     if (Gizmo.Target == SketcherGizmoTarget::None) return;
     constexpr auto Bit = [](GizmoHandle Handle) { return 1u << uint32_t(Handle); };
     const auto     Of  = [](GizmoHandle First, int Axis) { return GizmoHandle(uint8_t(First) + Axis); };
-    const int      View = State.FullXYZEnabled ? -1 : ViewAxisCondition(State.Camera);
+    const int      View = FullXYZEnabled ? -1 : ViewAxisCondition(Camera);
     Gizmo.FlatCondition = View >= 0;
     if (View < 0)
     {
@@ -6334,6 +6468,11 @@ void FitGizmoToView(SketcherWorkspaceStatus& State)
         }
         Gizmo.Pose.Hidden |= Bit(Of(GizmoHandle::PlaneYZ, Axis)) | Bit(Of(GizmoHandle::RotateX, Axis));
     }
+}
+
+void FitGizmoToView(SketcherWorkspaceStatus& State)
+{
+    FitGizmoPoseToCamera(State.Gizmo, State.Camera, State.FullXYZEnabled);
 }
 
 // 📝 Centre ring: on faces it scales whenever scale is on (faces have no axis cylinders); otherwise it moves in the
@@ -9243,23 +9382,226 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
     return Bevel.HoverHandle >= 0;
 }
 
-// Handles: a stick from the bevel's mid-line to the grip; the uniform grip a cyan ring, corner grips diamonds (amber
-// once they carry their own size). The size shows beside a hovered, dragged or sized handle. Tips register as
-// widgets BevelHandle0 (uniform), BevelHandle1 … for scripts.
-void DrawBevelHandles(SketcherWorkspaceStatus& State, ImDrawList* Canvas, const OrbitCameraBasis& Frame)
+[[nodiscard]] double PersistentBevelHandleSize(const SketcherCommittedBevelControls& Controls, int Index)
 {
-    const SketcherBevelSession& Bevel = State.Bevel;
-    if (!Bevel.ActiveCondition || Bevel.Verb != SketcherSessionVerb::Blend || Bevel.Handles.empty()) return;
-    const double Lead = BevelHandleLead * Frame.WorldPerPixel;
-    for (int Index = int(Bevel.Handles.size()) - 1; Index >= 0; --Index)
+    return Index > 0 && Index < int(Controls.CornerSizes.size()) && Controls.CornerSizes[size_t(Index)] > 0.0
+        ? Controls.CornerSizes[size_t(Index)] : Controls.Size;
+}
+
+[[nodiscard]] double PersistentBevelHandleDepthRate(const SketcherCommittedBevelControls& Controls, int Index)
+{
+    const double Spread = Controls.Handles[size_t(Index)].Spread;
+    if (!(Spread > 0.05) || !(Spread < 0.999)) return 1.0;
+    const double Rate = Controls.Shape == BlendProfile::Chamfer ? std::sqrt(1.0 - Spread * Spread) : 1.0 / Spread - 1.0;
+    return std::max(Rate, 0.05);
+}
+
+[[nodiscard]] Vector3 PersistentBevelHandleBase(const SketcherCommittedBevelControls& Controls, int Index)
+{
+    const SketcherBlendHandle& Handle = Controls.Handles[size_t(Index)];
+    return Handle.Position - Handle.Direction * (PersistentBevelHandleDepthRate(Controls, Index) * PersistentBevelHandleSize(Controls, Index));
+}
+
+[[nodiscard]] Vector3 PersistentBevelHandleTip(const SketcherCommittedBevelControls& Controls, int Index, double Lead)
+{
+    return PersistentBevelHandleBase(Controls, Index) + Controls.Handles[size_t(Index)].Direction * Lead;
+}
+
+[[nodiscard]] bool ProjectPersistentBevelHandle(const SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, int Index, double Lead,
+                                                ImVec2& Base, ImVec2& Tip, bool& ScreenCondition)
+{
+    const SketcherCommittedBevelControls& Controls = State.BevelControls;
+    if (!ProjectWorldPoint(State, Frame, PersistentBevelHandleBase(Controls, Index), Base)
+        || !ProjectWorldPoint(State, Frame, PersistentBevelHandleTip(Controls, Index, Lead), Tip))
+        return false;
+    const float Reach = float(Lead / Frame.WorldPerPixel);
+    ScreenCondition   = std::hypot(Tip.x - Base.x, Tip.y - Base.y) < 0.35f * Reach;
+    if (ScreenCondition) Tip = ImVec2(Base.x, Base.y - std::max(Reach, BevelHandleLead + 8.0f));
+    return true;
+}
+
+// Persistent blue + white variable-bevel controls kept active AFTER committing a bevel.
+// Dragging any handle live-edits the committed Blend feature step (merging/unmerging cleanly via parametric replay).
+bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, ImVec2 Local, bool PointerCondition)
+{
+    SyncPersistentBevelControls(State);
+    SketcherCommittedBevelControls& Controls = State.BevelControls;
+    Controls.HoverHandle = -1;
+    if (!Controls.ActiveCondition || Controls.Handles.empty())
+    {
+        Controls.DragHandle = -1;
+        return false;
+    }
+
+    const ImGuiIO& Io   = ImGui::GetIO();
+    const double   Lead = BevelHandleLead * Frame.WorldPerPixel;
+    const OrbitRay Ray  = CastOrbitRay(Frame, Local.x, Local.y);
+
+    if (Controls.DragHandle >= 0 && Controls.DragHandle < int(Controls.Handles.size()))
+    {
+        const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.DragHandle)];
+        const std::optional<double> Parameter = Controls.DragScreenCondition
+            ? std::optional<double>((Io.MousePos.x - Controls.DragLast) * Frame.WorldPerPixel)
+            : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
+        if (Parameter)
+        {
+            const double Moved = (*Parameter - Controls.DragOrigin) * (Io.KeyShift ? 0.1 : 1.0);
+            double Size = Controls.DragScreenCondition
+                ? Controls.DragSize + Moved
+                : Controls.DragSize - Moved / PersistentBevelHandleDepthRate(Controls, Controls.DragHandle);
+            Size = std::max(1.0e-3, Io.KeyCtrl ? std::round(Size * 1.0e6) * 1.0e-6 : std::round(Size * 1.0e3) * 1.0e-3);
+            if (Controls.DragHandle == 0 && !Io.KeyCtrl)
+            {
+                const double Rate = Controls.DragScreenCondition ? 1.0 : std::max(0.2, PersistentBevelHandleDepthRate(Controls, 0));
+                const double Band = BevelMergeBand * Frame.WorldPerPixel / Rate;
+                for (const double Merge : Controls.Shape == BlendProfile::Chamfer ? Controls.Fit.ChamferMerges : Controls.Fit.FilletMerges)
+                {
+                    if (std::abs(Size - Merge) <= Band)
+                    {
+                        Size = Merge;
+                        break;
+                    }
+                }
+            }
+
+            const double CurrentSize = PersistentBevelHandleSize(Controls, Controls.DragHandle);
+            if (std::abs(Size - CurrentSize) >= 5.0e-5)
+            {
+                const double NewUniform = (Controls.DragHandle == 0) ? Size : Controls.Size;
+                std::vector<std::pair<std::string, double>> VertexSizes;
+                for (size_t Index = 1; Index < Controls.Handles.size() && Index < Controls.CornerSizes.size(); ++Index)
+                {
+                    const double CornerValue = (int(Index) == Controls.DragHandle) ? Size : Controls.CornerSizes[Index];
+                    if (CornerValue > 0.0) VertexSizes.push_back({ Controls.Handles[Index].Vertex, CornerValue });
+                }
+
+                const bool RecordHistory = !Controls.DragHistoryRecorded;
+                SketcherBlendRequest EditRequest;
+                EditRequest.Shape               = Controls.Shape;
+                EditRequest.Size                = NewUniform;
+                EditRequest.VertexSizes         = std::move(VertexSizes);
+                EditRequest.ClampOverlapEnabled = Controls.ClampOverlapEnabled;
+                const SketcherCommandOutcome Outcome = UpdateSketcherBlendStep(
+                    State.Document,
+                    Controls.StepLabel,
+                    EditRequest,
+                    RecordHistory);
+                RecordSketcherOperationTiming(
+                    State.Profile,
+                    State.FrameNumber,
+                    "Bevel",
+                    "Edit variable bevel",
+                    Outcome.Milliseconds,
+                    Outcome.AcceptedCondition
+                        ? Compose("%s · %s m", Controls.StepLabel.c_str(), FormatLength(Size).c_str())
+                        : ("refused: " + Outcome.Refusal));
+                if (Outcome.AcceptedCondition)
+                {
+                    if (RecordHistory) Controls.DragHistoryRecorded = true;
+                    Controls.DragMutatedCondition = true;
+                    if (Controls.DragHandle == 0) Controls.Size = NewUniform;
+                    else Controls.CornerSizes[size_t(Controls.DragHandle)] = Size;
+                    Controls.DocumentRevision = State.Document.Revision;
+                    RefreshSketcherScene(State, true);
+                }
+            }
+        }
+        Controls.HoverHandle = Controls.DragHandle;
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        {
+            if (Controls.DragMutatedCondition)
+            {
+                Announce(State, Controls.DragHandle == 0
+                    ? Compose("%s: size %s m", Controls.StepLabel.c_str(), FormatLength(Controls.Size).c_str())
+                    : Compose("%s corner %d: %s m", Controls.StepLabel.c_str(), Controls.DragHandle, FormatLength(Controls.CornerSizes[size_t(Controls.DragHandle)]).c_str()));
+            }
+            Controls.DragHandle           = -1;
+            Controls.DragMutatedCondition = false;
+            Controls.DragHistoryRecorded  = false;
+        }
+        return true;
+    }
+
+    Controls.DragHandle = -1;
+    if (!PointerCondition) return false;
+    const ImVec2 Pointer(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y);
+    float Nearest = BevelHandleReach;
+    bool  Facing  = false;
+    for (int Index = int(Controls.Handles.size()) - 1; Index >= 0; --Index)
     {
         ImVec2 Base, Tip;
         bool   Screen = false;
-        if (!ProjectBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
-        const bool  Lit    = Index == Bevel.HoverHandle || Index == Bevel.DragHandle;
-        const bool  Sized  = Index > 0 && Bevel.CornerSizes[size_t(Index)] > 0.0;
-        const ImU32 Colour = Lit ? IM_COL32(0xff, 0xff, 0xff, 0xff) : Index == 0 ? IM_COL32(0x4d, 0xd2, 0xff, 0xff) : Sized ? IM_COL32(0xff, 0xc8, 0x3d, 0xff) : IM_COL32(0xc8, 0xc8, 0xc8, 0xe0);
-        Canvas->AddLine(Base, Tip, Colour, 1.5f);
+        if (!ProjectPersistentBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
+        const float Distance = std::hypot(Tip.x - Pointer.x, Tip.y - Pointer.y);
+        if (Distance <= Nearest)
+        {
+            Nearest = Distance;
+            Controls.HoverHandle = Index;
+            Facing = Screen;
+        }
+    }
+    if (Controls.HoverHandle >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    {
+        const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.HoverHandle)];
+        Controls.DragHandle           = Controls.HoverHandle;
+        Controls.DragScreenCondition  = Facing;
+        Controls.DragLast             = Io.MousePos.x;
+        Controls.DragOrigin           = Facing ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
+        Controls.DragSize             = PersistentBevelHandleSize(Controls, Controls.HoverHandle);
+        Controls.DragMutatedCondition = false;
+        Controls.DragHistoryRecorded  = false;
+        if (Controls.DragHandle > 0) Controls.FocusCorner = Controls.DragHandle;
+    }
+    return Controls.HoverHandle >= 0;
+}
+
+// Handles: a stick from the bevel's mid-line to the grip; the uniform grip a cyan/blue ring, corner grips white/amber
+// diamonds (amber once they carry their own size). Shown both during a live Bevel session AND persistently after commit.
+void DrawBevelHandles(SketcherWorkspaceStatus& State, ImDrawList* Canvas, const OrbitCameraBasis& Frame)
+{
+    const SketcherBevelSession& Bevel = State.Bevel;
+    if (Bevel.ActiveCondition && Bevel.Verb == SketcherSessionVerb::Blend && !Bevel.Handles.empty())
+    {
+        const double Lead = BevelHandleLead * Frame.WorldPerPixel;
+        for (int Index = int(Bevel.Handles.size()) - 1; Index >= 0; --Index)
+        {
+            ImVec2 Base, Tip;
+            bool   Screen = false;
+            if (!ProjectBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
+            const bool  Lit    = Index == Bevel.HoverHandle || Index == Bevel.DragHandle;
+            const bool  Sized  = Index > 0 && Bevel.CornerSizes[size_t(Index)] > 0.0;
+            const ImU32 Colour = Lit ? IM_COL32(0xff, 0xff, 0xff, 0xff) : Index == 0 ? IM_COL32(0x4d, 0xd2, 0xff, 0xff) : Sized ? IM_COL32(0xff, 0xc8, 0x3d, 0xff) : IM_COL32(0xc8, 0xc8, 0xc8, 0xe0);
+            Canvas->AddLine(Base, Tip, Colour, 1.5f);
+            if (Index == 0)
+            {
+                Canvas->AddCircleFilled(Tip, 5.5f, Colour, 20);
+                Canvas->AddCircle(Tip, 9.0f, Colour, 24, 1.5f);
+            }
+            else
+            {
+                const float Half = Lit ? 6.5f : 5.0f;
+                Canvas->AddQuadFilled(ImVec2(Tip.x, Tip.y - Half), ImVec2(Tip.x + Half, Tip.y), ImVec2(Tip.x, Tip.y + Half), ImVec2(Tip.x - Half, Tip.y), Colour);
+            }
+            if (Lit || Sized) Canvas->AddText(ImVec2(Tip.x + 12.0f, Tip.y - 8.0f), Colour, (FormatLength(BevelHandleSize(Bevel, Index)) + " m").c_str());
+            State.Widgets.Record("BevelHandle" + std::to_string(Index), ImVec2(Tip.x - 4.0f, Tip.y - 4.0f), ImVec2(Tip.x + 4.0f, Tip.y + 4.0f));
+        }
+        return;
+    }
+
+    // Post-commit persistent variable-bevel controls (blue uniform line + white corner lines).
+    SyncPersistentBevelControls(State);
+    const SketcherCommittedBevelControls& Controls = State.BevelControls;
+    if (!Controls.ActiveCondition || Controls.Handles.empty()) return;
+    const double Lead = BevelHandleLead * Frame.WorldPerPixel;
+    for (int Index = int(Controls.Handles.size()) - 1; Index >= 0; --Index)
+    {
+        ImVec2 Base, Tip;
+        bool   Screen = false;
+        if (!ProjectPersistentBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
+        const bool  Lit    = Index == Controls.HoverHandle || Index == Controls.DragHandle;
+        const bool  Sized  = Index > 0 && Index < int(Controls.CornerSizes.size()) && Controls.CornerSizes[size_t(Index)] > 0.0;
+        const ImU32 Colour = Lit ? IM_COL32(0xff, 0xff, 0xff, 0xff) : Index == 0 ? IM_COL32(0x4d, 0xd2, 0xff, 0xff) : Sized ? IM_COL32(0xff, 0xc8, 0x3d, 0xff) : IM_COL32(0xe6, 0xe6, 0xe6, 0xf0);
+        Canvas->AddLine(Base, Tip, Colour, 1.75f);
         if (Index == 0)
         {
             Canvas->AddCircleFilled(Tip, 5.5f, Colour, 20);
@@ -9270,7 +9612,12 @@ void DrawBevelHandles(SketcherWorkspaceStatus& State, ImDrawList* Canvas, const 
             const float Half = Lit ? 6.5f : 5.0f;
             Canvas->AddQuadFilled(ImVec2(Tip.x, Tip.y - Half), ImVec2(Tip.x + Half, Tip.y), ImVec2(Tip.x, Tip.y + Half), ImVec2(Tip.x - Half, Tip.y), Colour);
         }
-        if (Lit || Sized) Canvas->AddText(ImVec2(Tip.x + 12.0f, Tip.y - 8.0f), Colour, (FormatLength(BevelHandleSize(Bevel, Index)) + " m").c_str());
+        if (Lit || Sized)
+        {
+            const std::string Tag = (Index == 0 ? (Controls.StepLabel + " · ") : std::string{})
+                                  + FormatLength(PersistentBevelHandleSize(Controls, Index)) + " m";
+            Canvas->AddText(ImVec2(Tip.x + 12.0f, Tip.y - 8.0f), Colour, Tag.c_str());
+        }
         State.Widgets.Record("BevelHandle" + std::to_string(Index), ImVec2(Tip.x - 4.0f, Tip.y - 4.0f), ImVec2(Tip.x + 4.0f, Tip.y + 4.0f));
     }
 }
@@ -13965,6 +14312,17 @@ void PickAtPointer(SketcherWorkspaceStatus& State, ImVec2 Local, SketcherPickInt
     }
     if (State.PickMode == SketcherPickMode::Solid)
     {
+        // If the user clicks a face belonging to another Blend step, switch persistent variable-bevel controls to that step.
+        if (!(Identity & IdentityEdgeBit))
+        {
+            const std::string ClickedFace = NameSketcherIdentity(State.Scene, Identity);
+            const std::string FaceBlend   = FindSketcherBlendStepForFace(State.Document, ClickedFace);
+            if (!FaceBlend.empty())
+            {
+                if (!State.BevelControls.ActiveCondition || State.BevelControls.StepLabel != FaceBlend)
+                    ActivatePersistentBevelControls(State, FaceBlend);
+            }
+        }
         // Mode 4 (solid): the body under the pointer, by its key. Shift adds (pick order = Boolean order), Ctrl removes.
         const uint32_t Index   = (Identity & ~IdentityEdgeBit) - 1u;
         const uint32_t BodyAt  = (Identity & IdentityEdgeBit) ? (Index < State.Scene.Edges.size() ? State.Scene.Edges[Index].Body : ~0u)
@@ -14010,6 +14368,15 @@ void PickAtPointer(SketcherWorkspaceStatus& State, ImVec2 Local, SketcherPickInt
     case SketcherPickIntent::Replace:
         SelectSketcherName(State.Document, Kind, Name, false, PickKey);
         if (!PickKey.empty()) State.Outliner.AnchorKey = PickKey;
+        if (Kind == SketcherSelectionCategory::Face)
+        {
+            const std::string FaceBlend = FindSketcherBlendStepForFace(State.Document, Name);
+            if (!FaceBlend.empty())
+            {
+                if (!State.BevelControls.ActiveCondition || State.BevelControls.StepLabel != FaceBlend)
+                    ActivatePersistentBevelControls(State, FaceBlend);
+            }
+        }
         Announce(State, "Selected " + Name);
         break;
     case SketcherPickIntent::Add:
@@ -14370,6 +14737,12 @@ void DrawStatusBar(SketcherWorkspaceStatus& State, const ImVec2 Frame)
     Right -= 1.0f + 9.0f + 14.0f;
     const std::string Device = Compose("%.1f ms frame · %s", State.FrameMs, State.DeviceLabel.c_str());
     Right -= Sheet.TextRight(Right, Centre, 9.0f, Ink, Device.c_str()) + 14.0f;
+    float             ProfilerWidth = 0.0f;
+    const std::string ProfilerLabel = State.Profile.LastFrameCached
+        ? Compose("Profiler (F3) · %.1f ms [cached]", State.Profile.SmoothedFrameMs > 0.0 ? State.Profile.SmoothedFrameMs : State.FrameMs)
+        : Compose("Profiler (F3) · %.1f ms", State.Profile.SmoothedFrameMs > 0.0 ? State.Profile.SmoothedFrameMs : State.FrameMs);
+    if (SheetTextButton(State, Sheet, "StatusProfiler", Right, Centre, ProfilerLabel.c_str(), IconSymbol::Count, &ProfilerWidth)) State.ProfilerShown = !State.ProfilerShown;
+    Right -= ProfilerWidth + 10.0f;
 #ifdef FRONTIER_DEVELOPMENT_TRACE
     // 📝 The log is one click away: the button opens the trace panel (F12), which names SketcherTrace.log beside the exe.
     float             LogWidth = 0.0f;
@@ -15652,20 +16025,20 @@ std::vector<SketcherRasterPane> ComposeSketcherRasterPanes(const SketcherWorkspa
             Riding.Size   = MeasureGizmoSize(PaneFrame, Riding.Origin, GizmoPixels);
             return BuildGizmoGeometry(Riding, PaneFrame, GizmoHandle::None, State.Gizmo.Grab);
         }
-        SketcherWorkspaceStatus TempState;
-        TempState.Camera                = Cam;
-        TempState.Gizmo.Target          = State.Gizmo.Target;
-        TempState.Gizmo.Names           = State.Gizmo.Names;
-        TempState.Gizmo.Points          = State.Gizmo.Points;
-        TempState.Gizmo.Modes           = State.Gizmo.Modes;
-        TempState.Gizmo.VertexCondition = State.Gizmo.VertexCondition;
-        TempState.Gizmo.FaceNormal      = State.Gizmo.FaceNormal;
-        TempState.Gizmo.Pose            = State.Gizmo.Pose;
-        FitGizmoToView(TempState);
-        TempState.Gizmo.Pose.Modes = State.Gizmo.Modes;
-        TempState.Gizmo.Pose.Size  = MeasureGizmoSize(PaneFrame, TempState.Gizmo.Pose.Origin, GizmoPixels);
+        // Lightweight gizmo-only copy avoids constructing/destroying a full SketcherWorkspaceStatus every frame.
+        SketcherGizmoSession PaneGizmo;
+        PaneGizmo.Target          = State.Gizmo.Target;
+        PaneGizmo.Names           = State.Gizmo.Names;
+        PaneGizmo.Points          = State.Gizmo.Points;
+        PaneGizmo.Modes           = State.Gizmo.Modes;
+        PaneGizmo.VertexCondition = State.Gizmo.VertexCondition;
+        PaneGizmo.FaceNormal      = State.Gizmo.FaceNormal;
+        PaneGizmo.Pose            = State.Gizmo.Pose;
+        FitGizmoPoseToCamera(PaneGizmo, Cam, State.FullXYZEnabled);
+        PaneGizmo.Pose.Modes = State.Gizmo.Modes;
+        PaneGizmo.Pose.Size  = MeasureGizmoSize(PaneFrame, PaneGizmo.Pose.Origin, GizmoPixels);
         const GizmoHandle HoverH = ActivePaneCondition ? State.Gizmo.Hover : GizmoHandle::None;
-        return BuildGizmoGeometry(TempState.Gizmo.Pose, PaneFrame, HoverH, State.Gizmo.Grab);
+        return BuildGizmoGeometry(PaneGizmo.Pose, PaneFrame, HoverH, State.Gizmo.Grab);
     };
 
     std::vector<SketcherRasterPane> Panes;
@@ -16856,13 +17229,16 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
     const bool ModifierCurveHit = !State.Gizmo.DragCondition && Hovered && !OverCube
                                && (Io.KeyShift || Io.KeyCtrl || Io.KeyAlt)
                                && !FindCurveNear(State, Frame, Io.MousePos).empty();
+    // Persistent post-commit variable-bevel controls (blue uniform + white corner handles) take priority over gizmo/picks.
+    const bool PersistentBevelOwned = !State.Bevel.ActiveCondition
+                                   && DrivePersistentBevelControls(State, Frame, Local, Hovered && !OverCube && !ModifierCurveHit);
     bool GizmoOwned = false;
     {
         SketcherPhaseClock Clock(State.Profile, "viewport · gizmo");
         // Component hit targets own clicks even where a whole-curve gizmo overlaps.
         // Keep the gizmo itself available (including cardinal-view and numeric transforms).
         bool ComponentHit = false;
-        if (!State.Gizmo.DragCondition && Hovered && !OverCube)
+        if (!PersistentBevelOwned && !State.Gizmo.DragCondition && Hovered && !OverCube)
         {
             std::string Owner; int Index = -1;
             if (State.PickMode == SketcherPickMode::ControlPoint)
@@ -16873,10 +17249,10 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
         }
         // Only a real curve hit competes with a handle. Ctrl/Shift drags on
         // unobstructed handles must retain snapping / precision behaviour.
-        GizmoOwned = DriveGizmo(State, Frame, Local, Hovered && !OverCube && !ComponentHit && !ModifierCurveHit);
+        GizmoOwned = DriveGizmo(State, Frame, Local, !PersistentBevelOwned && Hovered && !OverCube && !ComponentHit && !ModifierCurveHit);
     }
     // Placed dimension repositioning: press & drag any placed dimension label pill or bar to adjust its offset / radial leader.
-    const bool DimDragOwned = !GizmoOwned && DrivePlacedDimensionDrag(State, Frame, Local, Hovered && !OverCube && !ModifierCurveHit);
+    const bool DimDragOwned = !PersistentBevelOwned && !GizmoOwned && DrivePlacedDimensionDrag(State, Frame, Local, Hovered && !OverCube && !ModifierCurveHit);
 
     // 📝 Mode 1 (Plasticity control-point mode): press on a shown pole grabs it, the pole follows the pointer in the
     //    screen-parallel plane through its start, the release commits one MoveSketcherPole; a press-release without
@@ -16887,7 +17263,7 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
     bool PointGesture = false;
     if ((State.PickMode == SketcherPickMode::ControlPoint || State.PickMode == SketcherPickMode::Any)
         && !State.Drawing.ActiveCondition && !State.Bevel.ActiveCondition && !State.Constrain.ActiveCondition
-        && !State.Transform.ActiveCondition && !State.DimensionTool.ActiveCondition && !DimDragOwned
+        && !State.Transform.ActiveCondition && !State.DimensionTool.ActiveCondition && !PersistentBevelOwned && !DimDragOwned
         && !State.PoleDrag.ActiveCondition && !GizmoOwned)
     {
         if (!SketchPoints.DragCondition)
@@ -16932,12 +17308,12 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
     if (!SketchPoints.DragCondition) RecordSketchPointWidgets(State, Frame);
 
     bool SpanGesture=false;
-    if(State.PickMode==SketcherPickMode::Edge && Hovered && !OverCube && !GizmoOwned && !DimDragOwned &&
+    if(State.PickMode==SketcherPickMode::Edge && Hovered && !OverCube && !PersistentBevelOwned && !GizmoOwned && !DimDragOwned &&
        !State.Drawing.ActiveCondition && !State.Bevel.ActiveCondition && !State.Transform.ActiveCondition && !State.Trim.ActiveCondition)
         SpanGesture=PickSplineSpan(State,Frame,Io.MousePos,LeftClick);
     SketcherPoleDrag& Drag = State.PoleDrag;
     bool PoleGesture = false;
-    if (!PointGesture && !GizmoOwned && !DimDragOwned && !State.DimensionTool.ActiveCondition
+    if (!PointGesture && !PersistentBevelOwned && !GizmoOwned && !DimDragOwned && !State.DimensionTool.ActiveCondition
         && (State.PickMode == SketcherPickMode::ControlPoint || State.PickMode == SketcherPickMode::Any)
         && !State.Drawing.ActiveCondition && !State.Bevel.ActiveCondition && !State.Constrain.ActiveCondition && !State.Transform.ActiveCondition)
     {
@@ -17260,9 +17636,9 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
             Announce(State, "Boolean cancelled");                                           // Blender: RMB cancels
         }
     }
-    else if (GizmoOwned || DimDragOwned)
+    else if (PersistentBevelOwned || GizmoOwned || DimDragOwned)
     {
-        // The gizmo or a placed dimension drag took the press / hover: no selection click, no box.
+        // Persistent bevel handle, gizmo, or a placed dimension drag took the press / hover: no selection click, no box.
     }
     else
     {
@@ -18053,6 +18429,16 @@ void DrawBevelCard(SketcherWorkspaceStatus& State)
                 Bevel.FocusCorner = -1;
                 Announce(State, "Corner sizes cleared: one size again");
             }
+        }
+        if (ImGui::Checkbox("Clamp & merge overlapping vertices###BevelClampMerge", &Bevel.ClampOverlapEnabled))
+        {
+            Bevel.LimitKey.clear();
+            Bevel.LimitGood = 0.0;
+            Bevel.LimitCeiling = 0.0;
+            Bevel.StagedSize = -1.0;
+            Announce(State, Bevel.ClampOverlapEnabled
+                ? "Bevel clamp & merge ON (merges blocking vertices; unclamped sides continue)"
+                : "Bevel clamp & merge OFF (strict stop at neighbour vertices)");
         }
     }
     ImGui::PushStyleColor(ImGuiCol_Text, Tint(MutedColour));
@@ -20277,7 +20663,12 @@ void DrawBevelHistory(SketcherWorkspaceStatus& State, SketcherSheet& Sheet)
         if (Press.HoveredCondition || Focused) Sheet.Box(Line, Focused ? SketcherWash(0x10) : SketcherInk(0x222222), 10.0f);
         Sheet.Icon(Step->Shape == BlendProfile::Fillet ? IconSymbol::SketcherFillet : IconSymbol::SketcherChamfer, Left, Y + 0.5f * Row - 7.0f, 14.0f, SketcherInk(0xb7a68c));
         Sheet.TextClipped(Left + 22.0f, Y + 0.5f * Row, Width - 22.0f, 11.0f, SketcherInk(Focused ? 0xffffff : 0xcccccc), DescribeSketcherStep(State.Document, *Step).c_str());
-        if (Press.ClickedCondition) State.FocusedStep = Focused ? std::string() : Step->Label;
+        if (Press.ClickedCondition)
+        {
+            State.FocusedStep = Focused ? std::string() : Step->Label;
+            if (!Focused) ActivatePersistentBevelControls(State, Step->Label);
+            else if (State.BevelControls.ActiveCondition && State.BevelControls.StepLabel == Step->Label) DismissPersistentBevelControls(State);
+        }
         Y += Row;
     }
     if (!Blends.empty()) Y += 14.0f;
@@ -20926,6 +21317,7 @@ void DeletePicked(SketcherWorkspaceStatus& State)
 void ApplyShortcuts(SketcherWorkspaceStatus& State)
 {
     ImGuiIO& Io = ImGui::GetIO();
+    if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) State.ProfilerShown = !State.ProfilerShown;
 #ifdef FRONTIER_DEVELOPMENT_TRACE
     if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) State.TraceShown = !State.TraceShown;          // development: operation trace panel
 #endif
@@ -21707,6 +22099,7 @@ void ApplyShortcuts(SketcherWorkspaceStatus& State)
         State.DimensionTool.EditingId.clear();
         State.DimensionTool.ExplicitSelectCondition = false;
         State.FocusedStep = {};
+        DismissPersistentBevelControls(State);
         Announce(State, "Selection cleared");
     }
     if (Pressed(ImGuiKey_X) || Pressed(ImGuiKey_Delete) || Pressed(ImGuiKey_Backspace))
@@ -22049,11 +22442,242 @@ SketcherPhaseClock::~SketcherPhaseClock()
     return "idle";
 }
 
+void RecordSketcherOperationTiming(
+    SketcherRenderProfile& Profile,
+    uint64_t               FrameNumber,
+    const char*            Category,
+    const char*            Label,
+    double                 DurationMs,
+    const std::string&     Detail)
+{
+    const char* SafeCategory = (Category != nullptr && *Category != '\0') ? Category : "Operation";
+    const char* SafeLabel    = (Label != nullptr && *Label != '\0') ? Label : "Unnamed";
+    const double ClampedMs   = std::max(0.0, DurationMs);
+
+    Profile.RecentOperations.push_back(SketcherOperationTimingRecord{
+        SafeCategory,
+        SafeLabel,
+        Detail,
+        ClampedMs,
+        FrameNumber,
+    });
+    if (Profile.RecentOperations.size() > 64u)
+    {
+        Profile.RecentOperations.erase(Profile.RecentOperations.begin());
+    }
+
+    for (SketcherOperationSummary& Summary : Profile.OperationStats)
+    {
+        if (Summary.Category == SafeCategory && Summary.Label == SafeLabel)
+        {
+            ++Summary.Calls;
+            Summary.LastMs     = ClampedMs;
+            Summary.PeakMs     = std::max(Summary.PeakMs, ClampedMs);
+            Summary.AvgMs      = Summary.Calls == 1u ? ClampedMs : (Summary.AvgMs * 0.85 + ClampedMs * 0.15);
+            Summary.LastDetail = Detail;
+            return;
+        }
+    }
+    Profile.OperationStats.push_back(SketcherOperationSummary{
+        SafeCategory,
+        SafeLabel,
+        Detail,
+        ClampedMs,
+        ClampedMs,
+        ClampedMs,
+        1ull,
+    });
+}
+
+void DrawProfilerPanel(SketcherWorkspaceStatus& State)
+{
+    if (!State.ProfilerShown) return;
+    ImGui::SetNextWindowSize(ImVec2(540.0f, 480.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    if (!ImGui::Begin("Performance Profiler (F3)###SketcherProfilerHUD", &State.ProfilerShown, ImGuiWindowFlags_NoDocking))
+    {
+        ImGui::End();
+        return;
+    }
+
+    SketcherRenderProfile& Profile = State.Profile;
+    const double TotalMs   = std::max(0.001, State.FrameMs + Profile.GpuWaitMs);
+    const double SmoothMs  = Profile.SmoothedFrameMs > 0.0 ? Profile.SmoothedFrameMs : TotalMs;
+    const double Fps       = SmoothMs > 0.001 ? 1000.0 / SmoothMs : 0.0;
+    const uint64_t TotalViewportFrames = Profile.ViewportDraws + Profile.ViewportCacheHits;
+    const double ViewportHitPct = TotalViewportFrames > 0ull
+        ? (100.0 * double(Profile.ViewportCacheHits) / double(TotalViewportFrames))
+        : 0.0;
+
+    uint64_t GizmoHits = 0ull, GizmoRebuilds = 0ull;
+    QueryGizmoGeometryCacheStats(GizmoHits, GizmoRebuilds);
+    const uint64_t GizmoTotal = GizmoHits + GizmoRebuilds;
+    const double GizmoHitPct  = GizmoTotal > 0ull ? (100.0 * double(GizmoHits) / double(GizmoTotal)) : 100.0;
+
+    ImGui::Text("Frame %.2f ms (%.1f FPS)  |  Worst %.2f ms  |  Mode: %s",
+                SmoothMs, Fps, Profile.WorstMs, Profile.LastFrameCached ? "CACHED (0% GPU)" : "ACTIVE GPU");
+    ImGui::Text("Viewport Cache: %.1f%% (%llu hits / %llu draws)  |  Gizmo Cache: %.1f%% (%llu / %llu)",
+                ViewportHitPct,
+                static_cast<unsigned long long>(Profile.ViewportCacheHits),
+                static_cast<unsigned long long>(Profile.ViewportDraws),
+                GizmoHitPct,
+                static_cast<unsigned long long>(GizmoHits),
+                static_cast<unsigned long long>(GizmoTotal));
+
+    if (ImGui::SmallButton("Reset Peaks"))
+    {
+        Profile.WorstMs = 0.0;
+        for (auto& Stat : Profile.PhaseStats) Stat.PeakMs = Stat.LastMs;
+        for (auto& Op : Profile.OperationStats) Op.PeakMs = Op.LastMs;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear Operations"))
+    {
+        Profile.OperationStats.clear();
+        Profile.RecentOperations.clear();
+    }
+
+    ImGui::SeparatorText("Host Frame Pipeline (ms)");
+    if (ImGui::BeginTable("##HostStageTable", 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Budget (16.6ms)", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableHeadersRow();
+
+        auto StageRow = [](const char* Name, double Ms)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(Name);
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f", Ms);
+            ImGui::TableSetColumnIndex(2);
+            const float Ratio = static_cast<float>(std::clamp(Ms / 16.667, 0.0, 1.0));
+            const ImVec4 BarCol = Ms > 12.0 ? ImVec4(0.95f, 0.30f, 0.28f, 1.0f)
+                                : Ms > 4.0  ? ImVec4(0.95f, 0.72f, 0.25f, 1.0f)
+                                            : ImVec4(0.28f, 0.78f, 0.56f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, BarCol);
+            ImGui::ProgressBar(Ratio, ImVec2(-1.0f, 12.0f), "");
+            ImGui::PopStyleColor();
+        };
+        StageRow("CPU Interface + Overlays", Profile.InterfaceMs);
+        StageRow("Host Scene / Matcap Upload", Profile.UploadMs);
+        StageRow("Face / Edge State Buffer Sync", Profile.StateUploadMs);
+        StageRow("Vulkan Command Record + Submit", Profile.GpuRecordMs);
+        StageRow("GPU Fence Wait", Profile.GpuWaitMs);
+        StageRow("Readback Copy + ImGui Upload", Profile.ReadbackCopyMs);
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Per-Frame Sub-Phases (sorted by Avg ms)");
+    if (ImGui::BeginTable("##PhaseTable", 5, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 125.0f)))
+    {
+        ImGui::TableSetupColumn("Phase", ImGuiTableColumnFlags_WidthStretch, 2.5f);
+        ImGui::TableSetupColumn("Last", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn("Avg", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn("Peak", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 42.0f);
+        ImGui::TableHeadersRow();
+
+        std::vector<SketcherPhaseRollingStat> Ranked = Profile.PhaseStats;
+        std::sort(Ranked.begin(), Ranked.end(), [](const auto& A, const auto& B) { return A.AvgMs > B.AvgMs; });
+        for (const SketcherPhaseRollingStat& Stat : Ranked)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(Stat.Name);
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", Stat.LastMs);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", Stat.AvgMs);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", Stat.PeakMs);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%d", Stat.Calls);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Per-Operation Modeling Profiler (Bevel / Extrude / Boolean / Scene)");
+    if (Profile.OperationStats.empty())
+    {
+        ImGui::TextDisabled("Run any operation (Bevel, Extrude, Boolean, Reshape, etc.) to record timings.");
+    }
+    else if (ImGui::BeginTable("##OperationTable", 6, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 125.0f)))
+    {
+        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("Operation", ImGuiTableColumnFlags_WidthStretch, 1.8f);
+        ImGui::TableSetupColumn("Last ms", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+        ImGui::TableSetupColumn("Avg ms", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn("Peak ms", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 42.0f);
+        ImGui::TableHeadersRow();
+
+        std::vector<SketcherOperationSummary> SortedOps = Profile.OperationStats;
+        std::sort(SortedOps.begin(), SortedOps.end(), [](const auto& A, const auto& B) { return A.LastMs > B.LastMs; });
+        for (const SketcherOperationSummary& Op : SortedOps)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(Op.Category.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(Op.Label.c_str());
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", Op.LastMs);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", Op.AvgMs);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", Op.PeakMs);
+            ImGui::TableSetColumnIndex(5); ImGui::Text("%llu", static_cast<unsigned long long>(Op.Calls));
+        }
+        ImGui::EndTable();
+    }
+
+    if (!Profile.RecentOperations.empty() && ImGui::CollapsingHeader("Recent Operations Log"))
+    {
+        ImGui::BeginChild("##RecentOpsScroll", ImVec2(0.0f, 95.0f), true);
+        for (auto It = Profile.RecentOperations.rbegin(); It != Profile.RecentOperations.rend(); ++It)
+        {
+            ImGui::Text("[#%llu] %-8s %-20s %6.2f ms  %s",
+                        static_cast<unsigned long long>(It->Frame),
+                        It->Category.c_str(),
+                        It->Label.c_str(),
+                        It->DurationMs,
+                        It->Detail.c_str());
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
 void ConcludeSketcherFrame(SketcherWorkspaceStatus& State)
 {
     SketcherRenderProfile& Profile = State.Profile;
     const double Total = State.FrameMs + Profile.GpuWaitMs;
     Profile.WorstMs = std::max(Profile.WorstMs, Total);
+    Profile.SmoothedFrameMs = Profile.SmoothedFrameMs <= 0.0 ? Total : (Profile.SmoothedFrameMs * 0.90 + Total * 0.10);
+
+    // Update rolling EMA/Peak phase statistics for the F3 Profiler HUD before clearing frame phases.
+    for (SketcherPhaseRollingStat& Stat : Profile.PhaseStats)
+    {
+        Stat.LastMs = 0.0;
+        Stat.Calls  = 0;
+    }
+    for (const SketcherRenderPhase& Phase : Profile.Phases)
+    {
+        bool Found = false;
+        for (SketcherPhaseRollingStat& Stat : Profile.PhaseStats)
+        {
+            if (Stat.Name == Phase.Name || (Stat.Name && Phase.Name && std::strcmp(Stat.Name, Phase.Name) == 0))
+            {
+                Stat.LastMs = Phase.Milliseconds;
+                Stat.AvgMs  = Stat.AvgMs <= 0.0 ? Phase.Milliseconds : (Stat.AvgMs * 0.90 + Phase.Milliseconds * 0.10);
+                Stat.PeakMs = std::max(Stat.PeakMs, Phase.Milliseconds);
+                Stat.Calls  = Phase.Calls;
+                Found = true;
+                break;
+            }
+        }
+        if (!Found)
+        {
+            Profile.PhaseStats.push_back(SketcherPhaseRollingStat{
+                Phase.Name,
+                Phase.Milliseconds,
+                Phase.Milliseconds,
+                Phase.Milliseconds,
+                Phase.Calls,
+            });
+        }
+    }
     const double Now  = SteadySeconds();
     const bool   Slow = Total >= Profile.SlowThreshold && State.FrameNumber > 2;            // Start-up frames load fonts and matcaps
     if (Slow && Now - Profile.LineSeconds < Profile.LineGap) ++Profile.Suppressed;
@@ -22188,12 +22812,14 @@ void DrawSketcherInterface(SketcherWorkspaceStatus& State, ImTextureID ViewportT
     DrawMatcapPicker(State);
     DrawWelcome(State);
     { SketcherPhaseClock Clock(Profile, "trace panel"); DrawTracePanel(State); }
+    { SketcherPhaseClock Clock(Profile, "profiler hud"); DrawProfilerPanel(State); }
     const OrbitCamera CamBeforeShortcuts  = State.Camera;
     const bool        XformBefore         = State.Transform.ActiveCondition;
     const int         XformAxisBefore     = State.Transform.Axis;
     const bool        XformPlaneBefore    = State.Transform.PlaneCondition;
     const auto        XformVerbBefore     = State.Transform.Verb;
     { SketcherPhaseClock Clock(Profile, "shortcuts"); ApplyShortcuts(State); }
+    if (State.BevelControls.ActiveCondition && HasCompetingBevelTool(State)) DismissPersistentBevelControls(State);
     const bool CamShortcutChanged = State.Camera.Distance != CamBeforeShortcuts.Distance
                                  || State.Camera.Azimuth != CamBeforeShortcuts.Azimuth
                                  || State.Camera.Elevation != CamBeforeShortcuts.Elevation
@@ -22365,6 +22991,7 @@ void EndSketcherHostedFrame(SketcherWorkspaceStatus& State, double DeltaSeconds,
     SketcherRenderProfile& Profile = State.Profile;
     const ImVec2 Frame = ImGui::GetIO().DisplaySize;
     { SketcherPhaseClock Clock(Profile, "shortcuts"); ApplyShortcuts(State); }
+    if (State.BevelControls.ActiveCondition && HasCompetingBevelTool(State)) DismissPersistentBevelControls(State);
     if (DrawFloatingOverlays)
     {
         if (!HostedOverlayMode)
@@ -22379,6 +23006,7 @@ void EndSketcherHostedFrame(SketcherWorkspaceStatus& State, double DeltaSeconds,
         DrawWelcome(State);
         DrawSketcherProjectBrowserOverlay(State);
         { SketcherPhaseClock Clock(Profile, "trace panel"); DrawTracePanel(State); }
+        { SketcherPhaseClock Clock(Profile, "profiler hud"); DrawProfilerPanel(State); }
     }
     { SketcherPhaseClock Clock(Profile, "autosave"); AdvanceAutosave(State, DeltaSeconds); }
     { SketcherPhaseClock Clock(Profile, "bevel preview"); StageBevelPreview(State); }
@@ -22494,11 +23122,20 @@ SketcherSceneStates DisplayedSketcherStates(const SketcherWorkspaceStatus& State
 
 void RefreshSketcherScene(SketcherWorkspaceStatus& State, bool DirtyCondition)
 {
+    const double SceneStart = SteadySeconds();
     SketcherPhaseClock Clock(State.Profile, "scene rebuild");
+    const bool Adopted = State.ReadyScene && State.ReadyScene->Revision == State.Document.Revision && !State.ZebraEnabled;
     // An adopted preview brings its display arrays (same document revision, same density): no second tessellation.
-    if (State.ReadyScene && State.ReadyScene->Revision == State.Document.Revision && !State.ZebraEnabled) State.Scene = std::move(*State.ReadyScene);
+    if (Adopted) State.Scene = std::move(*State.ReadyScene);
     else State.Scene = BuildSketcherScene(State.Document, 1.5e-3, State.ZebraEnabled);
     State.ReadyScene.reset();
+    RecordSketcherOperationTiming(
+        State.Profile,
+        State.FrameNumber,
+        "Scene",
+        Adopted ? "Adopt preview scene" : "Tessellate B-Rep scene",
+        (SteadySeconds() - SceneStart) * 1.0e3,
+        Compose("%zu tris · %zu edges", State.Scene.Corners.size() / 3u, State.Scene.Edges.size()));
     bool HasRefBounds = false;
     for (const SketcherReferenceSurface& Ref : State.Document.ReferenceSurfaces)
     {

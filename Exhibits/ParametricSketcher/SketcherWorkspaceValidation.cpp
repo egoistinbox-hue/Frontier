@@ -632,12 +632,25 @@ int main()
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Enter, false); });
         const bool BevelGizmoPlaced = !State.Bevel.ActiveCondition && State.Gizmo.OperationOriginCondition
                                    && State.Document.Selection.Bodies.size() == 1;
+        const bool PersistentBevelActive = State.BevelControls.ActiveCondition
+                                        && !State.BevelControls.StepLabel.empty()
+                                        && State.BevelControls.Handles.size() >= 3u;
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_V, true); });
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_V, false); });
         const bool VUnassigned = !State.Trim.ActiveCondition && !State.Bevel.ActiveCondition;
 
+        // Verify F3 live per-operation & frame profiler toggle + recorded operation stats.
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_F3, true); });
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_F3, false); });
+        const bool ProfilerToggledOn = State.ProfilerShown && !State.Profile.OperationStats.empty();
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_F3, true); });
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_F3, false); });
+        const bool ProfilerToggledOff = !State.ProfilerShown;
+
         // Verify Snap Filter & ContextAwareSnap defaults and Shift+A Line drawing mode
         if (!VerifyCheck(BevelGizmoPlaced, "Completed bevel places the gizmo at the edited feature") ||
+            !VerifyCheck(PersistentBevelActive, "Completed bevel keeps persistent blue + white variable-bevel controls active") ||
+            !VerifyCheck(ProfilerToggledOn && ProfilerToggledOff, "F3 toggles live per-operation profiler HUD with recorded timings") ||
             !VerifyCheck(VUnassigned, "Plain V has no assigned tool hotkey") ||
             !VerifyCheck(State.Picker.Enabled && State.Picker.ContextAwareSnap && State.Picker.Filter.CurveEnabled && State.Picker.Filter.EndpointEnabled,
                          "Snap Filter & ContextAwareSnap enabled by default"))
@@ -653,6 +666,14 @@ int main()
             Io.AddKeyEvent(ImGuiKey_A, true);
         });
         const bool LineDrawingStarted = State.Drawing.ActiveCondition && State.Drawing.Kind == SketcherDrawingCategory::Line;
+        const bool BevelControlsDismissedOnToolChange = !State.BevelControls.ActiveCondition;
+        if (!VerifyCheck(BevelControlsDismissedOnToolChange, "Changing active tool dismisses persistent variable-bevel controls"))
+        {
+            Host.Finalize();
+            Dock.Finalize();
+            ImGui::DestroyContext(Gui);
+            return 1;
+        }
         const uint64_t BeforeLine = State.Document.Revision;
         StepHostedFrame([&]()
         {

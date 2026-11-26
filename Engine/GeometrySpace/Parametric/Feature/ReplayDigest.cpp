@@ -160,6 +160,7 @@ std::string DigestFeatureStep(const FeatureTree& Tree, const FeatureStep& Step)
     for (const ConnectivityReference& Anchor : Step.SizeAnchors) Writer.Reference(Anchor);
     Writer.Word(Step.AnchorSizes.size());
     for (const FeatureScalar& Size : Step.AnchorSizes) Writer.Value(Size);
+    if (Step.ClampOverlapEnabled) Writer.Phrase("ClampOverlap");
     Writer.Kind(Step.Operation);
     Writer.Value(Step.Amount);
     Writer.Word(Step.References.size());

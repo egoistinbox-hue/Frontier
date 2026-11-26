@@ -45,6 +45,7 @@ struct BlendSettings
     std::optional<double>    EndSize             = {};                                       // [len] - Size at the end vertex (empty = constant)
     std::vector<VertexToken> SizeAnchors         = {};                                       // [-]   - Variable: vertices that take Size (empty = start vertices)
     std::vector<double>      AnchorSizes         = {};                                       // [len] - Per vertex: size at SizeAnchors[i] (empty = Size / EndSize)
+    bool                     ClampOverlapEnabled = false;                                    // [-]   - Clamp & merge at blocking vertices/parallel blends while other side continues beveling
 };
 
 // 💡 Everything about one blended edge that does not depend on its neighbours. Spine and both contact curves share
@@ -67,6 +68,8 @@ struct EdgeBlendSheet
     double          Alignment       = 1.0;                                                   // [-]   - +1 if τ runs along the edge, −1 against
     double          MaxResidual     = 0.0;                                                   // [len] - Worst ball / foot residual sampled
     double          RadiusRate      = 0.0;                                                   // [-]   - dr/dτ: r(τ) = Radius + RadiusRate·τ (variable)
+    bool            ClampedSides[2] = { false, false };                                      // [-]   - Side clamped onto a blocking vertex / opposing rail
+    double          AsymmetricMiddleWeight = 0.0;                                            // [-]   - > 0 when fillet uses rational quadratic G1 NURBS (asymmetric side clamp)
     // ⚠️ A variable sheet (RadiusRate ≠ 0) has a tilted line spine; its contact lines are unit-speed with their own τ, so
     //    Contacts[i](τ) is NOT the foot of Spine(τ) there. Every same-τ consumer refuses variable sheets. Only a straight
     //    edge between planes takes this form; a variable size anywhere else is a ball-law sheet (RadiusRate = 0 here).
@@ -102,6 +105,11 @@ struct SupportOverride
     FaceToken Face = {};                                                                     // [-] - Face the ball rolls onto
 };
 [[nodiscard]] EdgeBlendSheetOutcome ResolveEdgeBlendSheet(const ModelPartition& Partition, EdgeToken Edge, const BlendSettings& Settings, const SupportOverride& Override = {});
+
+// Straight convex edge between planar faces with independent per-side setbacks (d0, d1): exact PlaneSurface (chamfer),
+// CylinderSurface (equal clamped fillet), or exact G1-tangent rational quadratic NurbsSurface (asymmetric clamped fillet).
+[[nodiscard]] EdgeBlendSheetOutcome ResolveClampedPlanarBlendSheet(const ModelPartition& Partition, EdgeToken Edge, const BlendSettings& Settings,
+                                                                   double SetbackSide0, double SetbackSide1, bool Clamped0, bool Clamped1);
 
 // Ball radius at spine parameter τ: Radius + RadiusRate·τ.
 [[nodiscard]] double MeasureSheetRadius(const EdgeBlendSheet& Sheet, double τ) noexcept;

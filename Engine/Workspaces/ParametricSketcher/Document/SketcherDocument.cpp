@@ -899,6 +899,7 @@ static SketcherCommandOutcome BlendSketcherEdges(SketcherDocument& Document, con
         Step.Shape  = Request.Shape;
         Step.Size   = ParameterValue(Caption + ".Size");
         Step.Target = Owner;
+        Step.ClampOverlapEnabled = Request.ClampOverlapEnabled;
         // 💡 Tangent propagation (constant size, on refusal): an edge that runs on G1 into another sharp edge (the rim of a
         //    rounded end) takes the whole chain, as CAD fillets do — a blend cannot end where its support turns tangent.
         std::vector<std::string> Chain = Document.Selection.Edges;
@@ -1175,6 +1176,21 @@ SketcherBlendFit MeasureSketcherBlendFit(const SketcherDocument& Document, const
                                 }
                             }
                         }
+                        else if (Other != Edge && Neighbour.Start != Neighbour.End &&
+                                 (Neighbour.Start == Profile.Start || Neighbour.Start == Profile.End || Neighbour.End == Profile.Start || Neighbour.End == Profile.End))
+                        {
+                            const VertexToken Far = (Neighbour.Start == Profile.Start || Neighbour.Start == Profile.End) ? Neighbour.End : Neighbour.Start;
+                            const Vector3 Offset = Partition.Vertices.Resolve(Far).Position - Line->Origin;
+                            const double  Width  = Length(Offset - Line->Direction * Dot(Offset, Line->Direction));
+                            if (Width > 1.0e-9 * Diagonal)
+                            {
+                                for (const bool Chamfer : { false, true })
+                                {
+                                    const double R = Rate(Edge, Chamfer);
+                                    if (R > 1.0e-9) (Chamfer ? Fit.ChamferMerges : Fit.FilletMerges).push_back(Width / R);
+                                }
+                            }
+                        }
                         Fin = Partition.Fins.Resolve(Fin).Successor;
                         if (Fin == First) break;
                     }
@@ -1193,6 +1209,175 @@ SketcherBlendFit MeasureSketcherBlendFit(const SketcherDocument& Document, const
     Fit.Fitted = Decade;
     for (double Step : Steps) if (Step * Decade <= Wanted * (1.0 + 1.0e-9)) { Fit.Fitted = Step * Decade; break; }
     return Fit;
+}
+
+std::string FindSketcherBlendStepForFace(const SketcherDocument& Document, const std::string& FaceName)
+{
+    if (FaceName.empty()) return {};
+    // Walk newest Blend step first: Blend faces carry persistent names prefixed with "<StepLabel>." (e.g. "Blend#3.Edge...").
+    for (size_t Index = Document.Tree.Steps.size(); Index-- > 0;)
+    {
+        const FeatureStep& Step = Document.Tree.Steps[Index];
+        if (Step.Kind != FeatureStepCategory::Blend) continue;
+        const std::string Prefix = Step.Label + ".";
+        if (FaceName.rfind(Prefix, 0) == 0 || FaceName.find(Prefix) != std::string::npos) return Step.Label;
+    }
+    return {};
+}
+
+SketcherBlendStepControls MeasureSketcherBlendStepControls(const SketcherDocument& Document, const std::string& StepLabel)
+{
+    SketcherBlendStepControls Result;
+    if (StepLabel.empty()) return Result;
+    size_t StepIndex = Document.Tree.Steps.size();
+    for (size_t Idx = 0; Idx < Document.Tree.Steps.size(); ++Idx)
+    {
+        if (Document.Tree.Steps[Idx].Label == StepLabel && Document.Tree.Steps[Idx].Kind == FeatureStepCategory::Blend)
+        {
+            StepIndex = Idx;
+            break;
+        }
+    }
+    if (StepIndex >= Document.Tree.Steps.size()) return Result;
+
+    const FeatureStep& Step = Document.Tree.Steps[StepIndex];
+    std::vector<std::string> EdgeNames;
+    EdgeNames.reserve(Step.References.size());
+    for (const ConnectivityReference& Ref : Step.References)
+        if (Ref.Kind == ReferenceCategory::Edge && !Ref.Name.empty()) EdgeNames.push_back(Ref.Name);
+    if (EdgeNames.empty()) return Result;
+
+    // Replay a lightweight copy of the tree up to StepIndex (right before this Blend step) so the pre-blend sharp edge
+    // geometry, outward bisectors, and corner vertex names match the step's persistent references identically.
+    SketcherDocument Before;
+    Before.Tree.Parameters = Document.Tree.Parameters;
+    Before.Tree.Steps.assign(Document.Tree.Steps.begin(), Document.Tree.Steps.begin() + static_cast<std::ptrdiff_t>(StepIndex));
+    Before.Captions        = Document.Captions;
+    Before.Partition       = std::make_unique<ModelPartition>();
+    Before.Regeneration    = RegenerateFeatureTree(*Before.Partition, Before.Tree, false);
+
+    Result.Handles = MeasureSketcherBlendHandles(Before, EdgeNames);
+    if (Result.Handles.empty()) return Result;
+    Result.Fit                 = MeasureSketcherBlendFit(Before, EdgeNames);
+    Result.StepLabel           = Step.Label;
+    Result.BodyKey             = Step.Target;
+    Result.Shape               = Step.Shape;
+    Result.Size                = EvaluateFeatureValue(Document.Tree, Step.Size);
+    Result.ClampOverlapEnabled = Step.ClampOverlapEnabled;
+    Result.CornerSizes.assign(Result.Handles.size(), 0.0);
+
+    if (!Step.AnchorSizes.empty() && Step.AnchorSizes.size() == Step.SizeAnchors.size())
+    {
+        for (size_t AnchorIdx = 0; AnchorIdx < Step.SizeAnchors.size(); ++AnchorIdx)
+        {
+            const std::string& VName = Step.SizeAnchors[AnchorIdx].Name;
+            const double       VSize = EvaluateFeatureValue(Document.Tree, Step.AnchorSizes[AnchorIdx]);
+            for (size_t H = 1; H < Result.Handles.size(); ++H)
+            {
+                if (Result.Handles[H].Vertex == VName) Result.CornerSizes[H] = VSize;
+            }
+        }
+    }
+    else if (Step.EndSize)
+    {
+        Result.VariableEnabled = true;
+        Result.EndSize         = EvaluateFeatureValue(Document.Tree, *Step.EndSize);
+    }
+    Result.ValidCondition = true;
+    return Result;
+}
+
+SketcherCommandOutcome UpdateSketcherBlendStep(SketcherDocument& Document, const std::string& StepLabel,
+                                               const SketcherBlendRequest& Request, bool RecordUndo)
+{
+    const std::string Stem  = Request.Shape == BlendProfile::Fillet ? "Fillet" : "Chamfer";
+    const std::string Label = "Edit " + Stem + " " + FormatAmount(Request.Size);
+    return RunCommand(Document, Label, RecordUndo, [&]() -> std::string
+    {
+        if (Request.Size <= 0.0) return "the blend size must be positive";
+        if (Request.EndSize.has_value() && Request.VertexSizes.empty() && !(*Request.EndSize > 0.0)) return "the end blend size must be positive";
+        for (const auto& [Vertex, Size] : Request.VertexSizes) if (!(Size > 0.0)) return "the corner size at " + Vertex + " must be positive";
+
+        FeatureStep* TargetStep = nullptr;
+        for (FeatureStep& Step : Document.Tree.Steps)
+        {
+            if (Step.Label == StepLabel && Step.Kind == FeatureStepCategory::Blend) { TargetStep = &Step; break; }
+        }
+        if (!TargetStep) return "blend step " + StepLabel + " no longer exists";
+
+        const auto CaptionIt = Document.Captions.find(StepLabel);
+        const std::string Caption = CaptionIt != Document.Captions.end() ? CaptionIt->second : StepLabel;
+        const char*       Meaning = Request.Shape == BlendProfile::Fillet ? "fillet radius" : "chamfer setback";
+
+        double Larger = Request.Size;
+        if (Request.EndSize) Larger = std::max(Larger, *Request.EndSize);
+        for (const auto& Entry : Request.VertexSizes) Larger = std::max(Larger, Entry.second);
+        const double Bound = std::max(1.0, 4.0 * Larger);
+
+        const auto AssignOrAddParam = [&](const std::string& ParamName, double Value, const std::string& Note)
+        {
+            for (FeatureParameter& Param : Document.Tree.Parameters)
+            {
+                if (Param.Name == ParamName)
+                {
+                    Param.Value   = Value;
+                    Param.High = std::max(Param.High, Bound);
+                    return;
+                }
+            }
+            Document.Tree.Parameters.push_back({ ParamName, Value, 0.0, Bound, Note });
+        };
+
+        TargetStep->Shape               = Request.Shape;
+        TargetStep->ClampOverlapEnabled = Request.ClampOverlapEnabled;
+
+        if (!TargetStep->Size.Parameter.empty()) AssignOrAddParam(TargetStep->Size.Parameter, Request.Size, Meaning);
+        else
+        {
+            AssignOrAddParam(Caption + ".Size", Request.Size, Meaning);
+            TargetStep->Size = ParameterValue(Caption + ".Size");
+        }
+
+        if (!Request.VertexSizes.empty())
+        {
+            TargetStep->EndSize.reset();
+            TargetStep->SizeAnchors.clear();
+            TargetStep->AnchorSizes.clear();
+            for (size_t Index = 0; Index < Request.VertexSizes.size(); ++Index)
+            {
+                const std::string PName = Caption + ".Corner" + std::to_string(Index + 1);
+                AssignOrAddParam(PName, Request.VertexSizes[Index].second, std::string(Meaning) + " at " + Request.VertexSizes[Index].first);
+                TargetStep->SizeAnchors.push_back({ ReferenceCategory::Vertex, Request.VertexSizes[Index].first, {} });
+                TargetStep->AnchorSizes.push_back(ParameterValue(PName));
+            }
+        }
+        else if (Request.EndSize.has_value())
+        {
+            TargetStep->AnchorSizes.clear();
+            const std::string EndParam = (TargetStep->EndSize && !TargetStep->EndSize->Parameter.empty())
+                                       ? TargetStep->EndSize->Parameter
+                                       : (Caption + ".EndSize");
+            AssignOrAddParam(EndParam, *Request.EndSize, std::string(Meaning) + " at the far corners");
+            TargetStep->EndSize = ParameterValue(EndParam);
+            if (TargetStep->SizeAnchors.empty())
+            {
+                // Populate edge start/end anchors from the pre-blend geometry so variable taper is well-defined.
+                const SketcherBlendStepControls Controls = MeasureSketcherBlendStepControls(Document, StepLabel);
+                if (Controls.Handles.size() >= 2)
+                {
+                    const size_t PickIdx = Request.ReversedCondition && Controls.Handles.size() >= 3 ? 2u : 1u;
+                    TargetStep->SizeAnchors.push_back({ ReferenceCategory::Vertex, Controls.Handles[PickIdx].Vertex, {} });
+                }
+            }
+        }
+        else
+        {
+            TargetStep->EndSize.reset();
+            TargetStep->SizeAnchors.clear();
+            TargetStep->AnchorSizes.clear();
+        }
+        return {};
+    });
 }
 
 // 💡 Where a direct edit (face change, reshape) of body Owner goes in the history: before the body's trailing fillets /

@@ -97,6 +97,9 @@ struct GizmoGeometry
 // Handle triangles in world space: Hover / Grabbed glow (Slate emissive #555555), the ring billboarded to Frame.
 [[nodiscard]] GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& Frame, GizmoHandle Hover, GizmoHandle Grabbed);
 
+// Cumulative thread-local cache hit/rebuild telemetry for BuildGizmoGeometry (shown in the live Profiler).
+void QueryGizmoGeometryCacheStats(uint64_t& OutHits, uint64_t& OutRebuilds) noexcept;
+
 // Handle under the viewport pixel (local, top-left origin): inside a projected triangle or within Reach pixels of one
 // (inside first, opaque handles before see-through plane quads, then nearest); None when the pointer misses the gizmo.
 [[nodiscard]] GizmoHandle PickGizmoHandle(const GizmoGeometry& Geometry, const OrbitCameraBasis& Frame, double PixelX, double PixelY, double Reach);

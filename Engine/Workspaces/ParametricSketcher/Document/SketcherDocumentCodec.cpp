@@ -182,6 +182,7 @@ constexpr int64_t FormatVersion = 1;                                            
             Table.insert("SizeAnchors", EncodeReferences(Step.SizeAnchors));
             Table.insert("AnchorSizes", std::move(Sizes));
         }
+        if (Step.ClampOverlapEnabled) Table.insert("ClampOverlap", true);
         break;
     case FeatureStepCategory::FaceOperation:
         Table.insert("Operation", static_cast<int64_t>(Step.Operation));
@@ -932,6 +933,7 @@ SketcherDocumentFile DecodeSketcherDocument(const std::string& Text)
                 for (const toml::node& Size : *Sizes) Step.AnchorSizes.push_back(DecodeValue(toml::node_view<const toml::node>{ Size }));
                 if (Step.AnchorSizes.size() != Step.SizeAnchors.size()) { File.Refusal = Step.Label + " has " + std::to_string(Step.AnchorSizes.size()) + " vertex sizes for " + std::to_string(Step.SizeAnchors.size()) + " vertices"; return File; }
             }
+            Step.ClampOverlapEnabled = View["ClampOverlap"].value_or(false);
             if (const toml::array* Points = View["Points"].as_array())
             {
                 for (const toml::node& Point : *Points) Step.Points.push_back(DecodeVector(toml::node_view<const toml::node>{ Point }, Vector3{ std::nan(""), 0.0, 0.0 }));

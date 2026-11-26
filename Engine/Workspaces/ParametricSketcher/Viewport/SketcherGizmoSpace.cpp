@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 
 namespace Frontier
 {
@@ -222,10 +224,91 @@ double MeasureGizmoSize(const OrbitCameraBasis& Frame, Vector3 Origin, double Pi
     return PerUnit > 1.0e-9 ? Pixels / PerUnit : Pixels * Frame.WorldPerPixel;
 }
 
+namespace
+{
+    std::atomic<uint64_t> GlobalGizmoCacheHits     { 0ull };
+    std::atomic<uint64_t> GlobalGizmoCacheRebuilds { 0ull };
+
+    [[nodiscard]] uint64_t HashGizmoRequest(const GizmoPose& Pose, const OrbitCameraBasis& Frame, GizmoHandle Hover, GizmoHandle Grabbed) noexcept
+    {
+        auto Mix = [](uint64_t H, uint64_t V) noexcept -> uint64_t
+        {
+            H ^= V;
+            H *= 1099511628211ull;
+            return H;
+        };
+        auto Bits = [](double V) noexcept -> uint64_t
+        {
+            if (V == 0.0) V = 0.0; // normalize -0.0
+            uint64_t Raw = 0ull;
+            std::memcpy(&Raw, &V, sizeof(Raw));
+            return Raw;
+        };
+        uint64_t H = 14695981039346656037ull;
+        H = Mix(H, Bits(Pose.Origin.X));
+        H = Mix(H, Bits(Pose.Origin.Y));
+        H = Mix(H, Bits(Pose.Origin.Z));
+        for (int A = 0; A < 3; ++A)
+        {
+            H = Mix(H, Bits(Pose.Axes[A].X));
+            H = Mix(H, Bits(Pose.Axes[A].Y));
+            H = Mix(H, Bits(Pose.Axes[A].Z));
+        }
+        H = Mix(H, Bits(Pose.Size));
+        H = Mix(H, static_cast<uint64_t>(Pose.Modes));
+        H = Mix(H, static_cast<uint64_t>(Pose.Hidden));
+        for (int A = 0; A < 3; ++A)
+        {
+            H = Mix(H, Bits(Frame.Right[A]));
+            H = Mix(H, Bits(Frame.Up[A]));
+            H = Mix(H, Bits(Frame.Forward[A]));
+        }
+        H = Mix(H, static_cast<uint64_t>(Hover));
+        H = Mix(H, static_cast<uint64_t>(Grabbed));
+        return H == 0ull ? 1ull : H;
+    }
+} // namespace
+
+void QueryGizmoGeometryCacheStats(uint64_t& OutHits, uint64_t& OutRebuilds) noexcept
+{
+    OutHits     = GlobalGizmoCacheHits.load(std::memory_order_relaxed);
+    OutRebuilds = GlobalGizmoCacheRebuilds.load(std::memory_order_relaxed);
+}
+
 GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& Frame, GizmoHandle Hover, GizmoHandle Grabbed)
 {
     GizmoGeometry Geometry;
     if (Pose.Modes == 0) return Geometry;
+
+    // 4-slot thread-local LRU cache covers both Single and Quad split-view panes with zero per-frame trig/realloc.
+    struct CacheSlot
+    {
+        uint64_t      Key   = 0ull;
+        uint64_t      Stamp = 0ull;
+        GizmoGeometry Value {};
+    };
+    thread_local std::array<CacheSlot, 4u> Cache {};
+    thread_local uint64_t                  StampCounter = 0ull;
+    const uint64_t Key = HashGizmoRequest(Pose, Frame, Hover, Grabbed);
+    size_t Victim = 0u;
+    uint64_t Oldest = UINT64_MAX;
+    for (size_t Slot = 0u; Slot < Cache.size(); ++Slot)
+    {
+        if (Cache[Slot].Key == Key)
+        {
+            Cache[Slot].Stamp = ++StampCounter;
+            GlobalGizmoCacheHits.fetch_add(1ull, std::memory_order_relaxed);
+            return Cache[Slot].Value;
+        }
+        if (Cache[Slot].Stamp < Oldest)
+        {
+            Oldest = Cache[Slot].Stamp;
+            Victim = Slot;
+        }
+    }
+
+    GlobalGizmoCacheRebuilds.fetch_add(1ull, std::memory_order_relaxed);
+    Geometry.Vertices.reserve(2048u);
     GizmoBuilder  Builder(Pose, Geometry.Vertices);
     const Vector3 Units[3] = { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
     const Vector3 Toward   = FromArray(Frame.Forward) * -1.0;                                 // [-] - Towards the eye
@@ -288,11 +371,15 @@ GizmoGeometry BuildGizmoGeometry(const GizmoPose& Pose, const OrbitCameraBasis& 
             Builder.Triangle(Corners[0], Corners[2], Corners[3], {}, Colour, Plane);
         }
     }
+    Cache[Victim].Key   = Key;
+    Cache[Victim].Stamp = ++StampCounter;
+    Cache[Victim].Value = Geometry;
     return Geometry;
 }
 
 GizmoHandle PickGizmoHandle(const GizmoGeometry& Geometry, const OrbitCameraBasis& Frame, double PixelX, double PixelY, double Reach)
 {
+    if (Geometry.Vertices.size() < 3u) return GizmoHandle::None;
     struct Projected { double X = 0.0, Y = 0.0, Depth = 0.0; bool Valid = false; };
     const auto Project = [&](const GizmoVertex& Vertex)
     {
@@ -323,6 +410,13 @@ GizmoHandle PickGizmoHandle(const GizmoGeometry& Geometry, const OrbitCameraBasi
     {
         const Projected Corner[3] = { Project(Geometry.Vertices[Index]), Project(Geometry.Vertices[Index + 1]), Project(Geometry.Vertices[Index + 2]) };
         if (!Corner[0].Valid || !Corner[1].Valid || !Corner[2].Valid) continue;
+        // Fast 2D screen-space AABB reject skips barycentric + 3x std::hypot for >95% of triangles.
+        const double MinX = std::min({ Corner[0].X, Corner[1].X, Corner[2].X });
+        const double MaxX = std::max({ Corner[0].X, Corner[1].X, Corner[2].X });
+        if (PixelX < MinX - BestGap || PixelX > MaxX + BestGap) continue;
+        const double MinY = std::min({ Corner[0].Y, Corner[1].Y, Corner[2].Y });
+        const double MaxY = std::max({ Corner[0].Y, Corner[1].Y, Corner[2].Y });
+        if (PixelY < MinY - BestGap || PixelY > MaxY + BestGap) continue;
         // Barycentric inside test (either winding)
         const double Area = (Corner[1].X - Corner[0].X) * (Corner[2].Y - Corner[0].Y) - (Corner[2].X - Corner[0].X) * (Corner[1].Y - Corner[0].Y);
         double Distance = 0.0, Depth = (Corner[0].Depth + Corner[1].Depth + Corner[2].Depth) / 3.0;

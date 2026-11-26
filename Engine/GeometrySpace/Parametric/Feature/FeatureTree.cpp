@@ -1216,8 +1216,9 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
                 std::vector<EdgeToken> Edges;
                 for (uint32_t Slot : Slots) Edges.push_back(Partition.Edges.TokenAt(Slot));
                 BlendSettings Settings;
-                Settings.Profile = Step.Shape;
-                Settings.Size    = Amount;
+                Settings.Profile             = Step.Shape;
+                Settings.Size                = Amount;
+                Settings.ClampOverlapEnabled = Step.ClampOverlapEnabled;
                 if (!Step.AnchorSizes.empty())
                 {
                     if (Step.AnchorSizes.size() != Anchors.size()) { Refuse("Blend: per-vertex sizes do not match their vertices"); break; }

@@ -290,6 +290,7 @@ private:
     VkDescriptorPool            MatcapPool                   = VK_NULL_HANDLE;
     VkDescriptorSet             MatcapSet                    = VK_NULL_HANDLE;
     uint32_t                    MatcapLayers                 = 0u;
+    uint64_t                    LastStatesHash               = 0ull;
 };
 
 } // namespace Frontier::Workspaces::Sketcher

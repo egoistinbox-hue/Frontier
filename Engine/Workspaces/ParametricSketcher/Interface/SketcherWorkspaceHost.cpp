@@ -12,6 +12,7 @@
 #include <volk.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace Frontier::Workspaces
@@ -81,7 +82,8 @@ void SketcherWorkspaceHost::Finalize() noexcept
         Thumbnail->SetStatus(ImTextureStatus_Destroyed);
     }
     Sketcher::ReleaseSketcherProjectBrowserTextures(State);
-    UploadedMatcapGen = 0u;
+    UploadedMatcapGen           = 0u;
+    LastViewportRenderSignature = 0ull;
 
     if (RasterReady)
     {
@@ -207,9 +209,14 @@ void SketcherWorkspaceHost::EndFrame(double DeltaSeconds, bool DrawFloatingOverl
     const bool Single = State.SplitView.Layout == Sketcher::SketcherViewportLayout::Single;
     const auto& Rect = Single ? State.ViewportRect : State.SplitView.FullRect;
     const uint32_t Width = static_cast<uint32_t>(std::max(1.0f, Rect[2]));
-    const uint32_t Height = static_cast<uint32_t>(std::max(1.0f, Rect[3]));
-    const auto Panes = Sketcher::ComposeSketcherRasterPanes(State, Width, Height);
-    State.Style.Gizmo = Panes.empty() ? GizmoGeometry{} : Panes.front().Style.Gizmo;
+    // RenderViewportTarget already populates State.Style.Gizmo when RasterReady is true;
+    // only compose panes here in headless / non-raster mode to avoid duplicating work every frame.
+    if (!RasterReady)
+    {
+        const uint32_t Height = static_cast<uint32_t>(std::max(1.0f, Rect[3]));
+        const auto Panes = Sketcher::ComposeSketcherRasterPanes(State, Width, Height);
+        State.Style.Gizmo = Panes.empty() ? GizmoGeometry{} : Panes.front().Style.Gizmo;
+    }
     Sketcher::ConcludeSketcherFrame(State);
 }
 
@@ -285,30 +292,43 @@ void SketcherWorkspaceHost::RenderViewportTarget()
 
     try
     {
+        using Clock = std::chrono::steady_clock;
+        auto ElapsedMs = [](Clock::time_point Start) noexcept -> double
+        {
+            return std::chrono::duration<double, std::milli>(Clock::now() - Start).count();
+        };
+
+        const Clock::time_point UploadStart = Clock::now();
         const bool Single = State.SplitView.Layout == Sketcher::SketcherViewportLayout::Single;
         const auto& TargetRect = Single ? State.ViewportRect : State.SplitView.FullRect;
         const uint32_t TargetW = std::clamp(static_cast<uint32_t>(std::max(320.0f, TargetRect[2])), 320u, 1920u);
         const uint32_t TargetH = std::clamp(static_cast<uint32_t>(std::max(200.0f, TargetRect[3])), 200u, 1080u);
+        bool TargetResized = false;
         if (TargetW != Rasterizer.Width() || TargetH != Rasterizer.Height())
         {
             Rasterizer.Resize(TargetW, TargetH);
+            TargetResized = true;
+            LastViewportRenderSignature = 0ull;
         }
 
         if (UploadedMatcapGen != State.Matcaps.Generation)
         {
             Rasterizer.UploadMatcaps(State.Matcaps.Library.Pictures);
             UploadedMatcapGen = State.Matcaps.Generation;
+            LastViewportRenderSignature = 0ull;
         }
 
         const auto& Scene = Sketcher::DisplayedSketcherScene(State);
         if (Scene.Generation != Rasterizer.SceneGeneration())
         {
             Rasterizer.UploadScene(Scene);
+            LastViewportRenderSignature = 0ull;
         }
 
         if (State.Document.ReferenceRevision != Rasterizer.ReferenceRevision())
         {
             Rasterizer.UploadReferenceSurfaces(State.Document.ReferenceSurfaces, State.Document.ReferenceRevision);
+            LastViewportRenderSignature = 0ull;
         }
         else if (!State.Document.ReferenceSurfaces.empty())
         {
@@ -339,6 +359,7 @@ void SketcherWorkspaceHost::RenderViewportTarget()
                 State.Pictures.Refusals.push_back(Pictures.back().Refusal);
             }
             Rasterizer.UploadPictures(Pictures);
+            LastViewportRenderSignature = 0ull;
         }
 
         State.Style.ImagePlanes.clear();
@@ -370,12 +391,17 @@ void SketcherWorkspaceHost::RenderViewportTarget()
         const OrbitCameraBasis ActiveFrame = FrameOrbitCamera(State.Camera, 1.0, 1.0);
         State.Pictures.Drawn = static_cast<int>(std::count_if(State.Style.ImagePlanes.begin(), State.Style.ImagePlanes.end(),
             [&](const Sketcher::SketcherImagePlaneQuad& Draw) { return Sketcher::FacesSketcherImagePlane(Draw, ActiveFrame); }));
+        State.Profile.UploadMs = ElapsedMs(UploadStart);
 
+        const Clock::time_point StateStart = Clock::now();
         const auto States = Sketcher::DisplayedSketcherStates(State);
         Rasterizer.AssignStates(States.Faces, States.Edges);
+        State.Profile.StateUploadMs = ElapsedMs(StateStart);
         State.Style.EdgeStroke = State.Options.EdgeStroke;
 
         const auto Panes = Sketcher::ComposeSketcherRasterPanes(State, Rasterizer.Width(), Rasterizer.Height());
+        State.Style.Gizmo = Panes.empty() ? GizmoGeometry{} : Panes.front().Style.Gizmo;
+
         int ProbeX = -1;
         int ProbeY = -1;
         if (State.ViewportHovered && ImGui::GetCurrentContext() != nullptr && TargetRect[2] > 1.0f && TargetRect[3] > 1.0f)
@@ -390,17 +416,132 @@ void SketcherWorkspaceHost::RenderViewportTarget()
             }
         }
 
+        // Compute deterministic 64-bit FNV-1a dirty signature of everything that affects the rendered pixels.
+        auto Mix64 = [](uint64_t H, uint64_t V) noexcept -> uint64_t
+        {
+            H ^= V;
+            H *= 1099511628211ull;
+            return H;
+        };
+        auto MixBytes = [&](uint64_t H, const void* Ptr, size_t Count) noexcept -> uint64_t
+        {
+            const auto* Bytes = static_cast<const uint8_t*>(Ptr);
+            for (size_t I = 0u; I < Count; ++I)
+            {
+                H ^= Bytes[I];
+                H *= 1099511628211ull;
+            }
+            return H;
+        };
+        uint64_t Signature = 14695981039346656037ull;
+        Signature = Mix64(Signature, TargetW);
+        Signature = Mix64(Signature, TargetH);
+        Signature = Mix64(Signature, Scene.Generation);
+        Signature = Mix64(Signature, State.Document.ReferenceRevision);
+        Signature = Mix64(Signature, UploadedMatcapGen);
+        Signature = MixBytes(Signature, State.Style.Background, sizeof(State.Style.Background));
+        Signature = Mix64(Signature, static_cast<uint64_t>(States.Faces.size()));
+        if (!States.Faces.empty()) Signature = MixBytes(Signature, States.Faces.data(), States.Faces.size() * sizeof(uint32_t));
+        Signature = Mix64(Signature, static_cast<uint64_t>(States.Edges.size()));
+        if (!States.Edges.empty()) Signature = MixBytes(Signature, States.Edges.data(), States.Edges.size() * sizeof(uint32_t));
+        for (const Sketcher::SketcherReferenceSurface& Surf : State.Document.ReferenceSurfaces)
+        {
+            Signature = Mix64(Signature, static_cast<uint64_t>(Surf.VisibleCondition ? 1u : 0u));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Surf.WireframeCondition ? 1u : 0u));
+            Signature = MixBytes(Signature, Surf.SurfaceColour.data(), sizeof(Surf.SurfaceColour));
+            Signature = MixBytes(Signature, &Surf.Opacity, sizeof(Surf.Opacity));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Surf.MatcapLayer));
+        }
+        Signature = Mix64(Signature, static_cast<uint64_t>(Panes.size()));
+        for (const Sketcher::SketcherRasterPane& Pane : Panes)
+        {
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.OffsetX));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.OffsetY));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Width));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Height));
+            Signature = MixBytes(Signature, Pane.Frame.ClipFromWorld, sizeof(Pane.Frame.ClipFromWorld));
+            Signature = MixBytes(Signature, Pane.Frame.Eye, sizeof(Pane.Frame.Eye));
+            Signature = MixBytes(Signature, &Pane.Style.EdgeStroke, sizeof(Pane.Style.EdgeStroke));
+            Signature = MixBytes(Signature, &Pane.Style.EdgeDepthMargin, sizeof(Pane.Style.EdgeDepthMargin));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.GridEnabled ? 1u : 0u));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.GridPlane));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.EdgesEnabled ? 1u : 0u));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.SurfacesEnabled ? 1u : 0u));
+            Signature = MixBytes(Signature, &Pane.Style.ZebraStripes, sizeof(Pane.Style.ZebraStripes));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.XRayEnabled ? 1u : 0u));
+            Signature = MixBytes(Signature, &Pane.Style.XRayOpacity, sizeof(Pane.Style.XRayOpacity));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.SectionEnabled ? 1u : 0u));
+            Signature = MixBytes(Signature, Pane.Style.SectionPlane.data(), sizeof(Pane.Style.SectionPlane));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.ImagePlanes.size()));
+            for (const Sketcher::SketcherImagePlaneQuad& Quad : Pane.Style.ImagePlanes)
+            {
+                Signature = MixBytes(Signature, &Quad, sizeof(Quad));
+            }
+            const auto& GizmoVerts = Pane.Style.Gizmo.Vertices;
+            Signature = Mix64(Signature, static_cast<uint64_t>(GizmoVerts.size()));
+            Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.Gizmo.OpaqueCount));
+            if (!GizmoVerts.empty())
+            {
+                const size_t Step = std::max<size_t>(1u, GizmoVerts.size() / 64u);
+                for (size_t I = 0u; I < GizmoVerts.size(); I += Step)
+                {
+                    Signature = MixBytes(Signature, &GizmoVerts[I], sizeof(GizmoVertex));
+                }
+                Signature = MixBytes(Signature, &GizmoVerts.back(), sizeof(GizmoVertex));
+            }
+        }
+        if (Signature == 0ull) Signature = 1ull;
+
+        const bool CacheValid =
+            !TargetResized &&
+            Signature == LastViewportRenderSignature &&
+            ViewportTexture.GetTexID() != ImTextureID_Invalid &&
+            Rasterizer.ReadbackIdentity() != nullptr;
+        if (CacheValid)
+        {
+            // Zero-GPU fast path: probe hover identity directly from cached CPU readback buffer in ~5 ns.
+            if (State.ViewportHovered && ProbeX >= 0 && ProbeY >= 0 &&
+                static_cast<uint32_t>(ProbeX) < Rasterizer.Width() &&
+                static_cast<uint32_t>(ProbeY) < Rasterizer.Height())
+            {
+                const size_t PixelIndex = static_cast<size_t>(ProbeY) * static_cast<size_t>(Rasterizer.Width()) + static_cast<size_t>(ProbeX);
+                State.HoverIdentity = Rasterizer.ReadbackIdentity()[PixelIndex];
+            }
+            else
+            {
+                State.HoverIdentity = 0u;
+            }
+            State.Profile.GpuRecordMs    = 0.0;
+            State.Profile.GpuWaitMs      = 0.0;
+            State.Profile.ReadbackCopyMs = 0.0;
+            State.Profile.LastFrameCached = true;
+            ++State.Profile.ViewportCacheHits;
+            return;
+        }
+
+        const Clock::time_point RecordStart = Clock::now();
         VkCommandBuffer Cmd = Device->BeginSingleTimeCommands();
         if (Cmd == VK_NULL_HANDLE) return;
         Rasterizer.RecordPanes(Cmd, Panes, State.Style.Background, true, ProbeX, ProbeY);
 
         // DispatchCommandBufferAsync ends Cmd internally; do not call vkEndCommandBuffer twice.
         const uint64_t Tick = Device->DispatchCommandBufferAsync(Cmd);
-        if (Device->AwaitTimelineTick(Tick))
+        State.Profile.GpuRecordMs = ElapsedMs(RecordStart);
+
+        const Clock::time_point WaitStart = Clock::now();
+        const bool Completed = Device->AwaitTimelineTick(Tick);
+        State.Profile.GpuWaitMs = ElapsedMs(WaitStart);
+
+        const Clock::time_point CopyStart = Clock::now();
+        if (Completed)
         {
             State.HoverIdentity = State.ViewportHovered ? Rasterizer.ProbedIdentity() : 0u;
             UploadViewportPixels(Rasterizer.ReadbackColour(), Rasterizer.Width(), Rasterizer.Height());
+            LastViewportRenderSignature = Signature;
         }
+        State.Profile.ReadbackCopyMs = ElapsedMs(CopyStart);
+        State.Profile.LastFrameCached = false;
+        ++State.Profile.ViewportDraws;
         Device->FreeCommandBuffer(Cmd);
     }
     catch (const std::exception& Failure)

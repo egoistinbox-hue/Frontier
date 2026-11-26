@@ -208,8 +208,10 @@ struct SketcherBlendRequest
     std::optional<double>  EndSize           = {};                                           // [len] - Size at the far ends (empty = constant)
     bool                   ReversedCondition = false;                                        // [-]   - Anchor at each edge's end vertex
     std::vector<std::pair<std::string, double>> VertexSizes = {};                            // [len] - Handles: size per persistent vertex name (unlisted: Size)
+    bool                   ClampOverlapEnabled = true;                                       // [-]   - Clamp & merge at blocking vertices while other side continues beveling
 };
 
+// 📝 Pre-blend snapshot & current parameters of an already-committed Blend feature step (powers persistent post-bevel
 // 📝 Bevel handles (Plasticity's fillet gizmo): one per distinct vertex of the picked edges — dragged, it gives that
 //    corner its own size (variable blend) — plus the uniform handle at the middle of the first edge (Vertex empty).
 //    Direction is the outward bisector of the two faces' normals there; Edges counts the picked edges at the vertex.
@@ -236,6 +238,22 @@ struct SketcherBlendFit
     std::vector<double> FilletMerges  = {};                                                  // [len] - Radii where rails meet a neighbour (sorted)
     std::vector<double> ChamferMerges = {};                                                  // [len] - Chamfer sizes where rails meet a neighbour (sorted)
     std::string Refusal = {};                                                                // [-]   - Why nothing was measured
+};
+
+//    blue + white variable-bevel controls and click-another-bevel-face switching).
+struct SketcherBlendStepControls
+{
+    bool                                    ValidCondition      = false;                     // [-]   - Step found and pre-blend handles measured
+    std::string                             StepLabel           = {};                        // [-]   - FeatureStep::Label ("Blend#N")
+    std::string                             BodyKey             = {};                        // [-]   - Owning body key
+    GeometrySpace::Parametric::BlendProfile Shape               = GeometrySpace::Parametric::BlendProfile::Fillet;
+    double                                  Size                = 0.25;                      // [len] - Current uniform / anchor size
+    bool                                    VariableEnabled     = false;                     // [-]   - End-to-end variable enabled
+    double                                  EndSize             = 0.0;                       // [len] - Far-end size (when VariableEnabled)
+    bool                                    ClampOverlapEnabled = true;                      // [-]   - Blocking-vertex clamp & merge enabled
+    std::vector<SketcherBlendHandle>        Handles             = {};                        // [-]   - [0] blue uniform handle, [1..] white corner handles
+    std::vector<double>                     CornerSizes         = {};                        // [len] - Per-handle overrides (0: follows Size)
+    SketcherBlendFit                        Fit                 = {};                        // [len] - Reaches and merge distances
 };
 
 struct SketcherCommandOutcome
@@ -418,6 +436,12 @@ struct VehicleCurveFile;
 [[nodiscard]] std::vector<std::string> ResolveSketcherVertexBlendEdges(const SketcherDocument& Document, const std::vector<std::string>& Vertices);
 [[nodiscard]] std::vector<SketcherBlendHandle> MeasureSketcherBlendHandles(const SketcherDocument& Document, const std::vector<std::string>& Edges);
 [[nodiscard]] SketcherBlendFit MeasureSketcherBlendFit(const SketcherDocument& Document, const std::vector<std::string>& Edges);
+// Persistent post-bevel editing: locate owning Blend step from a bevel face, measure its pre-blend blue/white handles,
+// and update its parameters in place (supporting live variable bevel adjustment and reversible vertex merge/unmerge).
+[[nodiscard]] std::string FindSketcherBlendStepForFace(const SketcherDocument& Document, const std::string& FaceName);
+[[nodiscard]] SketcherBlendStepControls MeasureSketcherBlendStepControls(const SketcherDocument& Document, const std::string& StepLabel);
+[[nodiscard]] SketcherCommandOutcome UpdateSketcherBlendStep(SketcherDocument& Document, const std::string& StepLabel,
+                                                             const SketcherBlendRequest& Request, bool RecordUndo = true);
 // Direction (gizmo): Tweak moves along it by Amount, Rotate turns about it (through each face centre) by Amount [rad].
 [[nodiscard]] SketcherCommandOutcome ChangeSketcherSelection(SketcherDocument& Document, GeometrySpace::Parametric::FaceOperationCategory Operation, double Amount,
                                                              std::optional<GeometrySpace::Parametric::Vector3> Direction = std::nullopt);

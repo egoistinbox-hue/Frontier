@@ -810,4 +810,155 @@ const char* BlendProfileLabel(BlendProfile Profile) noexcept
     return Profile == BlendProfile::Fillet ? "Fillet" : "Chamfer";
 }
 
+EdgeBlendSheetOutcome ResolveClampedPlanarBlendSheet(
+    const ModelPartition& Partition,
+    EdgeToken             Edge,
+    const BlendSettings&  Settings,
+    double                SetbackSide0,
+    double                SetbackSide1,
+    bool                  Clamped0,
+    bool                  Clamped1)
+{
+    EdgeBlendSheetOutcome Outcome;
+    const auto Refuse = [&](std::string Reason) { Outcome.Refusal = std::move(Reason); return Outcome; };
+
+    const EdgeProfile& Profile = Partition.Edges.Resolve(Edge);
+    const auto*        Line    = std::get_if<StraightLine>(&Partition.Curves.Resolve(Profile.Curve));
+    if (!Line || Profile.Start == Profile.End) return Refuse("clamped blend requires an open straight edge");
+    if (!(SetbackSide0 > 1.0e-9) || !(SetbackSide1 > 1.0e-9)) return Refuse("clamped setback must be positive");
+
+    const FinToken Fin0 = Profile.RadialFin;
+    const FinToken Fin1 = Partition.RadialMate(Fin0);
+    if (!Fin0.PresentCondition() || !Fin1.PresentCondition() || Fin0 == Fin1) return Refuse("clamped blend requires a manifold edge");
+
+    const FinProfile&  Use0    = Partition.Fins.Resolve(Fin0);
+    const FinProfile&  Use1    = Partition.Fins.Resolve(Fin1);
+    const FaceToken    Face0   = Partition.Loops.Resolve(Use0.Loop).Face;
+    const FaceToken    Face1   = Partition.Loops.Resolve(Use1.Loop).Face;
+    const FaceProfile& Rec0    = Partition.Faces.Resolve(Face0);
+    const FaceProfile& Rec1    = Partition.Faces.Resolve(Face1);
+    const SurfaceGeometry& Surf0 = Partition.Surfaces.Resolve(Rec0.Surface);
+    const SurfaceGeometry& Surf1 = Partition.Surfaces.Resolve(Rec1.Surface);
+    if (!std::holds_alternative<PlaneSurface>(Surf0) || !std::holds_alternative<PlaneSurface>(Surf1))
+        return Refuse("clamped blend requires planar supports");
+
+    const double  Middle   = 0.5 * (Profile.IntervalLow + Profile.IntervalHigh);
+    const Vector3 MidPos   = EvaluateCurve(Partition.Curves.Resolve(Profile.Curve), Middle).Position;
+    const Vector3 Normal0  = ResolveOutwardNormal(Surf0, Rec0.Sense, MidPos, {});
+    const Vector3 Normal1  = ResolveOutwardNormal(Surf1, Rec1.Sense, MidPos, {});
+    const Vector3 Dir      = Normalize(Line->Direction);
+    const Vector3 Fin0Dir  = Dir * (Use0.Sense == Orientation::Forward ? 1.0 : -1.0);
+    const Vector3 Fin1Dir  = Dir * (Use1.Sense == Orientation::Forward ? 1.0 : -1.0);
+    const bool    Convex   = Dot(Cross(Normal0, Normal1), Fin0Dir) > 0.0;
+    if (!Convex) return Refuse("clamped blend applies to convex edges");
+
+    const double Cosine = std::clamp(Dot(Normal0, Normal1), -1.0, 1.0);
+    const double Turn   = std::acos(Cosine);
+    if (Turn < 1.0e-4 || Turn > std::numbers::pi - 1.0e-4) return Refuse("clamped blend requires non-tangent planar faces");
+
+    Vector3 Inward0 = Normalize(Cross(Normal0, Fin0Dir));
+    Vector3 Inward1 = Normalize(Cross(Normal1, Fin1Dir));
+    if (Dot(Inward0, Normal1) > 0.0) Inward0 = Inward0 * -1.0;
+    if (Dot(Inward1, Normal0) > 0.0) Inward1 = Inward1 * -1.0;
+
+    EdgeBlendSheet Sheet;
+    Sheet.Edge            = Edge;
+    Sheet.Fins[0]         = Fin0;
+    Sheet.Fins[1]         = Fin1;
+    Sheet.Faces[0]        = Face0;
+    Sheet.Faces[1]        = Face1;
+    Sheet.ConvexCondition = true;
+    Sheet.Dihedral        = std::numbers::pi - Turn;
+    Sheet.Alignment       = 1.0;
+    Sheet.ClampedSides[0] = Clamped0;
+    Sheet.ClampedSides[1] = Clamped1;
+
+    const double  HalfTan = std::tan(0.5 * Turn);
+    const double  AvgSet  = 0.5 * (SetbackSide0 + SetbackSide1);
+    Sheet.Radius          = (Settings.Profile == BlendProfile::Fillet && HalfTan > 1.0e-9) ? (AvgSet / HalfTan) : AvgSet;
+    Sheet.Spine           = StraightLine{ Line->Origin, Dir };
+    Sheet.Contacts[0]     = StraightLine{ Line->Origin + Inward0 * SetbackSide0, Dir };
+    Sheet.Contacts[1]     = StraightLine{ Line->Origin + Inward1 * SetbackSide1, Dir };
+
+    const Vector3 FootA   = Line->Origin + Inward0 * SetbackSide0;
+    const Vector3 FootB   = Line->Origin + Inward1 * SetbackSide1;
+    const Vector3 OutSum  = Normal0 + Normal1;
+
+    if (Settings.Profile == BlendProfile::Chamfer)
+    {
+        const Vector3 PlaneNormal = Cross(Dir, FootB - FootA);
+        if (Length(PlaneNormal) < 1.0e-12) return Refuse("degenerate clamped chamfer plane");
+        const PlaneSurface Plane{ ConstructFrame(FootA, PlaneNormal, Dir) };
+        Sheet.Surface     = Plane;
+        Sheet.SpineAxis   = 0;
+        Sheet.CrossCentre = 0.5 * Dot(FootB - FootA, Plane.Frame.YAxis);
+        Sheet.Sense       = Dot(Plane.Frame.ZAxis, OutSum) > 0.0 ? Orientation::Forward : Orientation::Reversed;
+        const double OffsetDist0 = -OrientationSign(Rec0.Sense) * Sheet.Radius;
+        const double OffsetDist1 = -OrientationSign(Rec1.Sense) * Sheet.Radius;
+        if (const auto Off0 = OffsetSurface(Surf0, OffsetDist0)) Sheet.Offsets[0] = *Off0;
+        if (const auto Off1 = OffsetSurface(Surf1, OffsetDist1)) Sheet.Offsets[1] = *Off1;
+        Outcome.Sheet = Sheet;
+        return Outcome;
+    }
+
+    // Equal clamped fillet -> exact CylinderSurface (same as standard rolling-ball fillet at clamped radius)
+    if (std::fabs(SetbackSide0 - SetbackSide1) <= 1.0e-9 * std::max(SetbackSide0, SetbackSide1))
+    {
+        const double  Radius   = SetbackSide0 / std::max(HalfTan, 1.0e-9);
+        const Vector3 Centre   = FootA - Normal0 * Radius;
+        const Vector3 Bisector = Normalize((FootA - Centre) + (FootB - Centre));
+        Sheet.Radius      = Radius;
+        Sheet.Spine       = StraightLine{ Centre, Dir };
+        Sheet.Surface     = CylinderSurface{ ConstructFrame(Centre, Dir, -Bisector), Radius };
+        Sheet.SpineAxis   = 1;
+        Sheet.CrossCentre = std::numbers::pi;
+        const Vector3 Probe   = EvaluateSurface(Sheet.Surface, ResolveSheetChart(Sheet, Middle)).Position;
+        const Vector3 Natural = EvaluateSurfaceNormal(Sheet.Surface, ResolveSheetChart(Sheet, Middle));
+        Sheet.Sense           = Dot(Natural, OutSum) > 0.0 ? Orientation::Forward : Orientation::Reversed;
+        const double OffsetDist0 = -OrientationSign(Rec0.Sense) * Radius;
+        const double OffsetDist1 = -OrientationSign(Rec1.Sense) * Radius;
+        if (const auto Off0 = OffsetSurface(Surf0, OffsetDist0)) Sheet.Offsets[0] = *Off0;
+        if (const auto Off1 = OffsetSurface(Surf1, OffsetDist1)) Sheet.Offsets[1] = *Off1;
+        (void)Probe;
+        Outcome.Sheet = Sheet;
+        return Outcome;
+    }
+
+    // Asymmetric clamped fillet: exact G1-tangent rational quadratic NURBS surface (degree 2 in u, degree 1 in v).
+    // At u = 0 it touches Contacts[0] tangent to Face0; at u = 1 it touches Contacts[1] tangent to Face1.
+    const double Span   = std::max(1.0e-3, Profile.IntervalHigh - Profile.IntervalLow);
+    const double Margin = std::max(4.0 * std::max(SetbackSide0, SetbackSide1), 0.5 * Span);
+    const double VLow   = Profile.IntervalLow - Margin;
+    const double VHigh  = Profile.IntervalHigh + Margin;
+    const double MidW   = std::clamp(std::cos(0.5 * Turn), 0.05, 0.999);
+
+    const std::vector<double> KnotsU = { 0.0, 0.0, 0.0, 1.0, 1.0, 1.0 };
+    const std::vector<double> KnotsV = { VLow, VLow, VHigh, VHigh };
+    const std::vector<Vector3> Poles = {
+        Line->Origin + Dir * VLow  + Inward0 * SetbackSide0,
+        Line->Origin + Dir * VHigh + Inward0 * SetbackSide0,
+        Line->Origin + Dir * VLow,
+        Line->Origin + Dir * VHigh,
+        Line->Origin + Dir * VLow  + Inward1 * SetbackSide1,
+        Line->Origin + Dir * VHigh + Inward1 * SetbackSide1,
+    };
+    const std::vector<double> Weights = { 1.0, 1.0, MidW, MidW, 1.0, 1.0 };
+
+    const std::optional<NurbsSurface> Rational = ConstructNurbsSurface(2, 1, 3, 2, KnotsU, KnotsV, Poles, Weights);
+    if (!Rational) return Refuse("failed to construct G1 clamped rational fillet surface");
+
+    Sheet.Surface                = *Rational;
+    Sheet.SpineAxis              = 1;
+    Sheet.CrossCentre            = 0.5;
+    Sheet.AsymmetricMiddleWeight = MidW;
+    const Vector3 Natural        = EvaluateSurfaceNormal(Sheet.Surface, { 0.5, Middle });
+    Sheet.Sense                  = Dot(Natural, OutSum) > 0.0 ? Orientation::Forward : Orientation::Reversed;
+    const double OffsetDist0     = -OrientationSign(Rec0.Sense) * Sheet.Radius;
+    const double OffsetDist1     = -OrientationSign(Rec1.Sense) * Sheet.Radius;
+    if (const auto Off0 = OffsetSurface(Surf0, OffsetDist0)) Sheet.Offsets[0] = *Off0;
+    if (const auto Off1 = OffsetSurface(Surf1, OffsetDist1)) Sheet.Offsets[1] = *Off1;
+    Outcome.Sheet = Sheet;
+    return Outcome;
+}
+
 } // namespace Frontier::GeometrySpace::Parametric

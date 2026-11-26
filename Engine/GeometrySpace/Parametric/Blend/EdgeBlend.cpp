@@ -11,6 +11,7 @@
 
 #include "Engine/GeometrySpace/Parametric/Construction/BodyArrangement.h"
 #include "Engine/GeometrySpace/Parametric/Containment/FaceDomain.h"
+#include "Engine/GeometrySpace/Parametric/Geometry/NurbsCarrier.h"
 #include "Engine/GeometrySpace/Parametric/Geometry/ProjectedCurve.h"
 #include "Engine/GeometrySpace/Parametric/Geometry/RollingBallCarrier.h"
 #include "Engine/GeometrySpace/Parametric/Intersection/CurveSurfaceIntersection.h"
@@ -127,6 +128,10 @@ namespace
             for (EdgeBlendSheet& Sheet : Outcome.Sheets)
             {
                 if (std::string Refusal = ResolveSmoothOverflow(Sheet); !Refusal.empty()) return Refusal;
+            }
+            if (Settings.ClampOverlapEnabled)
+            {
+                ApplyBlockingVertexClamping();
             }
 
             // ② Vertex resolution, ③ pieces, ④ faces.
@@ -445,6 +450,210 @@ namespace
                 ++Outcome.Statistics.SmoothOverflows;
             }
             return {};
+        }
+
+        // 💡 Blender-style reversible vertex clamp & merge: when one side of a straight convex planar blend reaches a
+        //    blocking vertex or an opposing parallel blend on the same face, clamp THAT side onto the exact merge line
+        //    so MergeCoincidences fuses the vertices into one (instead of leaving 2 separate vertices or refusing),
+        //    while the OTHER side continues beveling freely. Because the parametric FeatureStep stores the unmodified
+        //    requested Size against the pre-blend body, shrinking Size later cleanly unmerges them automatically.
+        void ApplyBlockingVertexClamping()
+        {
+            if (Outcome.Sheets.empty()) return;
+
+            // Precompute vertex degrees and incident blended-edge flags on the input body.
+            std::map<uint32_t, int>  VertexDegree;
+            std::set<uint32_t>       BlendedVertexSlots;
+            for (EdgeToken Edge : Inventory.Edges)
+            {
+                const EdgeProfile& P = Partition.Edges.Resolve(Edge);
+                if (P.Start != P.End)
+                {
+                    ++VertexDegree[P.Start.Slot];
+                    ++VertexDegree[P.End.Slot];
+                }
+                if (SheetIndex.count(Edge.Slot) != 0)
+                {
+                    BlendedVertexSlots.insert(P.Start.Slot);
+                    BlendedVertexSlots.insert(P.End.Slot);
+                }
+            }
+
+            // Helper: requested setback of a straight planar sheet along one of its planar supports.
+            const auto MeasureSheetSetback = [&](const EdgeBlendSheet& Sheet, int Side, Vector3& OutInward) -> double
+            {
+                const EdgeProfile& Profile = Partition.Edges.Resolve(Sheet.Edge);
+                const auto*        Line    = std::get_if<StraightLine>(&Partition.Curves.Resolve(Profile.Curve));
+                const auto*        Contact = std::get_if<StraightLine>(&Sheet.Contacts[Side]);
+                if (!Line || !Contact) return -1.0;
+                const Vector3 Dir   = Normalize(Line->Direction);
+                const Vector3 Delta = Contact->Origin - Line->Origin;
+                const Vector3 Perp  = Delta - Dir * Dot(Delta, Dir);
+                const double  Dist  = Length(Perp);
+                if (Dist <= Tolerance) return -1.0;
+                OutInward = Perp * (1.0 / Dist);
+                return Dist;
+            };
+
+            // Measure initial requested setbacks before clamping any sheet (symmetric between opposing parallel blends).
+            std::vector<std::array<double, 2>>  ReqSetback(Outcome.Sheets.size(), { -1.0, -1.0 });
+            std::vector<std::array<Vector3, 2>> InwardDirs(Outcome.Sheets.size());
+            for (size_t Idx = 0; Idx < Outcome.Sheets.size(); ++Idx)
+            {
+                const EdgeBlendSheet& Sheet = Outcome.Sheets[Idx];
+                if (!Sheet.ConvexCondition || Sheet.VariableCondition() || Sheet.LawCondition()) continue;
+                const EdgeProfile& Profile = Partition.Edges.Resolve(Sheet.Edge);
+                if (Profile.Start == Profile.End || !std::holds_alternative<StraightLine>(Partition.Curves.Resolve(Profile.Curve))) continue;
+                if (!std::holds_alternative<PlaneSurface>(SurfaceOf(Sheet.Faces[0])) || !std::holds_alternative<PlaneSurface>(SurfaceOf(Sheet.Faces[1]))) continue;
+                for (int Side = 0; Side < 2; ++Side)
+                {
+                    ReqSetback[Idx][Side] = MeasureSheetSetback(Sheet, Side, InwardDirs[Idx][Side]);
+                }
+            }
+
+            // Check whether a planar face can cleanly cliff-overflow past FarEdge (strict 4-edge convex cliff strip with
+            // unblended degree-3 far vertices); anything else is a blocking vertex that must clamp & merge instead.
+            const auto CanCliffOverflowCleanly = [&](FaceToken Face, EdgeToken BlendedEdge, EdgeToken FarEdge) -> bool
+            {
+                const FaceProfile& Rec = Partition.Faces.Resolve(Face);
+                if (Rec.Loops.size() != 1) return false;
+                int FinCount = 0;
+                Partition.EnumerateLoopFins(Rec.Loops.front(), [&](FinToken) { ++FinCount; });
+                if (FinCount != 4) return false;
+                if (!FarEdge.PresentCondition() || FarEdge == BlendedEdge) return false;
+                if (SheetIndex.count(FarEdge.Slot) != 0) return false;
+                const EdgeProfile& FarProf = Partition.Edges.Resolve(FarEdge);
+                if (FarProf.Start == FarProf.End || !std::holds_alternative<StraightLine>(Partition.Curves.Resolve(FarProf.Curve))) return false;
+                if (VertexDegree[FarProf.Start.Slot] != 3 || VertexDegree[FarProf.End.Slot] != 3) return false;
+                if (BlendedVertexSlots.count(FarProf.Start.Slot) != 0 || BlendedVertexSlots.count(FarProf.End.Slot) != 0) return false;
+                if (SmoothEdgeCondition(Partition, FarEdge)) return false;
+                return true;
+            };
+
+            for (size_t Idx = 0; Idx < Outcome.Sheets.size(); ++Idx)
+            {
+                EdgeBlendSheet& Sheet = Outcome.Sheets[Idx];
+                if (!(ReqSetback[Idx][0] > 0.0) || !(ReqSetback[Idx][1] > 0.0)) continue;
+                const EdgeProfile& Profile = Partition.Edges.Resolve(Sheet.Edge);
+                const auto&        Line    = std::get<StraightLine>(Partition.Curves.Resolve(Profile.Curve));
+                const Vector3      Dir     = Normalize(Line.Direction);
+                const Vector3      StartP  = Partition.Vertices.Resolve(Profile.Start).Position;
+                const Vector3      EndP    = Partition.Vertices.Resolve(Profile.End).Position;
+
+                double Limit[2] = { std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity() };
+                bool   MustClamp[2] = { false, false };
+
+                for (int Side = 0; Side < 2; ++Side)
+                {
+                    if (Smooths.count({ Sheet.Edge.Slot, Side }) != 0) continue;
+                    const FaceToken    Face = Sheet.Faces[Side];
+                    const FaceProfile& Rec  = Partition.Faces.Resolve(Face);
+                    const Vector3      Inw  = InwardDirs[Idx][Side];
+                    const double       Req  = ReqSetback[Idx][Side];
+
+                    // Walk every edge & vertex of Face[Side] to find opposing parallel blends and blocking vertices.
+                    for (LoopToken Loop : Rec.Loops)
+                    {
+                        Partition.EnumerateLoopFins(Loop, [&](FinToken Fin)
+                        {
+                            const EdgeToken    Other = Partition.Fins.Resolve(Fin).Edge;
+                            if (Other == Sheet.Edge) return;
+                            const EdgeProfile& Op    = Partition.Edges.Resolve(Other);
+                            if (Op.Start == Op.End) return;
+
+                            const Vector3 Pa = Partition.Vertices.Resolve(Op.Start).Position;
+                            const Vector3 Pb = Partition.Vertices.Resolve(Op.End).Position;
+                            const double  Da = Dot(Pa - StartP, Inw);
+                            const double  Db = Dot(Pb - StartP, Inw);
+
+                            // Case A: Parallel opposing edge on the same planar face
+                            if (const auto* Across = std::get_if<StraightLine>(&Partition.Curves.Resolve(Op.Curve));
+                                Across && std::fabs(std::fabs(Dot(Normalize(Across->Direction), Dir)) - 1.0) <= 1.0e-9)
+                            {
+                                const double Width = 0.5 * (Da + Db);
+                                if (!(Width > 1.0e-7 * Scale)) return;
+
+                                // A1: Parallel edge is ALSO being beveled -> share face proportionally and merge at midpoint!
+                                if (const auto FoundOther = SheetIndex.find(Other.Slot); FoundOther != SheetIndex.end())
+                                {
+                                    const size_t OtherIdx = static_cast<size_t>(FoundOther->second);
+                                    const int OtherSide = SideOn(Outcome.Sheets[OtherIdx], Face);
+                                    const double OtherReq = (OtherSide >= 0 && ReqSetback[OtherIdx][OtherSide] > 0.0)
+                                                          ? ReqSetback[OtherIdx][OtherSide]
+                                                          : Req;
+                                    const double SumReq = Req + OtherReq;
+                                    const double Share  = Width * (Req / std::max(SumReq, 1.0e-12));
+                                    const double Snap   = std::max(10.0 * Agreement, 0.002 * Share);
+                                    if (Req >= Share - Snap && Share < Limit[Side])
+                                    {
+                                        Limit[Side]     = Share;
+                                        MustClamp[Side] = true;
+                                    }
+                                    return;
+                                }
+
+                                // A2: Unblended parallel edge — clamp & merge directly onto the blocking edge so the far wall stays intact
+                                // while the unclamped side continues beveling past Width!
+                                const double Snap = std::max(10.0 * Agreement, 0.002 * Width);
+                                if (Req >= Width - Snap && Width < Limit[Side])
+                                {
+                                    Limit[Side]     = Width;
+                                    MustClamp[Side] = true;
+                                }
+                                return;
+                            }
+
+                            // Case B: Incident sharp edge leaving Start or End of the beveled edge onto a blocking vertex Far
+                            const bool AtStart = (Op.Start == Profile.Start || Op.End == Profile.Start);
+                            const bool AtEnd   = (Op.Start == Profile.End   || Op.End == Profile.End);
+                            if (AtStart || AtEnd)
+                            {
+                                const VertexToken Far    = (Op.Start == Profile.Start || Op.Start == Profile.End) ? Op.End : Op.Start;
+                                const Vector3     FarPos = Partition.Vertices.Resolve(Far).Position;
+                                const double      Perp   = Dot(FarPos - StartP, Inw);
+                                if (!(Perp > 1.0e-7 * Scale)) return;
+
+                                const double Snap = std::max(10.0 * Agreement, 0.002 * Perp);
+                                if (Req >= Perp - Snap && Perp < Limit[Side])
+                                {
+                                    Limit[Side]     = Perp;
+                                    MustClamp[Side] = true;
+                                }
+                                return;
+                            }
+
+                            // Case C: Any other non-incident blocking vertex inside Face[Side] (e.g. step / inner loop / N-gon)
+                            for (const Vector3& Pt : { Pa, Pb })
+                            {
+                                const double Perp = Dot(Pt - StartP, Inw);
+                                if (!(Perp > 1.0e-7 * Scale)) continue;
+                                const double Along = Dot(Pt - StartP, Dir);
+                                const double EdgeLen = Distance(StartP, EndP);
+                                if (Along < -Tolerance || Along > EdgeLen + Tolerance) continue;
+                                const double Snap = std::max(10.0 * Agreement, 0.002 * Perp);
+                                if (Req >= Perp - Snap && Perp < Limit[Side])
+                                {
+                                    Limit[Side]     = Perp;
+                                    MustClamp[Side] = true;
+                                }
+                            }
+                        });
+                    }
+                }
+
+                if (!MustClamp[0] && !MustClamp[1]) continue;
+
+                const double FinalD0 = MustClamp[0] ? Limit[0] : ReqSetback[Idx][0];
+                const double FinalD1 = MustClamp[1] ? Limit[1] : ReqSetback[Idx][1];
+                if (!(FinalD0 > 1.0e-7 * Scale) || !(FinalD1 > 1.0e-7 * Scale)) continue;
+
+                EdgeBlendSheetOutcome Clamped = ResolveClampedPlanarBlendSheet(
+                    Partition, Sheet.Edge, Settings, FinalD0, FinalD1, MustClamp[0], MustClamp[1]);
+                if (!Clamped.Sheet) continue;
+
+                Sheet = *Clamped.Sheet;
+                Outcome.Statistics.ClampedSides += (MustClamp[0] ? 1 : 0) + (MustClamp[1] ? 1 : 0);
+            }
         }
 
         [[nodiscard]] int EndAt(EdgeToken Edge, VertexToken Vertex) const { return Partition.Edges.Resolve(Edge).Start == Vertex ? 0 : 1; }
@@ -1271,6 +1480,7 @@ namespace
                     Overflow[Side] = true;
                     continue;
                 }
+                if (Sheet.ClampedSides[Side]) continue;
                 const CliffCorner Corner = DetectCliff(Sheet, Vertex, Sharp, Support, PositionOf(Feet[Side]), nullptr);
                 if (!Corner.Refusal.empty()) return Corner.Refusal;
                 if (Corner.Point < 0) continue;
@@ -1282,14 +1492,26 @@ namespace
                 TrimVertices[{ Corner.Trimmed.Slot, Corner.TrimmedEnd }] = Corner.Point;
                 if (Corner.NotchCondition) Extensions.insert({ Corner.Trimmed.Slot, Corner.TrimmedEnd });   // the ledge grows under the blend
             }
-            // 📝 Cap = blend carrier ∩ third face between the feet. A cylinder on a plane is a closed-form conic; every
-            //    other pair (torus or cone blends, curved third faces) goes through the exact section primitive.
+            // 📝 Cap = blend carrier ∩ third face between the feet. A cylinder on a plane is a closed-form conic; an
+            //    asymmetric G1 clamped rational fillet on a plane is an exact affine-projected rational quadratic Bézier;
+            //    every other pair goes through the exact section primitive.
             int Cap = -1;
             const auto* Cylinder = std::get_if<CylinderSurface>(&Sheet.Surface);
             if (Cylinder && Plane)
             {
                 const std::optional<CurveGeometry> Conic = SectionCylinderByPlane(*Cylinder, Plane->Frame.Origin, Plane->Frame.ZAxis);
                 if (Conic) Cap = IssueConicArc(*Conic, Feet[0], Feet[1]);
+            }
+            else if (Sheet.AsymmetricMiddleWeight > 0.0 && Plane)
+            {
+                const CurveGeometry& EdgeCurve = Partition.Curves.Resolve(Partition.Edges.Resolve(End.first).Curve);
+                const Vector3        Apex      = CrossCurveSurface(EdgeCurve, Position, SurfaceOf(Third)).value_or(Position);
+                const std::optional<NurbsCurve> CapArc = ConstructNurbsCurve(
+                    2,
+                    { 0.0, 0.0, 0.0, 1.0, 1.0, 1.0 },
+                    { PositionOf(Feet[0]), Apex, PositionOf(Feet[1]) },
+                    { 1.0, Sheet.AsymmetricMiddleWeight, 1.0 });
+                if (CapArc) Cap = IssueEdge(*CapArc, 0.0, 1.0, Feet[0], Feet[1]);
             }
             else Cap = IssueSection(Sheet.Surface, SurfaceOf(Third), Feet[0], Feet[1]);
             if (Cap < 0) return std::string("cap: no exact section of the ") + SurfaceCategoryLabel(Sheet.Surface) + " blend and the " + SurfaceCategoryLabel(SurfaceOf(Third)) + " face through both feet";
@@ -1739,9 +1961,17 @@ namespace
                 const double High = EndFound != TrimVertices.end() ? ProjectOntoCurve(Curve, PositionOf(To), Low) : Profile.IntervalHigh;
                 const bool   LowExtended  = Extensions.count({ Edge.Slot, 0 }) != 0;
                 const bool   HighExtended = Extensions.count({ Edge.Slot, 1 }) != 0;
-                if (!(High - Low > Tolerance) && Distance(PositionOf(From), PositionOf(To)) <= Agreement)
+                const double MergeDist    = Settings.ClampOverlapEnabled ? std::max(Agreement, 10.0 * Agreement) : Agreement;
+                if (!(High - Low > Tolerance) && Distance(PositionOf(From), PositionOf(To)) <= MergeDist)
                 {
-                    // Both trims land on the same point (two blends meeting on this edge): a zero-length piece to collapse.
+                    // Both trims land on the same point (two blends meeting on this edge or bevel foot landing on a
+                    // blocking vertex): emit a zero-length piece so MergeCoincidences fuses them into one vertex.
+                    Pieces[Edge.Slot] = IssueEdge(Curve, Low, Low, From, To);
+                    Collapsed.insert(Pieces[Edge.Slot]);
+                    continue;
+                }
+                if (Settings.ClampOverlapEnabled && Distance(PositionOf(From), PositionOf(To)) <= MergeDist)
+                {
                     Pieces[Edge.Slot] = IssueEdge(Curve, Low, Low, From, To);
                     Collapsed.insert(Pieces[Edge.Slot]);
                     continue;
@@ -1804,10 +2034,17 @@ namespace
                 while (Root[Vertex] != Vertex) Vertex = Root[Vertex] = Root[Root[Vertex]];
                 return Vertex;
             };
+            std::set<int> OriginalIndices;
+            for (const auto& [Slot, BlueprintIdx] : OriginalVertices) OriginalIndices.insert(BlueprintIdx);
             for (int Edge : Collapsed)
             {
                 const int Start = Find(Blueprint.Edges[Edge].Start), End = Find(Blueprint.Edges[Edge].End);
-                if (Start != End) Root[std::max(Start, End)] = std::min(Start, End);
+                if (Start == End) continue;
+                const bool StartOrig = OriginalIndices.count(Start) != 0;
+                const bool EndOrig   = OriginalIndices.count(End) != 0;
+                if (StartOrig && !EndOrig)      Root[End]   = Start;
+                else if (EndOrig && !StartOrig) Root[Start] = End;
+                else                            Root[std::max(Start, End)] = std::min(Start, End);
             }
             for (BlueprintEdge& Block : Blueprint.Edges)
             {
@@ -1931,6 +2168,16 @@ namespace
                 {
                     std::vector<FinToken> Fins;
                     Partition.EnumerateLoopFins(Loop, [&](FinToken Fin) { Fins.push_back(Fin); });
+                    // Rotate cyclic loop start off any consumed fin so a cap / setback attached to its end vertex
+                    // always has the preceding surviving use in Uses (independent of loop starting-edge ordering).
+                    if (Fins.size() > 1u && ConsumedEdges.count(Partition.Fins.Resolve(Fins.front()).Edge.Slot) != 0)
+                    {
+                        const auto FirstSurviving = std::find_if(Fins.begin(), Fins.end(), [&](FinToken Candidate)
+                        {
+                            return ConsumedEdges.count(Partition.Fins.Resolve(Candidate).Edge.Slot) == 0;
+                        });
+                        if (FirstSurviving != Fins.end()) std::rotate(Fins.begin(), FirstSurviving, Fins.end());
+                    }
                     std::vector<BlueprintUse> Uses;
                     for (FinToken Fin : Fins)
                     {

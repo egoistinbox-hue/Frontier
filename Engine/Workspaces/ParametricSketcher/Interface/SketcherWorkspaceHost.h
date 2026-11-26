@@ -60,7 +60,7 @@ public:
 private:
     void RenderViewportTarget();
     void UploadViewportPixels(const uint32_t* Pixels, uint32_t Width, uint32_t Height);
-    [[nodiscard]] ImTextureRef QueryViewportTextureRef() const noexcept;
+    [[nodiscard]] ImTextureRef QueryViewportTextureRef() noexcept;
 
     GeometricRaster::VulkanInterchange*            Device            = nullptr;
     GeometricRaster::ImGuiOverlayRasterization*    ImGuiPresenter    = nullptr;

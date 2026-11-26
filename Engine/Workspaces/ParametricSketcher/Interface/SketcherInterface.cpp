@@ -427,14 +427,15 @@ bool OpenDocument(SketcherWorkspaceStatus& State, const std::string& Path, bool 
 
 void SaveDocument(SketcherWorkspaceStatus& State, const std::string& Path)
 {
-    const double SaveStart = SteadySeconds();
+    const auto SaveStart = std::chrono::steady_clock::now();
     const bool Ok = WriteDocument(State.Document, Path);
+    const double SaveMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - SaveStart).count();
     RecordSketcherOperationTiming(
         State.Profile,
         State.FrameNumber,
         "File",
         "Save document",
-        (SteadySeconds() - SaveStart) * 1.0e3,
+        SaveMs,
         Ok ? Path : ("FAILED: " + Path));
     if (Ok)
     {
@@ -22242,16 +22243,17 @@ void AdvanceAutosave(SketcherWorkspaceStatus& State, double DeltaSeconds)
 
     // Encode lightweight parametric authoring TOML only (~0.1-0.4 ms, zero 65k-voxel SDF/BVH4 compile!)
     // and dispatch atomic disk write off the UI thread so post-operation autosave NEVER freezes SolidArc.
-    const double EncodeStart = SteadySeconds();
+    const auto EncodeStart = std::chrono::steady_clock::now();
     std::string EncodedToml  = EncodeSketcherDocument(State.Document);
     const size_t PayloadBytes = EncodedToml.size();
     SharedRecoveryAutosaveWriter().Enqueue(State.Options.RecoveryPath, std::move(EncodedToml));
+    const double EncodeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - EncodeStart).count();
     RecordSketcherOperationTiming(
         State.Profile,
         State.FrameNumber,
         "Autosave",
         "Async recovery TOML",
-        (SteadySeconds() - EncodeStart) * 1.0e3,
+        EncodeMs,
         Compose("%.1f KB queued", double(PayloadBytes) / 1024.0));
     State.Journal.push_back("Autosaved " + State.Options.RecoveryPath);
 }

@@ -113,7 +113,7 @@ void SketcherWorkspaceHost::AttachImGuiPresenter(GeometricRaster::ImGuiOverlayRa
     LastViewportRenderSignature = 0ull;
 }
 
-ImTextureRef SketcherWorkspaceHost::QueryViewportTextureRef() const noexcept
+ImTextureRef SketcherWorkspaceHost::QueryViewportTextureRef() noexcept
 {
     if (DirectGpuTextureId != 0ull)
     {

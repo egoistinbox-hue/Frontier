@@ -1,16 +1,16 @@
 /*============================================================================================================================================
                                                             EPICSTUBTRANSPORT.CPP
 ============================================================================================================================================*/
-// 🧩 Open-source zero-proprietary-SDK Epic Online Services stub enforcing scope/hex-key validation and graceful transport failover
-
-//------------------------------------------------------------------------------------------------------------------------
-//                                                        INCLUDES
-//------------------------------------------------------------------------------------------------------------------------
+// Open-source EOS stub. It never authenticates or claims cloud readiness; the explicit loopback bridge exists only for tests.
 
 #include "Engine/NetworkingSpace/Transports/EpicOnlineTransport.h"
 
 namespace Frontier::NetworkingSpace
 {
+
+struct EpicOnlineTransport::SdkState {};
+
+EpicOnlineTransport::EpicOnlineTransport() = default;
 
 EpicOnlineTransport::~EpicOnlineTransport() noexcept
 {
@@ -26,80 +26,78 @@ bool EpicOnlineTransport::QuerySdkCompiled() noexcept
 bool EpicOnlineTransport::ConfigureCredentials(const EpicSessionCredentials& Candidate)
 {
     ScrubSensitiveCredentials();
-    if (Candidate.ProductIdentifier.empty() ||
-        Candidate.SandboxIdentifier.empty() ||
-        Candidate.DeploymentIdentifier.empty() ||
-        !VerifyMandatoryIdentityScopes(Candidate.RequestedScopeMask) ||
+    if (Candidate.ProductIdentifier.empty() || Candidate.SandboxIdentifier.empty() ||
+        Candidate.DeploymentIdentifier.empty() || !VerifyMandatoryIdentityScopes(Candidate.RequestedScopeMask) ||
         (!Candidate.EncryptionHexKey.empty() && !VerifyHexStorageKeyFormat(Candidate.EncryptionHexKey)))
     {
-        CredentialsValid   = false;
-        RedactedDiagnostic = "eos=stub_rejected_invalid_scopes_or_storage_key";
+        RedactedDiagnostic = "eos=stub_rejected_invalid_configuration";
         return false;
     }
-
-    Credentials        = Candidate;
-    CredentialsValid   = true;
-    RedactedDiagnostic = RedactCredentialText(
-        "eos=stub_validated; product=" + Credentials.ProductIdentifier +
-        "; storage_key=" + Credentials.EncryptionHexKey);
+    Credentials = Candidate;
+    CredentialsValid = true;
+    IdentityPhase = EpicIdentityPhase::PlatformReady;
+    RedactedDiagnostic = "eos=sdk_not_compiled; cloud_login_unavailable";
     return true;
 }
+
+bool EpicOnlineTransport::InitializeSdk() noexcept { return false; }
+bool EpicOnlineTransport::BeginEpicAccountPortalLogin() noexcept { return false; }
+bool EpicOnlineTransport::ResolveProductUserConsent([[maybe_unused]] bool CreateNewProductUser) noexcept { return false; }
+void EpicOnlineTransport::SignOut() noexcept { ChannelOpen = false; IdentityPhase = EpicIdentityPhase::Unconfigured; }
+std::string EpicOnlineTransport::CopyEpicIdentityJwt() const { return {}; }
+bool EpicOnlineTransport::RegisterPeer([[maybe_unused]] uint32_t EndpointIdentifier, [[maybe_unused]] std::string_view ProductId) { return false; }
+void EpicOnlineTransport::UnregisterPeer([[maybe_unused]] uint32_t EndpointIdentifier) noexcept {}
+bool EpicOnlineTransport::CreateMatchSession([[maybe_unused]] std::string_view SessionName, [[maybe_unused]] std::string_view BucketIdentifier, [[maybe_unused]] uint32_t MaxPlayers) noexcept { return false; }
+bool EpicOnlineTransport::StartMatchSession() noexcept { return false; }
+bool EpicOnlineTransport::SearchMatchSessions([[maybe_unused]] std::string_view BucketIdentifier, [[maybe_unused]] uint32_t MaxResults) noexcept { return false; }
+bool EpicOnlineTransport::JoinMatchSession([[maybe_unused]] uint32_t SearchResultIndex, [[maybe_unused]] std::string_view LocalSessionName) noexcept { return false; }
+bool EpicOnlineTransport::LeaveMatchSession() noexcept { return false; }
 
 void EpicOnlineTransport::AttachSimulatedBridgeSwitch(LoopbackPacketSwitch* BridgeSwitch, uint32_t LocalEndpointIdentifier) noexcept
 {
     SimulatedBridge = BridgeSwitch;
-    LocalEndpoint   = (LocalEndpointIdentifier != 0u) ? LocalEndpointIdentifier : 1u;
+    LocalEndpoint = LocalEndpointIdentifier != 0u ? LocalEndpointIdentifier : 1u;
 }
 
 void EpicOnlineTransport::ScrubSensitiveCredentials() noexcept
 {
-    if (!Credentials.EncryptionHexKey.empty())
+    for (std::string* Secret : {&Credentials.ClientSecret, &Credentials.EncryptionHexKey})
     {
-        ZeroSensitiveBytes(std::span<char>(Credentials.EncryptionHexKey.data(), Credentials.EncryptionHexKey.size()));
-        Credentials.EncryptionHexKey.clear();
+        if (!Secret->empty())
+        {
+            ZeroSensitiveBytes(std::span<char>(Secret->data(), Secret->size()));
+            Secret->clear();
+        }
     }
     CredentialsValid = false;
+    if (IdentityPhase != EpicIdentityPhase::Failed)
+        IdentityPhase = EpicIdentityPhase::Unconfigured;
 }
 
 bool EpicOnlineTransport::OpenChannel() noexcept
 {
-    // Open only when an explicit simulated bridge switch is attached for deterministic failover validation
-    if (!CredentialsValid || SimulatedBridge == nullptr)
-    {
+    if (SimulatedBridge == nullptr || !CredentialsValid)
         return false;
-    }
     ChannelOpen = true;
     return true;
 }
 
-void EpicOnlineTransport::CloseChannel() noexcept
-{
-    ChannelOpen = false;
-}
+void EpicOnlineTransport::CloseChannel() noexcept { ChannelOpen = false; }
+void EpicOnlineTransport::AdvanceChannel([[maybe_unused]] double Δt) noexcept {}
 
-void EpicOnlineTransport::AdvanceChannel([[maybe_unused]] double Δt) noexcept
+bool EpicOnlineTransport::TransmitDatagram(uint32_t Target, DeliveryChannel Channel, std::span<const uint8_t> Bytes)
 {
-}
-
-bool EpicOnlineTransport::TransmitDatagram(
-    uint32_t                 TargetEndpointIdentifier,
-    DeliveryChannel          Channel,
-    std::span<const uint8_t> WireBytes)
-{
-    if (!ChannelOpen || SimulatedBridge == nullptr)
-    {
-        return false;
-    }
-    return SimulatedBridge->EnqueueFlightDatagram(LocalEndpoint, TargetEndpointIdentifier, Channel, WireBytes);
+    return ChannelOpen && SimulatedBridge != nullptr && SimulatedBridge->EnqueueFlightDatagram(LocalEndpoint, Target, Channel, Bytes);
 }
 
 bool EpicOnlineTransport::ReceiveDatagram(PacketDatagram& OutDatagram)
 {
-    if (!ChannelOpen || SimulatedBridge == nullptr)
-    {
-        return false;
-    }
-    return SimulatedBridge->PopArrivedDatagram(LocalEndpoint, OutDatagram);
+    return ChannelOpen && SimulatedBridge != nullptr && SimulatedBridge->PopArrivedDatagram(LocalEndpoint, OutDatagram);
+}
+
+bool EpicOnlineTransport::QueryChannelReady() const noexcept
+{
+    return CredentialsValid && (SimulatedBridge != nullptr);
 }
 
 } // namespace Frontier::NetworkingSpace

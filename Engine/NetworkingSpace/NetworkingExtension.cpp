@@ -56,11 +56,21 @@ void NetworkingExtension::Tick(double Δt) noexcept
         AccumulateReplicationElapsed(Contract, Δt);
     }
 
+    // EOS owns asynchronous Auth/Connect and Sessions callbacks even when Photon or UDP is the active datagram route.
+    EpicChannel.AdvanceChannel(Δt);
+    if (EpicOnlineTransport::QuerySdkCompiled() && EpicChannel.QueryIdentityPhase() == EpicIdentityPhase::Authenticated &&
+        EpicChannel.QueryChannelReady() &&
+        ActiveConfiguration.PreferredTransport == TransportChannelCategory::None &&
+        ActiveCategory != TransportChannelCategory::EpicOnline && ActiveCategory != TransportChannelCategory::PhotonRealtime)
+    {
+        FailedTransportBitmask &= static_cast<uint8_t>(~DeriveTransportBit(TransportChannelCategory::EpicOnline));
+        (void)ActivatePreferredOrFallbackTransport();
+    }
     switch (ActiveCategory)
     {
     case TransportChannelCategory::Loopback:        LoopbackChannel.AdvanceChannel(Δt); break;
     case TransportChannelCategory::SovereignSocket: SocketChannel.AdvanceChannel(Δt);   break;
-    case TransportChannelCategory::EpicOnline:      EpicChannel.AdvanceChannel(Δt);     break;
+    case TransportChannelCategory::EpicOnline:      break;
     case TransportChannelCategory::PhotonRealtime:  PhotonChannel.AdvanceChannel(Δt);   break;
     case TransportChannelCategory::None:            break;
     }
@@ -170,6 +180,21 @@ void NetworkingExtension::ConfigureNetworkSpace(
     SocketChannel.ConfigureBindPort(0u, LocalEndpointId);
 }
 
+bool NetworkingExtension::ConfigureEpicIdentity(const EpicSessionCredentials& Credentials)
+{
+    return EpicChannel.ConfigureCredentials(Credentials);
+}
+
+bool NetworkingExtension::BeginEpicAccountPortalLogin() noexcept
+{
+    return EpicChannel.BeginEpicAccountPortalLogin();
+}
+
+bool NetworkingExtension::ResolveEpicProductUserConsent(bool CreateNewProductUser) noexcept
+{
+    return EpicChannel.ResolveProductUserConsent(CreateNewProductUser);
+}
+
 void NetworkingExtension::AttachSharedLoopbackSwitch(
     LoopbackPacketSwitch* SharedSwitch,
     uint32_t              LocalEndpointIdentifier) noexcept
@@ -185,7 +210,7 @@ uint8_t NetworkingExtension::ComputeTransportAvailabilityMask() const noexcept
     uint8_t Mask = static_cast<uint8_t>(TransportLinkAvailabilityMask::EnableLoopback) |
                    static_cast<uint8_t>(TransportLinkAvailabilityMask::EnableSovereignSocket);
 
-    if (EpicOnlineTransport::QuerySdkCompiled() || EpicChannel.QueryChannelReady() || EpicChannel.QueryChannelOperational())
+    if (EpicChannel.QueryChannelReady() || EpicChannel.QueryChannelOperational())
     {
         Mask |= static_cast<uint8_t>(TransportLinkAvailabilityMask::EnableEpicOnline);
     }

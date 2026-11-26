@@ -11,10 +11,25 @@ python3 -m http.server 8770 --bind 0.0.0.0 --directory 'Experimental/Project bro
 
 ## Implemented interactions
 
+- **Default Project only** (Project Zero specification §14). The six sample files were removed. **+ New Project** adds a blank scene for the
+  session.
+- **Open with Frontier or SolidArc.** Every card has Frontier / SolidArc buttons; the reader header has a Frontier | SolidArc switch beside
+  **Open in …**; the Details inspector has an *Open with* card (hero + A/B tiles). The library inspector sets one default per format
+  (Projects → Frontier, CAD and Geometry → SolidArc), kept under browser-local `frontier.browser.openWith`. Launch is still a hand-off preview.
+- **Project Zero editor look** (`ProjectZeroLook.css`, loaded last, same three-column layout): DM Sans, Outliner-style rows and
+  Projects/Starred tallies, Inspector cards, numbered page pills, pill controls.
+- **Studio render**: sky-to-horizon backdrop, sand floor with haze, a warm key light with 2048² soft shadows (5×5 compared taps), sky / sand
+  reflections and hemisphere fill. Surface channels and CAD contours keep their plain black ground. 📝 *Open from disk* and the CAD / Geometry
+  filters are not in the specification and are marked for your keep-or-remove decision.
 - Responsive file catalogue with format filters, search, sorting and browser-local stars.
 - Three fixed shared columns for both catalogue and reader: 204 px left, flexible centre, 302 px right on desktop.
 - Each column owns an aligned 64 px header; the global Frontier/design-preview branding header is removed.
 - Left/right headers collapse their panels independently to 44 px rails and reopen them without losing view selection.
+- **Animated, draggable side panels.** Collapse / reopen eases the column (`cubic-bezier(.22,.8,.24,1)`, 0.32 s) while the pane content
+  keeps its open layout, slides 14 px and fades. Each pane's inner edge is a drag handle (orange `--pz-select` line on hover): left 160–380 px,
+  right 240–520 px, the centre keeps ≥ 320 px. Dragging narrower than 112 px snaps the pane shut and reopening restores the dragged width;
+  double-click resets the default, arrow keys nudge 16 px. Widths persist under browser-local `frontier.browser.paneWidths`.
+- The rail's "Your files. Your folders." note is removed (only *Browse files* remains).
 - Collapse choices carry across catalogue/reader transitions; narrow screens use compact collapsed panels.
 - The working version selector has a pill-shaped trigger.
 - Overview Markdown uses a complete 210:297 A4 sheet, laid out at 794 × 1123 px and fitted to available width/height.
@@ -28,6 +43,10 @@ python3 -m http.server 8770 --bind 0.0.0.0 --directory 'Experimental/Project bro
 - Capture thumbnail stores the current orbit/zoom/channel frame in the matching file/view/revision cache.
 - OLED default, Light and Dark palettes based on `Engine/Interface/ThemeStructure.cpp`.
 - Theme selection applies to the catalogue and reader; retained under browser-local `frontier.appearance.theme`.
+- **Project settings** is an editable page in the selected project reader, listed with that project’s pages. It is not a separate Project Details screen.
+- Standard settings save and reload through a `.projectspace` container manifest. The browser configuration is stored as an opaque `BrowserConfigurationJson` value alongside native project identity/startup/tick-rate fields; the native project codec preserves it when reading and writing the project container, but runtime interpretation is not connected in this prototype. Local test secrets remain a separate TOML file only after explicit confirmation.
+- Local test secret inputs remain in tab memory unless explicitly saved. EOS player tokens are not persisted; Photon client auth is intended to reuse EOS identity.
+- `.projectspace` files do not include local test secrets; local secret TOML must never be committed, shared, or packaged.
 - Real file and directory inputs, local image previews and a safe, bounded Markdown text subset.
 - Preview selection, zoom/fit, arrow-key navigation, Escape to library and `/` to search.
 
@@ -43,7 +62,9 @@ python3 -m http.server 8770 --bind 0.0.0.0 --directory 'Experimental/Project bro
 - UV inspection uses generated cylindrical coordinates from actual vertices; it is not an authored UV archive.
 - No-WebGL cases show an explicit unavailable message; no fake image replaces the renderer.
 - Native project/CAD/geometry codecs are not decoded here. Imported native files show an explicit placeholder.
-- Native editor launch is a hand-off preview dialog, not a simulated successful launch.
+- Native editor launch (Frontier or SolidArc) is a hand-off preview dialog, not a simulated successful launch.
+- The project settings page edits configuration only; it does not authenticate with EOS/Photon or prove a native engine connection. The browser can read its generated `.projectspace` manifest; native settings behavior is not wired to this HTML prototype.
+- Local test TOML stores any opted-in secrets as plaintext. Never commit, share, or package it; distributed client builds must not contain EOS client or Photon server secrets.
 - Browsers hide absolute file paths. Native startup integration must provide OS file/folder dialogs.
 - `.project` replaces `.scene` in the proposed browser vocabulary only; no existing files/codecs are renamed.
 - `.geometry` is a prototype suffix pending final format decisions. Existing `.projectspace` is accepted separately.
@@ -78,15 +99,15 @@ and `AlignedLibrary.png`. The rendering/version regression suite also passes aft
 
 HTML asset URLs include the first 12 characters of each stylesheet/script SHA-256. Update those query revisions when
 changing the corresponding asset, so embedded previews cannot combine new markup with an older cached script.
-`CatalogueLoadingValidation.cjs` checks those revisions, visible file cards at 890 × 800, all six open/back routes,
-filtering and reload. Evidence: `Results/CatalogueLoadingChecks.json` and `Images/CatalogueEmbedded.png`.
+`CatalogueLoadingValidation.cjs` checks those revisions, the single Default Project card at 890 × 800, Open in Frontier,
++ New Project (blank, Frontier only), filtering and reload. Evidence: `Results/CatalogueLoadingChecks.json` and `Images/CatalogueEmbedded.png`.
 A loading message remains visible if script startup fails instead of leaving an unexplained empty catalogue.
 
 
 ## Renderer validation moved out
 
 The Project Browser application reference no longer contains a renderer-validation catalogue entry, material editor,
-Vulkan controls or Vulkan scripts/styles. Its six original file samples and WebGL reference rendering remain.
+Vulkan controls or Vulkan scripts/styles. Its WebGL reference rendering remains; the catalogue holds the Default Project only.
 
 Native renderer validation now lives at `Exhibits/Renderer/index.html`, linked from the native/ImGui evidence pages
 `Exhibits/SpaceFormats/index.html` and `Exhibits/ProjectBrowser/index.html`. Run

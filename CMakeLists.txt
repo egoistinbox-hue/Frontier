@@ -20,8 +20,87 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(FRONTIER_PROFILE "Editor" CACHE STRING "Active Frontier build profile (Editor, Development, Shipping)")
 set_property(CACHE FRONTIER_PROFILE PROPERTY STRINGS Editor Development Shipping)
 
-option(FRONTIER_ENABLE_EOS_SDK    "Compile proprietary Epic Online Services transport adapter instead of open-source stub" OFF)
+option(FRONTIER_ENABLE_EOS_SDK    "Compile the EOS Auth/Connect/P2P/Sessions adapter" OFF)
 option(FRONTIER_ENABLE_PHOTON_SDK "Compile proprietary Photon Realtime C++ transport adapter instead of open-source stub" OFF)
+set(FRONTIER_EOS_SDK_ROOT "" CACHE PATH "Authorized local EOS SDK root (SDK files are never vendored into Git)")
+set(FRONTIER_PHOTON_SDK_ROOT "" CACHE PATH "Authorized local Photon Realtime Core package root (SDK files are never vendored into Git)")
+
+if(FRONTIER_ENABLE_PHOTON_SDK)
+    if(NOT FRONTIER_PHOTON_SDK_ROOT)
+        message(FATAL_ERROR "FRONTIER_ENABLE_PHOTON_SDK=ON requires -DFRONTIER_PHOTON_SDK_ROOT=<directory containing RealtimeCore/>")
+    endif()
+    if(MSVC AND NOT CMAKE_MSVC_RUNTIME_LIBRARY)
+        # Photon Realtime Core ships /MD variants but no /MDd package. Keep the
+        # SDK and engine on the compatible DLL runtime unless the caller chose one.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING "MSVC runtime for the Photon Realtime Core package")
+    endif()
+    find_package(RealtimeCore CONFIG REQUIRED
+        PATHS "${FRONTIER_PHOTON_SDK_ROOT}"
+        CMAKE_FIND_ROOT_PATH_BOTH)
+    if(NOT TARGET RealtimeCore::Matchmaking)
+        message(FATAL_ERROR "Photon Realtime Core package did not define RealtimeCore::Matchmaking")
+    endif()
+    message(STATUS "Photon Realtime Core enabled from local package: ${FRONTIER_PHOTON_SDK_ROOT}")
+endif()
+
+if(FRONTIER_ENABLE_EOS_SDK)
+    if(NOT FRONTIER_EOS_SDK_ROOT)
+        message(FATAL_ERROR "FRONTIER_ENABLE_EOS_SDK=ON requires -DFRONTIER_EOS_SDK_ROOT=<authorized EOS SDK directory>")
+    endif()
+    find_path(FRONTIER_EOS_INCLUDE_DIR eos_sdk.h
+        HINTS "${FRONTIER_EOS_SDK_ROOT}/Include" "${FRONTIER_EOS_SDK_ROOT}/include"
+        REQUIRED NO_DEFAULT_PATH)
+    if(WIN32)
+        if(CMAKE_GENERATOR_PLATFORM MATCHES "ARM64|arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+            set(FRONTIER_EOS_IMPORT_NAME EOSSDK-Win64-Shippingarm64.lib)
+            set(FRONTIER_EOS_RUNTIME_NAME EOSSDK-Win64-Shippingarm64.dll)
+        else()
+            set(FRONTIER_EOS_IMPORT_NAME EOSSDK-Win64-Shipping.lib)
+            set(FRONTIER_EOS_RUNTIME_NAME EOSSDK-Win64-Shipping.dll)
+        endif()
+        find_file(FRONTIER_EOS_IMPORT_LIBRARY "${FRONTIER_EOS_IMPORT_NAME}"
+            HINTS "${FRONTIER_EOS_SDK_ROOT}/Lib" "${FRONTIER_EOS_SDK_ROOT}/Lib/Win64" "${FRONTIER_EOS_SDK_ROOT}/lib"
+            REQUIRED NO_DEFAULT_PATH)
+        find_file(FRONTIER_EOS_RUNTIME "${FRONTIER_EOS_RUNTIME_NAME}"
+            HINTS "${FRONTIER_EOS_SDK_ROOT}/Bin" "${FRONTIER_EOS_SDK_ROOT}/Bin/Win64" "${FRONTIER_EOS_SDK_ROOT}/bin"
+            REQUIRED NO_DEFAULT_PATH)
+        add_library(FrontierEOSSDK SHARED IMPORTED GLOBAL)
+        set_target_properties(FrontierEOSSDK PROPERTIES
+            IMPORTED_IMPLIB "${FRONTIER_EOS_IMPORT_LIBRARY}"
+            IMPORTED_LOCATION "${FRONTIER_EOS_RUNTIME}")
+    elseif(APPLE)
+        find_file(FRONTIER_EOS_RUNTIME libEOSSDK-Mac-Shipping.dylib
+            HINTS "${FRONTIER_EOS_SDK_ROOT}/Bin" "${FRONTIER_EOS_SDK_ROOT}/Bin/Mac" "${FRONTIER_EOS_SDK_ROOT}/lib"
+            REQUIRED NO_DEFAULT_PATH)
+        add_library(FrontierEOSSDK SHARED IMPORTED GLOBAL)
+        set_target_properties(FrontierEOSSDK PROPERTIES IMPORTED_LOCATION "${FRONTIER_EOS_RUNTIME}")
+    elseif(ANDROID)
+        message(FATAL_ERROR "The currently staged EOS flattened runtime set has no Android binary; provide a platform-matched EOS SDK package.")
+    else()
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+            set(FRONTIER_EOS_RUNTIME_NAME libEOSSDK-LinuxArm64-Shipping.so)
+        else()
+            set(FRONTIER_EOS_RUNTIME_NAME libEOSSDK-Linux-Shipping.so)
+        endif()
+        find_file(FRONTIER_EOS_RUNTIME "${FRONTIER_EOS_RUNTIME_NAME}"
+            HINTS "${FRONTIER_EOS_SDK_ROOT}/Bin" "${FRONTIER_EOS_SDK_ROOT}/Bin/Linux" "${FRONTIER_EOS_SDK_ROOT}/lib"
+            REQUIRED NO_DEFAULT_PATH)
+        add_library(FrontierEOSSDK SHARED IMPORTED GLOBAL)
+        set_target_properties(FrontierEOSSDK PROPERTIES IMPORTED_LOCATION "${FRONTIER_EOS_RUNTIME}")
+    endif()
+    get_filename_component(FRONTIER_EOS_RUNTIME_DIR "${FRONTIER_EOS_RUNTIME}" DIRECTORY)
+    list(APPEND CMAKE_BUILD_RPATH "${FRONTIER_EOS_RUNTIME_DIR}")
+    message(STATUS "EOS SDK enabled from local package: ${FRONTIER_EOS_SDK_ROOT}")
+endif()
+
+function(frontier_stage_eos_runtime TargetName)
+    if(FRONTIER_ENABLE_EOS_SDK AND WIN32)
+        add_custom_command(TARGET ${TargetName} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE:FrontierEOSSDK>" "$<TARGET_FILE_DIR:${TargetName}>"
+            COMMENT "Staging EOSSDK-Win64-Shipping.dll beside ${TargetName}")
+    endif()
+endfunction()
 
 if(FRONTIER_PROFILE STREQUAL "Editor")
     set(FRONTIER_PROFILE_EDITOR_DEF      1)
@@ -1402,6 +1481,13 @@ target_compile_definitions(FrontierEngine PUBLIC
 )
 target_link_libraries(FrontierEngine PUBLIC FrontierSerialization FrontierCompileSettings thorvg_static Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(FrontierEngine PRIVATE Jolt FrontierZstdDecompress)
+if(FRONTIER_ENABLE_EOS_SDK)
+    target_include_directories(FrontierEngine PRIVATE "${FRONTIER_EOS_INCLUDE_DIR}")
+    target_link_libraries(FrontierEngine PUBLIC FrontierEOSSDK)
+endif()
+if(FRONTIER_ENABLE_PHOTON_SDK)
+    target_link_libraries(FrontierEngine PUBLIC RealtimeCore::Matchmaking)
+endif()
 if(WIN32)
     target_link_libraries(FrontierEngine PUBLIC ws2_32)
 endif()
@@ -1430,6 +1516,7 @@ set_target_properties(FrontierEngineRuntimeDll PROPERTIES
 )
 target_compile_definitions(FrontierEngineRuntimeDll PRIVATE FRONTIER_BUILDING_ENGINE_DLL=1)
 target_link_libraries(FrontierEngineRuntimeDll PRIVATE FrontierEngine)
+frontier_stage_eos_runtime(FrontierEngineRuntimeDll)
 if(UNIX AND NOT APPLE)
     target_link_options(FrontierEngineRuntimeDll PRIVATE "-Wl,--exclude-libs,ALL")
 endif()
@@ -1450,6 +1537,7 @@ if(NOT ANDROID AND FRONTIER_PROFILE STREQUAL "Editor")
         "FRONTIER_REPO_ROOT_DIR=\"${CMAKE_SOURCE_DIR}\""
     )
     target_link_libraries(FrontierWorkspaceUiDll PRIVATE FrontierEngine FrontierImGui)
+    frontier_stage_eos_runtime(FrontierWorkspaceUiDll)
     if(UNIX AND NOT APPLE)
         target_link_options(FrontierWorkspaceUiDll PRIVATE "-Wl,--exclude-libs,ALL")
     endif()
@@ -1479,6 +1567,7 @@ if(NOT ANDROID AND FRONTIER_PROFILE STREQUAL "Editor")
         add_executable(${APP_NAME} ${LAUNCH_SOURCE})
         target_compile_definitions(${APP_NAME} PRIVATE "FRONTIER_REPO_ROOT_DIR=\"${CMAKE_SOURCE_DIR}\"")
         target_link_libraries(${APP_NAME} PRIVATE FrontierEngine FrontierImGui)
+        frontier_stage_eos_runtime(${APP_NAME})
         if(WIN32)
             target_link_options(${APP_NAME} PRIVATE "/STACK:8388608")
         endif()
@@ -1490,6 +1579,7 @@ if(NOT ANDROID AND FRONTIER_PROFILE STREQUAL "Editor")
     add_executable(FrontierDefaultContentGenerator EXCLUDE_FROM_ALL Engine/Tools/DefaultContentGeneratorMain.cpp)
     target_compile_definitions(FrontierDefaultContentGenerator PRIVATE "FRONTIER_REPO_ROOT_DIR=\"${CMAKE_SOURCE_DIR}\"")
     target_link_libraries(FrontierDefaultContentGenerator PRIVATE FrontierEngine)
+    frontier_stage_eos_runtime(FrontierDefaultContentGenerator)
     add_custom_target(FrontierGenerateDefaultContent
         COMMAND FrontierDefaultContentGenerator "--repo-root=${CMAKE_SOURCE_DIR}"
         DEPENDS FrontierDefaultContentGenerator
@@ -1521,6 +1611,7 @@ if(BUILD_TESTING)
         else()
             target_link_libraries(${EXHIBIT_NAME} PRIVATE FrontierShippingExhibitUi FrontierEngine FrontierImGui)
         endif()
+        frontier_stage_eos_runtime(${EXHIBIT_NAME})
         add_test(NAME ${EXHIBIT_NAME} COMMAND ${EXHIBIT_NAME})
     endfunction()
 

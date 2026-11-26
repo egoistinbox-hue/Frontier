@@ -31,3 +31,7 @@ Thumbs.db
 .env.local
 _Build/
 Experimental/FrontierEditor/dist/
+
+# Local Project Details / EOS / Photon secrets must never enter source control
+**/ProjectSettings.local.toml
+**/*.secrets.toml

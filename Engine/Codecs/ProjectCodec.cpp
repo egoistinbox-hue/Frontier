@@ -27,6 +27,10 @@ SpaceContainerPayload ProjectEncoder::BuildPayload(
 
     toml::table Settings;
     Settings.insert_or_assign("ProjectTitle", Model.ProjectTitle);
+    if (!Model.BrowserConfigurationJson.empty())
+    {
+        Settings.insert_or_assign("BrowserConfigurationJson", Model.BrowserConfigurationJson);
+    }
     Settings.insert_or_assign("StartupSpacePath", Model.StartupSpacePath);
     Settings.insert_or_assign("TargetTickRateHz", Model.TargetTickRateHz);
     Payload.DomainManifest.insert_or_assign(".ProjectSettings", std::move(Settings));
@@ -78,6 +82,7 @@ bool ProjectDecoder::ExtractModel(
     if (const toml::table* Settings = Payload.DomainManifest[".ProjectSettings"].as_table())
     {
         OutModel.ProjectTitle     = (*Settings)["ProjectTitle"].value_or(Payload.DocumentTitle);
+        OutModel.BrowserConfigurationJson = (*Settings)["BrowserConfigurationJson"].value_or(std::string{});
         OutModel.StartupSpacePath = (*Settings)["StartupSpacePath"].value_or(std::string{});
         OutModel.TargetTickRateHz = (*Settings)["TargetTickRateHz"].value_or(120.0);
     }

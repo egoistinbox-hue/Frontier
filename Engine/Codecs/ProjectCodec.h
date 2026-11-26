@@ -33,6 +33,7 @@ struct ProjectDependencyLockEntry
 struct ProjectSpaceDocumentModel
 {
     std::string                             ProjectTitle      { "FrontierProject" };   // [-]  - Human-readable project name
+    std::string                             BrowserConfigurationJson {};                  // [-]  - Opaque editable Project Browser settings, preserved by native codec round-trips
     std::string                             StartupSpacePath  { "Main.UVSpace" };      // [-]  - Default workspace document on launch
     double                                  TargetTickRateHz  = 120.0;                 // [Hz] - Deterministic runtime tick frequency
     std::vector<ProjectDependencyLockEntry> DependencyLocks   {};                      // [-]  - Locked external/workspace dependencies

@@ -65,6 +65,9 @@ public:
     // Configuration & transport routing
     void               ConfigureNetworkSpace(const Codecs::NetworkSpaceConfiguration& Configuration, uint32_t LocalEndpointIdentifier = 1u);
     void               AttachSharedLoopbackSwitch(LoopbackPacketSwitch* SharedSwitch, uint32_t LocalEndpointIdentifier) noexcept;
+    [[nodiscard]] bool ConfigureEpicIdentity(const EpicSessionCredentials& Credentials);
+    [[nodiscard]] bool BeginEpicAccountPortalLogin() noexcept;
+    [[nodiscard]] bool ResolveEpicProductUserConsent(bool CreateNewProductUser) noexcept;
 
     [[nodiscard]] TransportChannelCategory ActivatePreferredOrFallbackTransport() noexcept;
     [[nodiscard]] TransportChannelCategory TriggerTransportFailover() noexcept;

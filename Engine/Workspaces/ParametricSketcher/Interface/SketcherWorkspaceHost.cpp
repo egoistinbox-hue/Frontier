@@ -448,9 +448,13 @@ void SketcherWorkspaceHost::RenderViewportTarget()
         {
             Signature = Mix64(Signature, static_cast<uint64_t>(Surf.VisibleCondition ? 1u : 0u));
             Signature = Mix64(Signature, static_cast<uint64_t>(Surf.WireframeCondition ? 1u : 0u));
-            Signature = MixBytes(Signature, Surf.SurfaceColour.data(), sizeof(Surf.SurfaceColour));
             Signature = MixBytes(Signature, &Surf.Opacity, sizeof(Surf.Opacity));
             Signature = Mix64(Signature, static_cast<uint64_t>(Surf.MatcapLayer));
+            for (const Sketcher::SketcherReferencePart& Part : Surf.Parts)
+            {
+                Signature = Mix64(Signature, static_cast<uint64_t>(Part.VisibleCondition ? 1u : 0u));
+                Signature = MixBytes(Signature, Part.SurfaceColour.data(), sizeof(Part.SurfaceColour));
+            }
         }
         Signature = Mix64(Signature, static_cast<uint64_t>(Panes.size()));
         for (const Sketcher::SketcherRasterPane& Pane : Panes)
@@ -459,8 +463,8 @@ void SketcherWorkspaceHost::RenderViewportTarget()
             Signature = Mix64(Signature, static_cast<uint64_t>(Pane.OffsetY));
             Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Width));
             Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Height));
-            Signature = MixBytes(Signature, Pane.Frame.ClipFromWorld, sizeof(Pane.Frame.ClipFromWorld));
-            Signature = MixBytes(Signature, Pane.Frame.Eye, sizeof(Pane.Frame.Eye));
+            Signature = MixBytes(Signature, Pane.Frame.ClipFromWorld.data(), sizeof(Pane.Frame.ClipFromWorld));
+            Signature = MixBytes(Signature, Pane.Frame.Eye.data(), sizeof(Pane.Frame.Eye));
             Signature = MixBytes(Signature, &Pane.Style.EdgeStroke, sizeof(Pane.Style.EdgeStroke));
             Signature = MixBytes(Signature, &Pane.Style.EdgeDepthMargin, sizeof(Pane.Style.EdgeDepthMargin));
             Signature = Mix64(Signature, static_cast<uint64_t>(Pane.Style.GridEnabled ? 1u : 0u));

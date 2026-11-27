@@ -498,6 +498,37 @@ export const LANDFORM_CATALOG = [
             { key: 'strikeBow',      label: 'Rift Trace Curvature',   min: -0.5, max: 0.5,  step: 0.02, dec: 2, unit: 'b' }
         ]
     },
+    {
+        id: 'cliff_pathway',
+        family: 'valleys',
+        name: 'Cliffside Switchback Pathway (3D)',
+        badge: '3D TRAIL',
+        glyph: 'Spline',
+        desc: 'Real-scale mountain/cliff switchback ledge with retaining embankment & 3D rock gallery overhang',
+        defaultCombine: 'smooth_union',
+        defaultRadius: 16,
+        defaultLength: 420,
+        defaultHeight: 58,
+        defaultAspect: 1.0,
+        hasLength: true,
+        hasVolumetric3D: true,
+        defaultParams: {
+            influenceScale: 1.35,
+            switchbacks: 2,
+            bendAmplitude: 0.42,
+            cliffGallery: 0.74,
+            retainingSteepness: 0.78,
+            gradeRise: 0.65
+        },
+        controls: [
+            { key: 'influenceScale',     label: 'Influence Scale (Shoulder)', min: 0.30, max: 3.50, step: 0.05, dec: 2, unit: '×' },
+            { key: 'switchbacks',        label: 'Switchback Hairpins',        min: 0,    max: 4,    step: 1,    dec: 0, unit: 'N' },
+            { key: 'bendAmplitude',      label: 'Switchback Sweep',           min: 0.0,  max: 0.95, step: 0.02, dec: 2, unit: 'w' },
+            { key: 'cliffGallery',       label: '3D Cliff Overhang Gallery',  min: 0.0,  max: 1.0,  step: 0.02, dec: 2, unit: '3D' },
+            { key: 'retainingSteepness', label: 'Outer Retaining Steepness',  min: 0.25, max: 0.98, step: 0.02, dec: 2, unit: 'w' },
+            { key: 'gradeRise',          label: 'Longitudinal Climb Grade',   min: -1.0, max: 1.0,  step: 0.02, dec: 2, unit: 'g' }
+        ]
+    },
 
     // =========================================================================
     // FAMILY 4: LINEAR RIDGES, FAULT SCARPS & FOLD BELTS
@@ -713,6 +744,37 @@ export const LANDFORM_CATALOG = [
             { key: 'lobing',         label: 'Karst Rim Lobing',       min: 0.0,  max: 0.45, step: 0.02, dec: 2, unit: 'w' }
         ]
     },
+    {
+        id: 'cave_cavern',
+        family: 'aeolian_karst',
+        name: 'Natural 3D Cave & Cavern',
+        badge: '3D CAVE',
+        glyph: 'Arch',
+        desc: 'True-3D subterranean cave portal, winding limestone passage, vaulted chamber & walkable floor',
+        defaultCombine: 'sub',
+        defaultRadius: 24,
+        defaultLength: 160,
+        defaultHeight: 24,
+        defaultAspect: 1.0,
+        hasLength: true,
+        hasVolumetric3D: true,
+        defaultParams: {
+            portalWidth: 0.78,
+            chamberSwell: 0.62,
+            caveRoughness: 0.48,
+            floorFlatness: 0.78,
+            passageCurve: 0.32,
+            mouthApron: 0.45
+        },
+        controls: [
+            { key: 'portalWidth',   label: 'Cave Mouth Width Ratio',  min: 0.35, max: 1.35, step: 0.02, dec: 2, unit: 'r' },
+            { key: 'chamberSwell',  label: 'Interior Vault Swell',    min: 0.0,  max: 1.40, step: 0.02, dec: 2, unit: 'w' },
+            { key: 'caveRoughness', label: '3D Wall & Roof Crags',    min: 0.0,  max: 1.0,  step: 0.02, dec: 2, unit: '3D' },
+            { key: 'floorFlatness', label: 'Walkable Floor Flatness', min: 0.15, max: 1.0,  step: 0.02, dec: 2, unit: 'w' },
+            { key: 'passageCurve',  label: 'Passage Winding S-Bend',  min: -0.85,max: 0.85, step: 0.02, dec: 2, unit: 'b' },
+            { key: 'mouthApron',    label: 'Exterior Mouth Approach', min: 0.0,  max: 1.0,  step: 0.02, dec: 2, unit: 'w' }
+        ]
+    },
 
     // =========================================================================
     // FAMILY 6: COASTAL & ISLAND FORMS
@@ -855,8 +917,8 @@ export function ResolveLandformInstances(Layer)
     const Mode = Layer.placementMode || 'single';
     const Cx = Number(Layer.centerX) || 0.0;
     const Cz = Number(Layer.centerZ) || 0.0;
-    const BaseR = Math.max(24.0, Number(Layer.radius) || Spec.defaultRadius);
-    const BaseL = Spec.hasLength ? Math.max(40.0, Number(Layer.length) || Spec.defaultLength) : BaseR;
+    const BaseR = Math.max(4.0, Number(Layer.radius) || Spec.defaultRadius);
+    const BaseL = Spec.hasLength ? Math.max(24.0, Number(Layer.length) || Spec.defaultLength) : BaseR;
     const BaseH = Math.max(4.0, Number(Layer.height) || Spec.defaultHeight);
     const BaseAzRad = ((Number(Layer.azimuth) || 0.0) * Math.PI) / 180.0;
     const Aspect = Clamp(Number(Layer.aspectRatio) || 1.0, 0.35, 3.0);
@@ -871,8 +933,24 @@ export function ResolveLandformInstances(Layer)
     const PushInst = (X, Z, R, L, H, AzRad, InstSeed) =>
     {
         const CosA = Math.cos(AzRad), SinA = Math.sin(AzRad);
-        const HalfU = Spec.hasLength ? L * 0.55 + R * 0.25 : R * Math.max(1.0, Aspect) * 1.18;
-        const HalfV = R * Math.max(1.0, Aspect) * (Spec.id === 'slot_canyon' || Spec.id === 'v_gorge' ? (1.35 + (Number(Layer.params?.meanderAmp) || 0.35)) : 1.18);
+        const HalfU = Spec.hasLength ? L * 0.56 + R * 0.45 : R * Math.max(1.0, Aspect) * 1.18;
+        let HalfV = R * Math.max(1.0, Aspect) * 1.18;
+        if (Spec.id === 'slot_canyon' || Spec.id === 'v_gorge')
+        {
+            HalfV = R * Math.max(1.0, Aspect) * (1.35 + (Number(Layer.params?.meanderAmp) || 0.35));
+        }
+        else if (Spec.id === 'cliff_pathway')
+        {
+            const InfS = Clamp(Number(Layer.params?.influenceScale) ?? 1.35, 0.25, 4.0);
+            const BendA = Clamp(Number(Layer.params?.bendAmplitude) ?? 0.42, 0.0, 1.0);
+            HalfV = R * (1.25 + 1.45 * InfS) + L * 0.20 * BendA + 18.0;
+        }
+        else if (Spec.id === 'cave_cavern')
+        {
+            const Swell = Clamp(Number(Layer.params?.chamberSwell) ?? 0.62, 0.0, 1.5);
+            const Curve = Math.abs(Number(Layer.params?.passageCurve) ?? 0.32);
+            HalfV = R * (1.45 + Swell + Curve * 1.15) + 18.0;
+        }
         const Reach = Math.hypot(HalfU, HalfV) * 1.06;
         Instances.push({
             cx: X, cz: Z,
@@ -979,6 +1057,20 @@ export function ResolveLandformInstances(Layer)
 /*==========================================================================================================================================
                                      SINGLE-INSTANCE PURE-SDF LANDFORM PROFILE EVALUATOR
 ==========================================================================================================================================*/
+/**
+ * Deterministic 3D limestone/bedrock wall displacement noise for Pure-SDF 3D Caves & Cliff Galleries.
+ * Smooth trigonometric 3D wave interference (fast, allocation-free, C∞ differentiable, exact everywhere).
+ */
+export function CaveNoise3D(X, Y, Z, Seed)
+{
+    const S1 = (Seed % 997) * 0.017;
+    const S2 = ((Seed * 7) % 991) * 0.013;
+    const N1 = Math.sin(X * 0.19 + S1) * Math.cos(Y * 0.23 + S2) * Math.sin(Z * 0.17 - S1 * 0.7);
+    const N2 = Math.sin(X * 0.43 - Z * 0.37 + S2) * Math.cos(Y * 0.41 + X * 0.21);
+    const N3 = Math.cos(X * 0.89 + Y * 0.77 - Z * 0.83 + S1 * 1.9);
+    return N1 * 0.54 + N2 * 0.30 + N3 * 0.16;
+}
+
 // Reusable return object to guarantee ZERO heap allocation inside the inner 2D grid loop!
 const _EvalOut = { value: 0.0, active: false, waterMask: 0.0 };
 
@@ -1744,6 +1836,95 @@ function EvaluateSingleLandformInstance(SpecId, Inst, Params, RockDetail, Wx, Wz
             break;
         }
 
+        // -----------------------------------------------------------------------------------------------------------------
+        // 21. CLIFFSIDE SWITCHBACK PATHWAY (3D) — Real-scale mountain trail shelf + uphill cliff wall + 3D gallery overhang
+        // -----------------------------------------------------------------------------------------------------------------
+        case 'cliff_pathway':
+        {
+            const HalfL = Math.max(24.0, L * 0.5);
+            const Ul = Wu / HalfL;
+            if (Math.abs(Ul) >= 1.04) return _EvalOut;
+
+            const InfScale = Clamp(Number(Params.influenceScale) ?? 1.35, 0.25, 4.0);
+            const Gallery = Clamp(Number(Params.cliffGallery) ?? 0.58, 0.0, 1.0);
+            const SwBacks = Clamp(Number(Params.switchbacks) ?? 1.5, 0.0, 4.0);
+            const BendAmp = Clamp(Number(Params.bendAmplitude) ?? 0.42, 0.0, 1.0);
+            const RetSteep = Clamp(Number(Params.retainingSteepness) ?? 0.86, 0.35, 0.98);
+            const GradeRise = Clamp(Number(Params.gradeRise) ?? 0.65, 0.0, 1.0);
+
+            const CenterV = BendAmp * HalfL * 0.32 * Math.sin(Ul * Math.PI * Math.max(0.5, SwBacks) + (Seed % 173) * 0.01);
+            const DV = Wv - CenterV;
+            const HalfPath = Math.max(2.0, R * 0.5);
+            const SkirtW = Math.max(4.0, R * (0.85 + 1.35 * InfScale));
+            const EndEnv = Smoothstep(1.04, 0.84, Math.abs(Ul));
+            if (EndEnv <= 1e-4) return _EvalOut;
+
+            // Ascending walkable trail deck elevation along the switchback
+            const TrailProf = 0.24 + 0.44 * GradeRise * (0.5 + 0.5 * Ul);
+            let P = 0.0;
+            if (Math.abs(DV) <= HalfPath)
+            {
+                // Crisp flat walkable path deck
+                P = TrailProf;
+            }
+            else if (DV < -HalfPath)
+            {
+                // Downhill side: steep retaining embankment & rock talus buttress controlled by retainingSteepness + influenceScale
+                const OutT = Clamp((-DV - HalfPath) / SkirtW, 0.0, 1.0);
+                if (OutT >= 1.0) return _EvalOut;
+                const DropExp = Mix(1.15, 3.6, RetSteep);
+                P = TrailProf * Math.pow(1.0 - Smoothstep(0.0, 1.0, OutT), DropExp);
+            }
+            else
+            {
+                // Uphill side: towering cliff wall rising cleanly above the trail so 3D rock gallery cuts an overhanging ceiling
+                const UpDist = DV - HalfPath;
+                const CliffW = Math.max(4.0, R * (0.28 + 0.22 * (1.0 - RetSteep)));
+                const CliffCrownW = Math.max(10.0, R * (1.15 + 1.15 * InfScale));
+                const UpT = UpDist / (CliffW + CliffCrownW);
+                if (UpT >= 1.0) return _EvalOut;
+                const CliffTop = Math.min(1.0, TrailProf + 0.34 + 0.30 * Gallery);
+                const RiseFrac = Smoothstep(0.0, CliffW, UpDist);
+                const BackFade = 1.0 - Smoothstep(CliffW + CliffCrownW * 0.32, CliffW + CliffCrownW, UpDist);
+                P = Mix(TrailProf, CliffTop, RiseFrac) * BackFade;
+            }
+            Prof = P * EndEnv;
+            break;
+        }
+
+        // -----------------------------------------------------------------------------------------------------------------
+        // 22. SUBTERRANEAN KARST CAVE & CAVERN (3D) — Exterior entrance mouth cut (interior void is True-3D volumetric SDF!)
+        // -----------------------------------------------------------------------------------------------------------------
+        case 'cave_cavern':
+        {
+            const HalfL = Math.max(24.0, L * 0.5);
+            const Ul = Wu / HalfL;
+            if (Ul < -1.08 || Ul > 0.35) return _EvalOut;
+
+            const PortalW = Clamp(Number(Params.portalWidth) ?? 0.56, 0.25, 1.0);
+            const Curve = Clamp(Number(Params.passageCurve) ?? 0.32, -1.0, 1.0);
+            const Apron = Clamp(Number(Params.mouthApron) ?? 0.45, 0.05, 1.0);
+            const CenterV = Curve * R * Math.sin(Ul * Math.PI * 1.15);
+            const AbsV = Math.abs(Wv - CenterV);
+
+            // Recessed exterior approach grotto at the front portal (-1.05 .. -0.25) while keeping overhead rock intact deeper in!
+            const MouthLen = Mix(0.28, 0.66, Apron);
+            const MouthStart = -1.04;
+            const MouthEnd = MouthStart + MouthLen;
+            if (Ul > MouthEnd + 0.18) return _EvalOut;
+
+            const LongEnv = Smoothstep(MouthStart - 0.04, MouthStart + MouthLen * 0.36, Ul)
+                          * Smoothstep(MouthEnd + 0.16, MouthEnd - MouthLen * 0.22, Ul);
+            const MouthHalfW = Math.max(3.0, R * (PortalW * 0.78 + 0.42 * Apron));
+            const CrossT = AbsV / MouthHalfW;
+            if (CrossT >= 1.25 || LongEnv <= 1e-4) return _EvalOut;
+
+            const CrossEnv = 1.0 - Smoothstep(0.42, 1.22, CrossT);
+            // Carves down smoothly to cave floor elevation right in front of the cave mouth
+            Prof = (0.78 + 0.22 * Apron) * LongEnv * CrossEnv;
+            break;
+        }
+
         default:
             return _EvalOut;
     }
@@ -1895,7 +2076,13 @@ export function CollectVolumetricLandformPrimitives(Region, Rt, SeaLevel = 0.0)
         if (!Layer || Layer.enabled === false || Layer.type !== 'landform') continue;
         const Spec = GetLandformSpec(Layer.archetype);
         if (!Spec.hasVolumetric3D) continue;
-        const Overhang = Clamp(Number(Layer.params?.overhangAmount) ?? 0.0, 0.0, 1.0);
+        const IsCaveCavern = Spec.id === 'cave_cavern';
+        const IsCliffPath = Spec.id === 'cliff_pathway';
+        const Overhang = IsCaveCavern
+            ? 1.0
+            : IsCliffPath
+                ? Clamp(Number(Layer.params?.cliffGallery) ?? 0.58, 0.0, 1.0)
+                : Clamp(Number(Layer.params?.overhangAmount) ?? 0.0, 0.0, 1.0);
         if (Overhang <= 0.04) continue;
 
         const Resolved = ResolveLandformInstances(Layer);
@@ -2047,6 +2234,135 @@ export function CollectVolumetricLandformPrimitives(Region, Rt, SeaLevel = 0.0)
                     }
                 });
             }
+            else if (Spec.id === 'cliff_pathway')
+            {
+                const InfScale = Clamp(Number(Params.influenceScale) ?? 1.35, 0.25, 4.0);
+                const Gallery = Clamp(Number(Params.cliffGallery) ?? 0.58, 0.0, 1.0);
+                const SwBacks = Clamp(Number(Params.switchbacks) ?? 1.5, 0.0, 4.0);
+                const BendAmp = Clamp(Number(Params.bendAmplitude) ?? 0.42, 0.0, 1.0);
+                const GradeRise = Clamp(Number(Params.gradeRise) ?? 0.65, 0.0, 1.0);
+                const HalfL = Math.max(24.0, Inst.length * 0.5);
+                const R = Inst.radius;
+                const HalfPath = Math.max(2.0, R * 0.5);
+                const BaseTopY = SeaLevel + (Number(Region.baseElevation) ?? 3.0);
+                const GalleryH = Math.max(5.5, Inst.height * (0.16 + 0.14 * Gallery));
+                const GalleryDepth = Math.max(4.5, HalfPath * (1.25 + 1.25 * Gallery) + InfScale * 1.4);
+
+                const MaxSweep = BendAmp * HalfL * 0.34 + HalfPath + GalleryDepth + 14.0;
+                const ReachX = Math.abs(HalfL * Inst.cosA) + Math.abs(MaxSweep * Inst.sinA) + 14.0;
+                const ReachZ = Math.abs(HalfL * Inst.sinA) + Math.abs(MaxSweep * Inst.cosA) + 14.0;
+                const MinY = BaseTopY + Inst.height * 0.16 - 8.0;
+                const MaxY = BaseTopY + Inst.height * (0.28 + 0.44 * GradeRise) + GalleryH + 14.0;
+
+                Out.push({
+                    kind: 'cliff_pathway',
+                    minX: Inst.cx - ReachX, maxX: Inst.cx + ReachX,
+                    minY: MinY,             maxY: MaxY,
+                    minZ: Inst.cz - ReachZ, maxZ: Inst.cz + ReachZ,
+                    evalSdf(Px, Py, Pz, CurD)
+                    {
+                        const Dx = Px - Inst.cx, Dz = Pz - Inst.cz;
+                        const U = Dx * Inst.cosA + Dz * Inst.sinA;
+                        const V = -Dx * Inst.sinA + Dz * Inst.cosA;
+                        const Ul = U / HalfL;
+                        if (Math.abs(Ul) >= 0.98) return CurD;
+
+                        const EndEnv = Smoothstep(0.98, 0.78, Math.abs(Ul));
+                        const CenterV = BendAmp * HalfL * 0.32 * Math.sin(Ul * Math.PI * Math.max(0.5, SwBacks) + (Inst.seed % 173) * 0.01);
+                        const DV = V - CenterV;
+                        const TrailY = BaseTopY + Inst.height * (0.24 + 0.44 * GradeRise * (0.5 + 0.5 * Ul));
+
+                        // Arched half-tunnel cliff gallery biting horizontally into uphill cliff (DV > 0) above the trail deck!
+                        const ArchCenterV = HalfPath * 0.35;
+                        const ArchRx = Math.max(3.0, GalleryDepth * EndEnv);
+                        const ArchRy = Math.max(3.5, GalleryH * EndEnv);
+                        const RelV = (DV - ArchCenterV) / ArchRx;
+                        const RelY = (Py - TrailY) / ArchRy;
+
+                        // Flat walkable trail floor at Py == TrailY, vaulted rock ceiling above (RelV^2 + RelY^2 <= 1)
+                        const VaultDist = (Math.hypot(Math.max(0.0, RelV), Math.max(0.0, RelY)) - 1.0) * Math.min(ArchRx, ArchRy);
+                        const FloorDist = TrailY - Py;
+                        const OpenSideDist = -(DV + HalfPath * 0.85); // Open to valley air on downhill side
+                        const Rough = CaveNoise3D(Px * 0.32, Py * 0.36, Pz * 0.32, Inst.seed + 53) * Math.min(2.2, ArchRy * 0.16) * Smoothstep(0.0, 0.35, RelY);
+                        const VoidD = Math.max(VaultDist + Rough, FloorDist, OpenSideDist);
+                        return SdfSmoothMax(CurD, -VoidD, Math.min(4.5, BlendM * 0.45));
+                    }
+                });
+            }
+            else if (Spec.id === 'cave_cavern')
+            {
+                const Swell = Clamp(Number(Params.chamberSwell) ?? 0.62, 0.0, 1.5);
+                const Rough = Clamp(Number(Params.caveRoughness) ?? 0.48, 0.0, 1.0);
+                const FlatFloor = Clamp(Number(Params.floorFlatness) ?? 0.72, 0.0, 1.0);
+                const PortalW = Clamp(Number(Params.portalWidth) ?? 0.56, 0.25, 1.0);
+                const Curve = Clamp(Number(Params.passageCurve) ?? 0.32, -1.0, 1.0);
+                const HalfL = Math.max(24.0, Inst.length * 0.5);
+                const R = Inst.radius;
+
+                const RoofGroundH = Math.max(
+                    SampleSurfH(Inst.cx, Inst.cz),
+                    SampleSurfH(Inst.cx + Inst.cosA * HalfL * 0.42, Inst.cz + Inst.sinA * HalfL * 0.42),
+                    RimH
+                );
+                const MouthGroundH = SampleSurfH(Inst.cx - Inst.cosA * HalfL * 0.86, Inst.cz - Inst.sinA * HalfL * 0.86);
+                const VaultH = Math.max(4.5, Math.min(Inst.height, Math.max(8.0, (RoofGroundH - Rt.slabBottom) * 0.58)));
+                const RoofRock = Math.max(6.0, VaultH * 0.32);
+                const CaveFloorY = Math.max(Rt.slabBottom + 4.5, Math.min(MouthGroundH + 1.5, RoofGroundH - VaultH - RoofRock));
+
+                const MaxHalfW = R * (1.0 + Swell + Math.abs(Curve)) + 16.0;
+                const ReachX = Math.abs(HalfL * Inst.cosA) + Math.abs(MaxHalfW * Inst.sinA) + 16.0;
+                const ReachZ = Math.abs(HalfL * Inst.sinA) + Math.abs(MaxHalfW * Inst.cosA) + 16.0;
+
+                Out.push({
+                    kind: 'cave_cavern',
+                    minX: Inst.cx - ReachX, maxX: Inst.cx + ReachX,
+                    minY: CaveFloorY - 8.0, maxY: CaveFloorY + VaultH * (1.25 + 0.35 * Swell) + 14.0,
+                    minZ: Inst.cz - ReachZ, maxZ: Inst.cz + ReachZ,
+                    evalSdf(Px, Py, Pz, CurD)
+                    {
+                        const Dx = Px - Inst.cx, Dz = Pz - Inst.cz;
+                        const U = Dx * Inst.cosA + Dz * Inst.sinA;
+                        const V = -Dx * Inst.sinA + Dz * Inst.cosA;
+                        const Ul = U / HalfL;
+                        if (Ul < -1.05 || Ul > 1.02) return CurD;
+
+                        const CenterV = Curve * R * Math.sin(Ul * Math.PI * 1.15);
+                        const DV = V - CenterV;
+
+                        // Swelling central karst chamber + tapered blind back grotto + flared entrance mouth
+                        const BackEnv = Smoothstep(1.02, 0.68, Ul);
+                        const PortalBlend = Smoothstep(-0.95, 0.10, Ul);
+                        const ChamberDome = Math.sin(Clamp((Ul + 0.85) / 1.85, 0.0, 1.0) * Math.PI);
+                        const LocalW = Math.max(2.5, R * Mix(PortalW, 1.0 + Swell * ChamberDome, PortalBlend) * BackEnv);
+                        const LocalH = Math.max(3.5, VaultH * (0.72 + 0.42 * ChamberDome * (0.4 + 0.6 * Swell)) * BackEnv);
+
+                        // Slight upward ramp right at the exterior portal so the mouth exits into open air cleanly
+                        const MouthLift = Smoothstep(-0.55, -1.02, Ul) * Math.max(0.0, MouthGroundH - CaveFloorY) * 0.55;
+                        const LocalFloorY = CaveFloorY + MouthLift;
+
+                        // Arch cross-section: flat walkable floor when floorFlatness -> 1, rounded karst tube when -> 0
+                        const ArchCenterY = LocalFloorY + LocalH * Mix(0.48, 0.14, FlatFloor);
+                        const EffRy = Math.max(2.5, LocalH * Mix(0.52, 0.86, FlatFloor));
+                        const Qx = DV / LocalW;
+                        const Qy = (Py - ArchCenterY) / EffRy;
+                        const TubeD = (Math.hypot(Qx, Qy) - 1.0) * Math.min(LocalW, EffRy);
+                        const FlatFloorD = LocalFloorY - Py;
+                        const BaseCrossD = FlatFloor > 0.05 ? SdfSmoothMax(TubeD, FlatFloorD, Math.max(0.6, (1.0 - FlatFloor) * 4.5)) : TubeD;
+
+                        // End caps along Ul (open front entrance past -1.02, rounded grotto back at +0.96)
+                        const BackCapD = (Ul - 0.96) * HalfL;
+                        const FrontCapD = (-1.04 - Ul) * HalfL;
+
+                        // Organic 3D limestone stalactite & scalloped wall displacement (gentle near flat walkable floor)
+                        const FloorQuiet = Mix(1.0, Smoothstep(0.0, LocalH * 0.35, Py - LocalFloorY), FlatFloor * 0.82);
+                        const WallDisp = CaveNoise3D(Px * (2.6 / Math.max(8.0, R)), Py * (2.8 / Math.max(8.0, VaultH)), Pz * (2.6 / Math.max(8.0, R)), Inst.seed)
+                                       * Rough * Math.min(LocalW, LocalH) * 0.34 * FloorQuiet;
+
+                        const CaveVoidD = Math.max(BaseCrossD + WallDisp, BackCapD, FrontCapD);
+                        return SdfSmoothMax(CurD, -CaveVoidD, Math.min(5.0, BlendM * 0.45));
+                    }
+                });
+            }
         }
     }
 
@@ -2054,7 +2370,7 @@ export function CollectVolumetricLandformPrimitives(Region, Rt, SeaLevel = 0.0)
 }
 
 /*==========================================================================================================================================
-                                     7 CURATED BASIC LANDFORM SHOWCASE WORLDS (1-CLICK TEMPLATES)
+                                     8 CURATED BASIC LANDFORM SHOWCASE WORLDS (1-CLICK TEMPLATES)
 ==========================================================================================================================================*/
 export const LANDFORM_SHOWCASE_WORLDS = [
     {
@@ -2098,11 +2414,17 @@ export const LANDFORM_SHOWCASE_WORLDS = [
         name: '3D Karst Cenote & Wave-Notch Cliffs',
         badge: '3D COAST',
         desc: 'True 3D overhanging limestone cenote sinkhole, wave-cut sea-cliff headland & coastal atoll'
+    },
+    {
+        id: 'caves-cliff-pathways',
+        name: 'Cliff Pathways, Mounds & 3D Caves',
+        badge: 'NEW 3D',
+        desc: 'Real-scale steep cliffside gallery pathway, organic spline-drawn earthen mound, natural footpath & 3D limestone cave network'
     }
 ];
 
 /**
- * Populates `World` with one of the 7 curated Universal Basic Landform Showcase Worlds.
+ * Populates `World` with one of the 8 curated Universal Basic Landform Showcase Worlds.
  * Returns `{ masks, regions, focusLandformLayerId }` so the studio can immediately activate its 3D Landform Gizmo!
  */
 export function SeedLandformShowcaseWorld(World, ShowcaseId = 'universal-archipelago', EvaluateRegionFn = null)
@@ -2378,6 +2700,132 @@ export function SeedLandformShowcaseWorld(World, ShowcaseId = 'universal-archipe
             });
             Stack = [Folds, Fault, Graben, Crater];
             FocusLayerId = Crater.id;
+        }
+        else if (ShowcaseId === 'caves-cliff-pathways')
+        {
+            RegName = 'Cliff Pathways, Mounds & 3D Caves';
+            ShoreBevel = 10.0;
+            BaseElev = 14.0;
+            const CliffMesa = CreateLandformLayer('mesa_plateau', {
+                name: 'Sandstone Cliff Escarpment',
+                centerX: -140, centerZ: -110, radius: 420, height: 128, azimuth: 18, aspectRatio: 1.15, rockDetail: 0.22,
+                combine: 'smooth_union', smoothK: 20, seed: 13101,
+                params: { footprintRoundness: 2.8, lobing: 0.22, cliffSteepness: 0.90, talusRatio: 0.28, terraceSteps: 6, terraceStrength: 0.58, dipDeg: 1.2 }
+            });
+            const MoundSpline = {
+                id: 'layer-showcase-mound-1',
+                type: 'spline',
+                name: 'Organic Earthen Mound (Spline)',
+                enabled: true,
+                opacity: 1.0,
+                combine: 'add',
+                smoothK: 16.0,
+                seed: 13111,
+                splineMode: 'mound',
+                width: 44.0,
+                amount: 26.0,
+                bankSmooth: 0.68,
+                meander: 0.10,
+                influenceScale: 1.85,
+                moundRoundness: 0.56,
+                endTaper: 0.74,
+                lumpiness: 0.34,
+                points: [
+                    [130, 290, 18.0],
+                    [235, 165, 34.0],
+                    [315, 25, 42.0],
+                    [275, -135, 28.0]
+                ],
+                falloff: { mode: 'none', distance: 200.0, edgeFloor: 0.0, points: [[0, 0], [0.35, 0.28], [0.72, 0.84], [1, 1]] },
+                heightMask: { enabled: false, minElev: 0.0, maxElev: 300.0, minSlope: 0.0, maxSlope: 90.0 }
+            };
+            const NaturalPath = {
+                id: 'layer-showcase-pathway-1',
+                type: 'spline',
+                name: 'Foothill Natural Footpath (5.5m)',
+                enabled: true,
+                opacity: 1.0,
+                combine: 'lerp',
+                smoothK: 10.0,
+                seed: 13121,
+                splineMode: 'pathway',
+                width: 5.5,
+                amount: 1.2,
+                bankSmooth: 0.58,
+                meander: 0.08,
+                influenceScale: 1.45,
+                points: [
+                    [360, 280, 15.0],
+                    [270, 235, 18.0],
+                    [205, 190, 21.0],
+                    [155, 145, 24.0]
+                ],
+                falloff: { mode: 'none', distance: 200.0, edgeFloor: 0.0, points: [[0, 0], [0.35, 0.28], [0.72, 0.84], [1, 1]] },
+                heightMask: { enabled: false, minElev: 0.0, maxElev: 300.0, minSlope: 0.0, maxSlope: 90.0 }
+            };
+            const CliffPath = {
+                id: 'layer-showcase-cliffpath-1',
+                type: 'spline',
+                name: 'Steep Cliffside Gallery Pathway (9m · 3D)',
+                enabled: true,
+                opacity: 1.0,
+                combine: 'lerp',
+                smoothK: 10.0,
+                seed: 13131,
+                splineMode: 'cliff_path',
+                width: 9.0,
+                amount: 9.5,
+                bankSmooth: 0.52,
+                meander: 0.04,
+                influenceScale: 1.50,
+                cliffGallery: 0.78,
+                retainingDepth: 0.85,
+                points: [
+                    [155, 145, 24.0],
+                    [40, 205, 52.0],
+                    [-120, 220, 82.0],
+                    [-275, 165, 112.0],
+                    [-320, 35, 140.0]
+                ],
+                falloff: { mode: 'none', distance: 200.0, edgeFloor: 0.0, points: [[0, 0], [0.35, 0.28], [0.72, 0.84], [1, 1]] },
+                heightMask: { enabled: false, minElev: 0.0, maxElev: 300.0, minSlope: 0.0, maxSlope: 90.0 }
+            };
+            const CaveSpline = {
+                id: 'layer-showcase-cave-1',
+                type: 'spline',
+                name: 'True-3D Limestone Cave Passage (15m)',
+                enabled: true,
+                opacity: 1.0,
+                combine: 'sub',
+                smoothK: 10.0,
+                seed: 13141,
+                splineMode: 'cave',
+                width: 15.0,
+                amount: 12.0,
+                bankSmooth: 0.35,
+                meander: 0.0,
+                influenceScale: 1.0,
+                caveRoughness: 0.54,
+                chamberSwell: 0.72,
+                floorFlatness: 0.78,
+                points: [
+                    [265, -80, 44.0],
+                    [150, -95, 46.0],
+                    [10, -115, 50.0],
+                    [-135, -135, 54.0],
+                    [-285, -210, 48.0]
+                ],
+                falloff: { mode: 'none', distance: 200.0, edgeFloor: 0.0, points: [[0, 0], [0.35, 0.28], [0.72, 0.84], [1, 1]] },
+                heightMask: { enabled: false, minElev: 0.0, maxElev: 300.0, minSlope: 0.0, maxSlope: 90.0 }
+            };
+            const KarstCavern = CreateLandformLayer('cave_cavern', {
+                name: 'Subterranean Karst Grotto (3D)',
+                centerX: -120, centerZ: -280, radius: 22, length: 155, height: 22, azimuth: 82, aspectRatio: 1.0, rockDetail: 0.18,
+                combine: 'sub', smoothK: 10, seed: 13201,
+                params: { chamberSwell: 0.68, caveRoughness: 0.50, floorFlatness: 0.76, portalWidth: 0.60, passageCurve: 0.28, mouthApron: 0.55 }
+            });
+            Stack = [CliffMesa, MoundSpline, NaturalPath, CliffPath, CaveSpline, KarstCavern];
+            FocusLayerId = CliffPath.id;
         }
         else // 'karst-sea-cliffs'
         {

@@ -9,6 +9,7 @@ import { WorldMask2D, ComputeRegionMaskSdf2D } from './Engine/WorldMask2D.js';
 import {
     EvaluateBoundaryFalloff,
     CreateTerrainLayer,
+    ComputeSplineCorridorMetrics,
     EvaluateTerrainRegion,
     ApplyTerrainSculptDab,
     ExtractRegionTriangleMesh,
@@ -2648,10 +2649,10 @@ Suite('36. Pure-SDF Crystals (crystal_prism), Upgraded Basalt Colonnades (colonn
 // =========================================================================================================================================
 // 37. Basic Landform Generators: All 6 Families, All 20 Archetypes, Geological Morphology & Zero-Dead-Controls Sweep
 // =========================================================================================================================================
-Suite('37. Basic Landforms: all 6 families & 20 archetypes evaluate finite relief, exact morphology & zero dead controls', () =>
+Suite('37. Basic Landforms: all 6 families & 22 archetypes evaluate finite relief, exact morphology & zero dead controls', () =>
 {
     assert.equal(LANDFORM_FAMILIES.length, 6, 'Must define all 6 geological landform families');
-    assert.equal(LANDFORM_CATALOG.length, 20, 'Must define all 20 basic landform archetypes');
+    assert.equal(LANDFORM_CATALOG.length, 22, 'Must define all 22 basic landform archetypes (including 3D cliff_pathway & cave_cavern)');
     assert.equal(LANDFORM_PLACEMENT_MODES.length, 4, 'Must define 4 placement modes (single, range, cluster, field)');
     assert.equal(LANDFORM_COMBINE_MODES.length, 7, 'Must define 7 composable SDF combine modes');
 
@@ -2963,9 +2964,9 @@ Suite('38. Basic Landforms: all 4 placement modes, 7 SDF combine modes, BaseSign
 });
 
 // =========================================================================================================================================
-// 39. True-3D Volumetric Landform Overhangs & Shafts (Slot Canyon, Karst Cenote, Sea-Cliff Wave Notch) via Dual-Surface-Nets
+// 39. True-3D Volumetric Landform Overhangs & Shafts (Slot Canyon, Karst Cenote, Sea-Cliff Wave Notch, Cliff Pathway, 3D Karst Cave)
 // =========================================================================================================================================
-Suite('39. True-3D Volumetric Landforms (Slot Canyon, Karst Cenote, Sea-Cliff Notch) extract genuine downward overhang normals', () =>
+Suite('39. True-3D Volumetric Landforms (all 5 archetypes: Slot Canyon, Cenote, Sea-Cliff, Cliff Pathway & Karst Cave) extract genuine downward overhang normals', () =>
 {
     const VolumetricCases = [
         {
@@ -2985,6 +2986,18 @@ Suite('39. True-3D Volumetric Landforms (Slot Canyon, Karst Cenote, Sea-Cliff No
             kind: 'sea_cliff_headland',
             baseElev: 18.0,
             opts: { centerX: 0, centerZ: 0, radius: 260, length: 560, height: 135, azimuth: 0, params: { cliffSteepness: 0.92, platformWidth: 0.30, platformHeight: 0.12, overhangAmount: 0.78, lobing: 0.20, terraceSteps: 4 } }
+        },
+        {
+            id: 'cliff_pathway',
+            kind: 'cliff_pathway',
+            baseElev: 22.0,
+            opts: { centerX: 0, centerZ: 0, radius: 20, length: 420, height: 68, azimuth: 12, params: { influenceScale: 1.4, cliffGallery: 0.78, switchbacks: 1.5, bendAmplitude: 0.36, retainingSteepness: 0.86, gradeRise: 0.65 } }
+        },
+        {
+            id: 'cave_cavern',
+            kind: 'cave_cavern',
+            baseElev: 120.0,
+            opts: { centerX: 0, centerZ: 0, radius: 26, length: 180, height: 26, azimuth: 10, params: { chamberSwell: 0.72, caveRoughness: 0.46, floorFlatness: 0.76, portalWidth: 0.58, passageCurve: 0.28, mouthApron: 0.50 } }
         }
     ];
 
@@ -3031,11 +3044,11 @@ Suite('39. True-3D Volumetric Landforms (Slot Canyon, Karst Cenote, Sea-Cliff No
 });
 
 // =========================================================================================================================================
-// 40. All 7 Curated Landform Showcase Worlds + Priority-Flood Crater Lakes + Erosion Physics Compatibility + UI Structural Verification
+// 40. All 8 Curated Landform Showcase Worlds + Priority-Flood Crater Lakes + Erosion Physics Compatibility + UI Structural Verification
 // =========================================================================================================================================
-Suite('40. All 7 Landform Showcase Worlds, Priority-Flood crater lake, erosion physics compatibility & studio UI wiring', () =>
+Suite('40. All 8 Landform Showcase Worlds, Priority-Flood crater lake, erosion physics compatibility & studio UI wiring', () =>
 {
-    assert.equal(LANDFORM_SHOWCASE_WORLDS.length, 7, 'Must ship 7 curated Landform Showcase Worlds');
+    assert.equal(LANDFORM_SHOWCASE_WORLDS.length, 8, 'Must ship 8 curated Landform Showcase Worlds (including Caves & Cliff Pathways)');
 
     for (const Sw of LANDFORM_SHOWCASE_WORLDS)
     {
@@ -3097,5 +3110,378 @@ Suite('40. All 7 Landform Showcase Worlds, Priority-Flood crater lake, erosion p
     assert.ok(Map2dJs.includes('ResolveLandformInstances'), '2D map canvas must render landform footprint overlays');
 });
 
-console.log(`\nAll ${Passed}/40 Open-World SDF Terrain, Basic Landform Generators & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
+// =========================================================================================================================================
+// 41. Real-World Metric Scale, Spline Influence Scale, Natural Pathways & Organic Spline-Drawn Mounds (Zero Dead Controls)
+// =========================================================================================================================================
+Suite('41. Real-World Metric Scale, Spline Influence Scale, Natural Pathways & Organic Spline-Drawn Mounds', () =>
+{
+    // A. ComputeSplineCorridorMetrics exact real-world metric scale & monotonic influenceScale envelope
+    const MSmall = ComputeSplineCorridorMetrics({ splineMode: 'pathway', width: 2.0, bankSmooth: 0.6, influenceScale: 0.25 });
+    const MMid   = ComputeSplineCorridorMetrics({ splineMode: 'pathway', width: 2.0, bankSmooth: 0.6, influenceScale: 1.00 });
+    const MWide  = ComputeSplineCorridorMetrics({ splineMode: 'pathway', width: 2.0, bankSmooth: 0.6, influenceScale: 3.50 });
+    assert.equal(MSmall.widthM, 2.0, 'Must support narrow real-world 2.0m human footpath scale');
+    assert.equal(MSmall.halfW, 1.0, 'Half-width must be exact metric 1.0m');
+    assert.ok(MSmall.outerRadiusM < MMid.outerRadiusM && MMid.outerRadiusM < MWide.outerRadiusM,
+        `Outer influence radius must grow strictly monotonically with influenceScale (${MSmall.outerRadiusM.toFixed(2)} < ${MMid.outerRadiusM.toFixed(2)} < ${MWide.outerRadiusM.toFixed(2)})`);
+
+    // Legacy backward compatibility: at influenceScale === 1.0, legacy outerRadiusM === HalfW * (1 + Bank)
+    const MLeg = ComputeSplineCorridorMetrics({ splineMode: 'grade', width: 100.0, bankSmooth: 0.60, influenceScale: 1.0 });
+    assert.ok(Math.abs(MLeg.outerRadiusM - 80.0) < 1e-6, `Legacy grade mode at influenceScale=1.0 must match exact 80.0m (got ${MLeg.outerRadiusM})`);
+
+    const MakeFlatRegion = (Layers = [], BaseElev = 40.0, Span = 600, Res = 96) =>
+    {
+        const W = new WorldMask2D();
+        const M = W.addMaskLayer({ name: 'Metric Basin', color: '#58b982' });
+        W.paintCapsuleMeters(M, [-10, 0], [10, 0], Span * 0.9, 'paint', 1.0, 0.0, 2041);
+        const Reg = W.addTerrainRegion({
+            name: 'Metric Scale Region',
+            maskLayerId: M.id,
+            bounds: { x: -Span * 0.5, z: -Span * 0.5, width: Span, depth: Span },
+            resolution: Res,
+            baseElevation: BaseElev,
+            slabThickness: 6.5,
+            shorelineBevel: 8.0,
+            stack: Layers
+        });
+        return { W, Reg };
+    };
+
+    const DiffHeights = (H1, H2) =>
+    {
+        let MaxD = 0.0, ChangedCells = 0;
+        for (let I = 0; I < H1.length; ++I)
+        {
+            const D = Math.abs(H1[I] - H2[I]);
+            if (D > MaxD) MaxD = D;
+            if (D > 0.05) ChangedCells++;
+        }
+        return { maxDiff: MaxD, changedCells: ChangedCells };
+    };
+
+    // B. Natural Pathway (`pathway`) at real-world scale: cut-and-fill tread, trailMask, monotonic influenceScale, zero dead controls
+    const MakePathway = (Overrides = {}) => CreateTerrainLayer('spline', {
+        name: 'Mountain Footpath',
+        splineMode: 'pathway',
+        width: 5.0,
+        amount: 2.0,
+        bankSmooth: 0.55,
+        influenceScale: 1.0,
+        meander: 0.12,
+        falloff: { mode: 'none', distance: 120, edgeFloor: 1.0 },
+        points: [[-200, -10, 32.0], [0, 0, 32.0], [200, 10, 32.0]],
+        ...Overrides
+    });
+
+    const { W: WP0, Reg: RP0 } = MakeFlatRegion([], 40.0, 500, 96);
+    const BaseFlatH = EvaluateTerrainRegion(WP0, RP0).heights;
+
+    const { W: WP1, Reg: RP1 } = MakeFlatRegion([MakePathway({ influenceScale: 0.35 })], 40.0, 500, 96);
+    const RtPathTight = EvaluateTerrainRegion(WP1, RP1);
+    const { W: WP2, Reg: RP2 } = MakeFlatRegion([MakePathway({ influenceScale: 3.20 })], 40.0, 500, 96);
+    const RtPathWide = EvaluateTerrainRegion(WP2, RP2);
+
+    const TightDiff = DiffHeights(BaseFlatH, RtPathTight.heights);
+    const WideDiff = DiffHeights(BaseFlatH, RtPathWide.heights);
+    assert.ok(TightDiff.maxDiff > 5.0 && TightDiff.changedCells > 20, `Real-scale pathway must carve walkable grade (maxDiff=${TightDiff.maxDiff.toFixed(2)}m)`);
+    assert.ok(WideDiff.changedCells > TightDiff.changedCells * 1.4,
+        `Increasing pathway influenceScale (0.35 -> 3.20) must broaden surrounding blend footprint (${TightDiff.changedCells} -> ${WideDiff.changedCells} cells)`);
+
+    let TrailCells = 0;
+    for (let I = 0; I < RtPathTight.trailMask.length; ++I) if (RtPathTight.trailMask[I] > 0.35) TrailCells++;
+    assert.ok(TrailCells >= 15, `Pathway must emit compacted-earth trailMask along walkable tread (cells=${TrailCells})`);
+
+    // Zero-dead-control sweep on `pathway`: width, amount, influenceScale, bankSmooth, meander
+    const { W: WPB, Reg: RPB } = MakeFlatRegion([MakePathway()], 40.0, 500, 96);
+    const PathBaseH = EvaluateTerrainRegion(WPB, RPB).heights;
+    for (const [Key, AltVal] of [
+        ['width', 18.0],
+        ['amount', 8.0],
+        ['influenceScale', 3.0],
+        ['bankSmooth', 0.95],
+        ['meander', 0.65]
+    ])
+    {
+        const { W, Reg } = MakeFlatRegion([MakePathway({ [Key]: AltVal })], 40.0, 500, 96);
+        const AltH = EvaluateTerrainRegion(W, Reg).heights;
+        const D = DiffHeights(PathBaseH, AltH);
+        assert.ok(D.maxDiff > 0.05, `Pathway spline control "${Key}" is DEAD (maxDiff=${D.maxDiff})`);
+    }
+
+    // C. Organic Spline-Drawn Mound (`mound`): builds real relief, scales footprint with influenceScale, zero dead controls
+    const MakeMound = (Overrides = {}) => CreateTerrainLayer('spline', {
+        name: 'Drawn Mound',
+        splineMode: 'mound',
+        width: 34.0,
+        amount: 26.0,
+        bankSmooth: 0.65,
+        influenceScale: 1.4,
+        meander: 0.10,
+        moundRoundness: 0.55,
+        endTaper: 0.70,
+        lumpiness: 0.30,
+        falloff: { mode: 'none', distance: 120, edgeFloor: 1.0 },
+        points: [[-180, -30, 40.0], [0, 10, 40.0], [180, -20, 40.0]],
+        ...Overrides
+    });
+
+    const { W: WM0, Reg: RM0 } = MakeFlatRegion([MakeMound({ influenceScale: 0.30 })], 40.0, 600, 96);
+    const RtMTight = EvaluateTerrainRegion(WM0, RM0);
+    const { W: WM1, Reg: RM1 } = MakeFlatRegion([MakeMound({ influenceScale: 1.40 })], 40.0, 600, 96);
+    const RtMMid = EvaluateTerrainRegion(WM1, RM1);
+    const { W: WM2, Reg: RM2 } = MakeFlatRegion([MakeMound({ influenceScale: 3.40 })], 40.0, 600, 96);
+    const RtMWide = EvaluateTerrainRegion(WM2, RM2);
+
+    const { W: WMB, Reg: RMB } = MakeFlatRegion([], 40.0, 600, 96);
+    const MoundFlatH = EvaluateTerrainRegion(WMB, RMB).heights;
+    const MTightD = DiffHeights(MoundFlatH, RtMTight.heights);
+    const MMidD = DiffHeights(MoundFlatH, RtMMid.heights);
+    const MWideD = DiffHeights(MoundFlatH, RtMWide.heights);
+
+    assert.ok(RtMMid.maxHeight >= 40.0 + 18.0, `Spline-drawn mound must build substantial earthen relief (maxH=${RtMMid.maxHeight.toFixed(1)}m on 40m plain)`);
+    assert.ok(MTightD.changedCells < MMidD.changedCells && MMidD.changedCells < MWideD.changedCells,
+        `Mound influenceScale (0.30 -> 1.40 -> 3.40) must monotonically expand mound skirt (${MTightD.changedCells} < ${MMidD.changedCells} < ${MWideD.changedCells})`);
+
+    // Zero-dead-control sweep on `mound`: width, amount, influenceScale, moundRoundness, endTaper, lumpiness, meander
+    for (const [Key, AltVal] of [
+        ['width', 76.0],
+        ['amount', 52.0],
+        ['influenceScale', 3.2],
+        ['moundRoundness', 0.98],
+        ['endTaper', 0.05],
+        ['lumpiness', 0.95],
+        ['meander', 0.60]
+    ])
+    {
+        const { W, Reg } = MakeFlatRegion([MakeMound({ [Key]: AltVal })], 40.0, 600, 96);
+        const AltH = EvaluateTerrainRegion(W, Reg).heights;
+        const D = DiffHeights(RtMMid.heights, AltH);
+        assert.ok(D.maxDiff > 0.25, `Mound spline control "${Key}" is DEAD (maxDiff=${D.maxDiff})`);
+    }
+
+    // D. ComputeRegionBaseSignature reacts immediately to every new spline parameter!
+    const BaseSig = ComputeRegionBaseSignature(WM1, RM1);
+    const LyrSig = RM1.stack[0];
+    for (const [Key, Val] of [
+        ['influenceScale', 2.85],
+        ['cliffGallery', 0.22],
+        ['retainingDepth', 0.33],
+        ['moundRoundness', 0.91],
+        ['endTaper', 0.12],
+        ['lumpiness', 0.88],
+        ['caveRoughness', 0.92],
+        ['chamberSwell', 1.35],
+        ['floorFlatness', 0.15]
+    ])
+    {
+        const Prev = LyrSig[Key];
+        LyrSig[Key] = Val;
+        const NextSig = ComputeRegionBaseSignature(WM1, RM1);
+        assert.notEqual(NextSig, BaseSig, `ComputeRegionBaseSignature must react to spline.${Key}`);
+        LyrSig[Key] = Prev;
+    }
+});
+
+// =========================================================================================================================================
+// 42. Steep Cliffside Pathways (Open-Air & True-3D Rock Gallery), True-3D Limestone Cave Splines, Showcase #8 & UI Wiring
+// =========================================================================================================================================
+Suite('42. Steep Cliffside Pathways (3D Rock Gallery), True-3D Limestone Cave Splines, Showcase #8 & UI Wiring', () =>
+{
+    const CountOverhangs = (Mesh, MinY) =>
+    {
+        let Cnt = 0;
+        for (let I = 0; I < Mesh.vertexCount; ++I)
+        {
+            const Py = Mesh.positions[I * 3 + 1];
+            const Ny = Mesh.normals[I * 3 + 1];
+            assert.ok(Number.isFinite(Py) && Number.isFinite(Ny), 'Mesh vertex/normal must be finite');
+            if (Ny < -0.15 && Py > MinY) Cnt++;
+        }
+        return Cnt;
+    };
+
+    // A. Steep Cliffside Pathway (`cliff_path`) climbing a towering 130m sandstone mesa escarpment
+    const BuildCliffScenario = (CliffSplineOverrides = {}) =>
+    {
+        const W = new WorldMask2D();
+        const M = W.addMaskLayer({ name: 'Cliff Mesa', color: '#e8c27a' });
+        W.paintCapsuleMeters(M, [-10, 0], [10, 0], 720, 'paint', 1.0, 0.0, 2042);
+        const Mesa = CreateLandformLayer('mesa_plateau', {
+            centerX: -60, centerZ: -60, radius: 320, height: 130, azimuth: 0, rockDetail: 0.12,
+            combine: 'smooth_union', smoothK: 14, seed: 3101,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { footprintRoundness: 3.0, lobing: 0.08, cliffSteepness: 0.92, talusRatio: 0.22, terraceSteps: 4, terraceStrength: 0.35, dipDeg: 0.0 }
+        });
+        const CliffPath = CreateTerrainLayer('spline', {
+            name: 'Steep Cliffside Pathway',
+            splineMode: 'cliff_path',
+            width: 9.0,
+            amount: 10.0,
+            bankSmooth: 0.45,
+            influenceScale: 1.4,
+            cliffGallery: 0.78,
+            retainingDepth: 0.85,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            // Climbs diagonally right along the southern sheer mesa escarpment (uphill rock 145m, downhill cliff drop 45m!)
+            points: [
+                [205, 165, 36.0],
+                [75, 235, 62.0],
+                [-95, 250, 86.0],
+                [-255, 185, 112.0]
+            ],
+            ...CliffSplineOverrides
+        });
+        const Reg = W.addTerrainRegion({
+            name: 'Cliff Pathway Mesa',
+            maskLayerId: M.id,
+            bounds: { x: -500, z: -500, width: 1000, depth: 1000 },
+            resolution: 76,
+            baseElevation: 16.0,
+            slabThickness: 6.5,
+            shorelineBevel: 10.0,
+            stack: [Mesa, CliffPath]
+        });
+        EvaluateTerrainRegion(W, Reg);
+        return { W, Reg };
+    };
+
+    // 1. Open-air mode (`cliffGallery: 0.0`) vs True-3D Gallery mode (`cliffGallery: 0.78`)
+    const OpenCliff = BuildCliffScenario({ cliffGallery: 0.0 });
+    const OpenMesh = ExtractRegionTriangleMesh(OpenCliff.W, OpenCliff.Reg);
+    const OpenOverhangs = CountOverhangs(OpenMesh, 14.0);
+
+    const GalCliff = BuildCliffScenario({ cliffGallery: 0.78 });
+    const GalMesh = ExtractRegionTriangleMesh(GalCliff.W, GalCliff.Reg);
+    const GalOverhangs = CountOverhangs(GalMesh, 14.0);
+    assert.equal(OpenOverhangs, 0, `Open-air cliff_path (cliffGallery=0) must produce 0 volumetric overhangs (got ${OpenOverhangs})`);
+    assert.ok(GalOverhangs >= 20, `True-3D cliff_path gallery (cliffGallery=0.78) must extract genuine overhanging cliff ceiling normals (Ny < -0.15 verts=${GalOverhangs})`);
+
+    // Retaining buttress steepness (`retainingDepth`) must measurably reshape the downhill cliff embankment
+    const SoftRetain = BuildCliffScenario({ cliffGallery: 0.0, retainingDepth: 0.15 });
+    let RetainDiff = 0.0;
+    for (let I = 0; I < OpenCliff.Reg.runtime.heights.length; ++I)
+    {
+        RetainDiff = Math.max(RetainDiff, Math.abs(OpenCliff.Reg.runtime.heights[I] - SoftRetain.Reg.runtime.heights[I]));
+    }
+    assert.ok(RetainDiff > 1.0, `cliff_path retainingDepth control must actively reshape downhill retaining embankment (maxDiff=${RetainDiff.toFixed(2)}m)`);
+
+    // B. True-3D Limestone Cave Spline (`cave`): intact mountain roof + genuine downward cave ceilings + zero dead controls!
+    const BuildCaveScenario = (CaveOverrides = {}) =>
+    {
+        const W = new WorldMask2D();
+        const M = W.addMaskLayer({ name: 'Karst Plateau', color: '#be95ff' });
+        W.paintCapsuleMeters(M, [-10, 0], [10, 0], 620, 'paint', 1.0, 0.0, 2043);
+        const Cave = CreateTerrainLayer('spline', {
+            name: 'Limestone Cave Passage',
+            splineMode: 'cave',
+            width: 16.0,
+            amount: 14.0,
+            bankSmooth: 0.35,
+            influenceScale: 1.0,
+            caveRoughness: 0.50,
+            chamberSwell: 0.65,
+            floorFlatness: 0.76,
+            seed: 7071,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            points: [
+                [-170, 0, 52.0],
+                [-50, 12, 54.0],
+                [60, -10, 56.0],
+                [170, 4, 52.0]
+            ],
+            ...CaveOverrides
+        });
+        const Reg = W.addTerrainRegion({
+            name: 'Cave Plateau',
+            maskLayerId: M.id,
+            bounds: { x: -380, z: -380, width: 760, depth: 760 },
+            resolution: 64,
+            baseElevation: 95.0,
+            slabThickness: 8.0,
+            shorelineBevel: 10.0,
+            stack: [Cave]
+        });
+        EvaluateTerrainRegion(W, Reg);
+        return { W, Reg };
+    };
+
+    const CaveBase = BuildCaveScenario();
+    // Verify mountain roof overhead stays 100% intact (heightfield untouched at 95m!)
+    const CenterCell = Math.floor(CaveBase.Reg.runtime.nz / 2) * CaveBase.Reg.runtime.nx + Math.floor(CaveBase.Reg.runtime.nx / 2);
+    assert.ok(Math.abs(CaveBase.Reg.runtime.heights[CenterCell] - 95.0) < 0.1,
+        `3D Cave spline must leave overhead plateau rock intact at 95.0m (got ${CaveBase.Reg.runtime.heights[CenterCell].toFixed(2)}m)`);
+
+    const CaveMeshBase = ExtractRegionTriangleMesh(CaveBase.W, CaveBase.Reg);
+    const CaveOverhangs = CountOverhangs(CaveMeshBase, 42.0);
+    assert.ok(CaveOverhangs >= 30, `True-3D Limestone Cave spline must extract vaulted subterranean cave ceiling geometry (Ny < -0.15 verts=${CaveOverhangs})`);
+
+    // Zero-dead-control sweep across EVERY cave spline parameter via extracted 3D mesh signature!
+    const MeshSignature = Msh =>
+    {
+        let SumX = 0, SumY = 0, SumZ = 0;
+        for (let I = 0; I < Msh.vertexCount; ++I)
+        {
+            SumX += Math.abs(Msh.positions[I * 3]);
+            SumY += Math.abs(Msh.positions[I * 3 + 1]);
+            SumZ += Math.abs(Msh.positions[I * 3 + 2]);
+        }
+        return `${Msh.vertexCount}:${Msh.triangleCount}:${SumX.toFixed(1)}:${SumY.toFixed(1)}:${SumZ.toFixed(1)}`;
+    };
+    const BaseCaveSig = MeshSignature(CaveMeshBase);
+    for (const [Key, AltVal] of [
+        ['width', 28.0],
+        ['amount', 22.0],
+        ['influenceScale', 2.4],
+        ['caveRoughness', 0.0],
+        ['chamberSwell', 1.45],
+        ['floorFlatness', 0.0]
+    ])
+    {
+        const AltCave = BuildCaveScenario({ [Key]: AltVal });
+        const AltMesh = ExtractRegionTriangleMesh(AltCave.W, AltCave.Reg);
+        assert.notEqual(MeshSignature(AltMesh), BaseCaveSig, `3D Cave spline control "${Key}" must visibly alter extracted 3D cave mesh`);
+    }
+
+    // C. Showcase #8 ('caves-cliff-pathways') end-to-end 3D extraction, OBJ/STL export & JSON round-trip!
+    const W8 = new WorldMask2D();
+    SeedLandformShowcaseWorld(W8, 'caves-cliff-pathways');
+    const Reg8 = W8.regions[0];
+    const Mesh8 = ExtractRegionTriangleMesh(W8, Reg8);
+    const Over8 = CountOverhangs(Mesh8, 12.0);
+    assert.ok(Mesh8.triangleCount > 5000 && Over8 >= 40,
+        `Showcase #8 must extract rich watertight mesh with 3D cliff gallery + cave overhangs (tris=${Mesh8.triangleCount}, overhangVerts=${Over8})`);
+
+    const Obj8 = ExportWorldTerrainsObj(W8, [Reg8]);
+    assert.ok(Obj8.triangleCount === Mesh8.triangleCount && Obj8.text.includes('f '), 'Showcase #8 must export complete Wavefront .OBJ');
+    const Stl8 = ExportWorldTerrainsBinaryStl(W8, [Reg8]);
+    assert.ok(Stl8.triangleCount === Mesh8.triangleCount && Stl8.bytes.byteLength === 84 + Stl8.triangleCount * 50,
+        'Showcase #8 must export exact watertight binary .STL');
+
+    // JSON round-trip preserves all new spline fields accurately!
+    const Json8 = JSON.parse(JSON.stringify(W8.toJSON()));
+    const W8RT = new WorldMask2D();
+    W8RT.loadFromJSON(Json8);
+    const CliffSplineRT = W8RT.regions[0].stack.find(L => L.splineMode === 'cliff_path');
+    const MoundSplineRT = W8RT.regions[0].stack.find(L => L.splineMode === 'mound');
+    const CaveSplineRT = W8RT.regions[0].stack.find(L => L.splineMode === 'cave');
+    assert.ok(CliffSplineRT && Math.abs(CliffSplineRT.influenceScale - 1.5) < 1e-6 && Math.abs(CliffSplineRT.cliffGallery - 0.78) < 1e-6,
+        'JSON round-trip must preserve cliff_path influenceScale & cliffGallery');
+    assert.ok(MoundSplineRT && Math.abs(MoundSplineRT.moundRoundness - 0.56) < 1e-6 && Math.abs(MoundSplineRT.endTaper - 0.74) < 1e-6,
+        'JSON round-trip must preserve mound roundness & endTaper');
+    assert.ok(CaveSplineRT && Math.abs(CaveSplineRT.caveRoughness - 0.54) < 1e-6 && Math.abs(CaveSplineRT.chamberSwell - 0.72) < 1e-6,
+        'JSON round-trip must preserve cave roughness & chamberSwell');
+
+    // D. Studio UI & Viewport wiring checks for Pathways, Steep Cliff Pathways, Mounds, Caves & Spline Influence Scale
+    const EditorJs = readFileSync(new URL('./TerrainWorldEditor.js', import.meta.url), 'utf8');
+    const View3dJs = readFileSync(new URL('./Engine/TerrainOceanViewport.js', import.meta.url), 'utf8');
+    const Map2dJs = readFileSync(new URL('./Engine/WorldMap2DCanvas.js', import.meta.url), 'utf8');
+    assert.ok(EditorJs.includes('Spline Influence Scale') && EditorJs.includes("Mode === 'cliff_path'")
+           && EditorJs.includes("Mode === 'mound'") && EditorJs.includes("Mode === 'cave'"),
+        'TerrainWorldEditor.js must wire Spline Influence Scale and contextual cliff_path/mound/cave controls');
+    assert.ok(View3dJs.includes('ComputeSplineCorridorMetrics') && View3dJs.includes('DrawOffsetRail'),
+        'TerrainOceanViewport.js must render live 3D core rails & dashed Influence Scale envelope');
+    assert.ok(Map2dJs.includes('ComputeSplineCorridorMetrics'),
+        'WorldMap2DCanvas.js must render 2D spline core width & Influence Scale halo');
+});
+
+console.log(`\nAll ${Passed}/42 Open-World SDF Terrain, Basic Landform Generators, Pathways/Caves/Mounds & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
 

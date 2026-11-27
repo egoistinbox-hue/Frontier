@@ -13,6 +13,7 @@ import {
     ApplyTerrainSculptDab,
     Clamp,
     SampleCatmullRomPolyline,
+    ComputeSplineCorridorMetrics,
     CreateTerrainLayer,
     GetLandformSpec,
     GetLandformFamily,
@@ -1906,16 +1907,84 @@ export class TerrainOceanViewport
 
         const { region: Reg, layer: ActiveSpline } = SplineCtx;
 
-        // Draw all enabled splines on the active region; highlight ActiveSpline with knots + XYZ Gizmo
+        const SplineColorForMode = Mode =>
+        {
+            switch (Mode)
+            {
+                case 'pathway':    return '#e5c687';
+                case 'cliff_path': return '#ffbe5c';
+                case 'mound':      return '#8ce28d';
+                case 'cave':       return '#be95ff';
+                case 'tunnel':     return '#93a8ff';
+                case 'canyon':     return '#ff8a80';
+                case 'river':
+                case 'lake':       return '#67d1ff';
+                default:           return '#eff4cf';
+            }
+        };
+
+        // Draw all enabled splines on the active region; highlight ActiveSpline with core rails, live Influence Scale envelope & XYZ Gizmo
         for (const Layer of Reg.stack)
         {
             if (Layer.type !== 'spline' || !Layer.enabled || !Layer.points || Layer.points.length === 0) continue;
             const IsActiveLyr = Layer.id === ActiveSpline.id;
+            const Accent = SplineColorForMode(Layer.splineMode);
 
-            // 1. Draw smooth 3D Catmull-Rom curve
+            // 1. Draw smooth 3D Catmull-Rom curve + Core Corridor Rails & Dashed Outer Influence Scale Envelope
             if (Layer.points.length >= 2)
             {
                 const Poly = SampleCatmullRomPolyline(Layer.points, 8);
+                const Metrics = ComputeSplineCorridorMetrics(Layer);
+
+                // Draw live Core Width rails (+-halfW) and Outer Influence Scale envelope (+-outerRadiusM) on the active spline!
+                if (IsActiveLyr && Poly.length >= 2)
+                {
+                    const DrawOffsetRail = (OffsetM, StrokeStyle, LineW, DashPattern) =>
+                    {
+                        for (const Side of [-1, 1])
+                        {
+                            Ctx.save();
+                            if (DashPattern) Ctx.setLineDash(DashPattern);
+                            Ctx.beginPath();
+                            let Started = false;
+                            for (let K = 0; K < Poly.length; ++K)
+                            {
+                                const Prev = Poly[Math.max(0, K - 1)];
+                                const Next = Poly[Math.min(Poly.length - 1, K + 1)];
+                                const Tx = Next[0] - Prev[0];
+                                const Tz = Next[1] - Prev[1];
+                                const Len = Math.hypot(Tx, Tz) || 1.0;
+                                const PerpX = (-Tz / Len) * Side;
+                                const PerpZ = (Tx / Len) * Side;
+                                const Ox = Poly[K][0] + PerpX * OffsetM;
+                                const Oz = Poly[K][1] + PerpZ * OffsetM;
+                                const BaseY = Number.isFinite(Poly[K][2]) ? Poly[K][2] : this.sampleTerrainSurfaceY(Reg, Ox, Oz);
+                                const GroundY = this.sampleTerrainSurfaceY(Reg, Ox, Oz);
+                                const Wy = (Layer.splineMode === 'cave' || Layer.splineMode === 'tunnel' || Layer.splineMode === 'arch3d')
+                                    ? BaseY + 1.4
+                                    : (OffsetM > Metrics.halfW + 0.5 ? GroundY + 1.4 : Math.max(GroundY, BaseY) + 1.6);
+                                const Scr = ProjectWorldToScreen(ViewProj, [Ox, Wy, Oz], Width, Height);
+                                if (!Scr) { Started = false; continue; }
+                                if (!Started) { Ctx.moveTo(Scr[0], Scr[1]); Started = true; }
+                                else Ctx.lineTo(Scr[0], Scr[1]);
+                            }
+                            Ctx.strokeStyle = StrokeStyle;
+                            Ctx.lineWidth = LineW;
+                            Ctx.stroke();
+                            Ctx.restore();
+                        }
+                    };
+
+                    // Dashed Outer Influence Envelope (+-outerRadiusM)
+                    if (Metrics.outerRadiusM > Metrics.halfW + 0.35)
+                    {
+                        DrawOffsetRail(Metrics.outerRadiusM, 'rgba(134, 214, 255, 0.52)', 1.35, [6, 5]);
+                    }
+                    // Crisp Core Path / Mound / Cave Width Rails (+-halfW)
+                    DrawOffsetRail(Metrics.halfW, `${Accent}aa`, 1.45, null);
+                }
+
+                // Centerline Catmull-Rom curve
                 Ctx.beginPath();
                 let Started = false;
                 for (const Pt of Poly)
@@ -1926,9 +1995,39 @@ export class TerrainOceanViewport
                     if (!Started) { Ctx.moveTo(Scr[0], Scr[1]); Started = true; }
                     else Ctx.lineTo(Scr[0], Scr[1]);
                 }
-                Ctx.strokeStyle = IsActiveLyr ? '#eff4cf' : 'rgba(126, 200, 255, 0.55)';
+                Ctx.strokeStyle = IsActiveLyr ? Accent : `${Accent}88`;
                 Ctx.lineWidth = IsActiveLyr ? 2.6 : 1.5;
                 Ctx.stroke();
+
+                // Compact live real-world metric telemetry pill at midpoint of active spline
+                if (IsActiveLyr)
+                {
+                    const MidPt = Poly[Math.floor(Poly.length * 0.5)];
+                    const MidY = Number.isFinite(MidPt[2]) ? MidPt[2] : this.sampleTerrainSurfaceY(Reg, MidPt[0], MidPt[1]);
+                    const ScrMid = ProjectWorldToScreen(ViewProj, [MidPt[0], MidY + 8.5, MidPt[1]], Width, Height);
+                    if (ScrMid && ScrMid[0] > 60 && ScrMid[0] < Width - 60 && ScrMid[1] > 28 && ScrMid[1] < Height - 28)
+                    {
+                        const ModeTag = (Layer.splineMode || 'grade').replace('_', ' ').toUpperCase();
+                        const BadgeTxt = `${ModeTag} · Core ${Metrics.widthM.toFixed(1)}m · Infl ${Metrics.influenceScale.toFixed(2)}× (${(Metrics.outerRadiusM * 2.0).toFixed(0)}m)`;
+                        Ctx.save();
+                        Ctx.font = '600 10px "DM Sans", sans-serif';
+                        const Tw = Ctx.measureText(BadgeTxt).width;
+                        const Bx = ScrMid[0] - Tw * 0.5 - 8;
+                        const By = ScrMid[1] - 24;
+                        Ctx.fillStyle = 'rgba(14, 17, 22, 0.86)';
+                        Ctx.strokeStyle = `${Accent}99`;
+                        Ctx.lineWidth = 1.0;
+                        Ctx.beginPath();
+                        Ctx.roundRect(Bx, By, Tw + 16, 18, 5);
+                        Ctx.fill();
+                        Ctx.stroke();
+                        Ctx.fillStyle = Accent;
+                        Ctx.textAlign = 'center';
+                        Ctx.textBaseline = 'middle';
+                        Ctx.fillText(BadgeTxt, ScrMid[0], By + 9.5);
+                        Ctx.restore();
+                    }
+                }
             }
 
             if (!IsActiveLyr) continue;

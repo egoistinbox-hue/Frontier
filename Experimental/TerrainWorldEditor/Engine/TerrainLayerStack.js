@@ -23,6 +23,7 @@ import {
     EvaluateLandformLayerAt,
     ApplyLandformCombine,
     CollectVolumetricLandformPrimitives,
+    CaveNoise3D,
     SeedLandformShowcaseWorld as _SeedLandformShowcaseWorldRaw
 } from './BasicLandformEngine.js';
 
@@ -38,7 +39,8 @@ export {
     ResolveLandformInstances,
     EvaluateLandformLayerAt,
     ApplyLandformCombine,
-    CollectVolumetricLandformPrimitives
+    CollectVolumetricLandformPrimitives,
+    CaveNoise3D
 };
 
 export function SeedLandformShowcaseWorld(World, ShowcaseId = 'universal-archipelago')
@@ -426,13 +428,36 @@ export function CreateTerrainLayer(Type = 'multifractal', Overrides = {})
     }
     if (Type === 'spline')
     {
+        const Mode = Overrides.splineMode ?? 'grade';
+        const DefaultW = Mode === 'pathway' ? 4.5
+            : Mode === 'cliff_path' ? 8.0
+            : Mode === 'cave' ? 14.0
+            : Mode === 'mound' ? 38.0
+            : 105.0;
+        const DefaultAmt = Mode === 'pathway' ? 1.5
+            : Mode === 'cliff_path' ? 9.0
+            : Mode === 'cave' ? 11.0
+            : Mode === 'mound' ? 24.0
+            : 32.0;
         return {
             ...Base,
-            splineMode: Overrides.splineMode ?? 'grade', // 'grade' | 'arch3d' | 'ridge' | 'canyon' | 'river' | 'lake'
-            width: Overrides.width ?? 105.0,
-            amount: Overrides.amount ?? 32.0, // Vertical offset or arch tube thickness (m)
+            splineMode: Mode, // 'grade' | 'pathway' | 'cliff_path' | 'mound' | 'cave' | 'tunnel' | 'arch3d' | 'ridge' | 'canyon' | 'river' | 'lake'
+            width: Overrides.width ?? DefaultW,
+            amount: Overrides.amount ?? DefaultAmt, // Vertical height/depth, cave vault height, or cliff gallery ceiling clearance (m)
             bankSmooth: Overrides.bankSmooth ?? 0.62,
-            meander: Overrides.meander ?? 0.14,
+            influenceScale: Overrides.influenceScale ?? 1.0, // User-controllable spline influence envelope multiplier (0.20x .. 4.0x)
+            meander: Overrides.meander ?? (Mode === 'cave' ? 0.0 : 0.14),
+            // Cliffside Pathway controls
+            cliffGallery: Overrides.cliffGallery ?? 0.68,     // 0=open-air cliff ledge, >0.04=True-3D rock overhang gallery
+            retainingDepth: Overrides.retainingDepth ?? 0.80, // Steepness/strength of downhill rock retaining buttress
+            // Organic Mound Spline controls
+            moundRoundness: Overrides.moundRoundness ?? 0.55, // 0=sharp peaked berm, 0.55=natural earthen hill, 1=broad dome mound
+            endTaper: Overrides.endTaper ?? 0.72,             // Smooth tapered tails at spline start/end (0=blunt, 1=long gentle taper)
+            lumpiness: Overrides.lumpiness ?? 0.30,           // Natural rolling knolls & organic swell along the mound crest
+            // True-3D Cave Spline controls
+            caveRoughness: Overrides.caveRoughness ?? 0.52,   // 3D stalactite & limestone wall irregularity
+            chamberSwell: Overrides.chamberSwell ?? 0.65,     // Periodic wide subterranean cavern halls along the passage
+            floorFlatness: Overrides.floorFlatness ?? 0.76,   // Walkable flat cave floor vs rounded karst tube
             points: (Overrides.points || []).map(P => P.slice())
         };
     }
@@ -536,6 +561,42 @@ function PointToPolylineDist(Wx, Wz, Poly)
     return { dist: Math.sqrt(BestSq), along: BestAlong, elevY: BestY };
 }
 
+/**
+ * Exact real-world metric corridor geometry for any Spline layer:
+ * - `widthM` / `halfW`: core walkable path, cliff shelf, mound crest, or cave bore width (down to 2.0m real scale!)
+ * - `influenceScale`: user-controllable outer blend / grading envelope multiplier (0.20x .. 4.0x)
+ * - At `influenceScale === 1.0`, legacy modes (`grade`, `road`, `ridge`, `canyon`, `river`, `lake`)
+ *   evaluate identically to `HalfW * (1 + Bank)` for 100% backward compatibility.
+ */
+export function ComputeSplineCorridorMetrics(Layer)
+{
+    const Mode = Layer?.splineMode || 'grade';
+    const RawW = Number(Layer?.width);
+    const WidthM = Math.max(2.0, Number.isFinite(RawW) && RawW > 0.0 ? RawW : (
+        Mode === 'pathway' ? 4.5 :
+        Mode === 'cliff_path' ? 8.0 :
+        Mode === 'cave' ? 14.0 :
+        Mode === 'mound' ? 38.0 : 90.0
+    ));
+    const HalfW = WidthM * 0.5;
+    const Bank = Clamp(Number(Layer?.bankSmooth) ?? 0.55, 0.05, 1.0);
+    const InfScale = Clamp(Number(Layer?.influenceScale) ?? 1.0, 0.20, 4.0);
+    const IsRealScaleMode = Mode === 'pathway' || Mode === 'cliff_path' || Mode === 'mound' || Mode === 'cave';
+    const ShoulderM = IsRealScaleMode
+        ? Math.max(0.15, HalfW * (0.28 + Bank * 1.12) * InfScale)
+        : (HalfW * Bank * InfScale);
+    const OuterRadiusM = HalfW + ShoulderM;
+    return {
+        mode: Mode,
+        widthM: WidthM,
+        halfW: HalfW,
+        bank: Bank,
+        influenceScale: InfScale,
+        shoulderM: ShoulderM,
+        outerRadiusM: OuterRadiusM
+    };
+}
+
 /*==========================================================================================================================================
                                     TERRAIN REGION LAYER-STACK & THIN-SLAB SDF EVALUATOR
 ==========================================================================================================================================*/
@@ -560,6 +621,7 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
     const Heights = new Float32Array(Count);
     const FalloffPreview = new Float32Array(Count);
     const WaterChannel = new Float32Array(Count); // River/lake spline water tint mask
+    const TrailMask = new Float32Array(Count);    // Pathway / cliff-trail compacted earth surface tint mask
 
     const SeaLevel = World.seaLevel ?? 0.0;
     const SlabBottom = SeaLevel - Math.max(1.5, Number(Region.slabThickness) || 6.5);
@@ -573,7 +635,7 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
             nx: Nx, nz: Nz, stepX: StepX, stepZ: StepZ,
             slabBottom: SlabBottom, baseTop: BaseTop,
             coverage: MaskCov, sdf2D: Sdf2D, heights: Heights,
-            falloffMap: FalloffPreview, waterChannel: WaterChannel,
+            falloffMap: FalloffPreview, waterChannel: WaterChannel, trailMask: TrailMask,
             hasLand: false, maxHeight: SlabBottom, landAreaKm2: 0
         };
         Region.dirty = false;
@@ -649,6 +711,7 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
         // Precompute spline polyline & bounding box when evaluating a Spline Landform layer
         let Poly = null;
         let PolyBounds = null;
+        let SplineMetrics = null;
         if (Type === 'spline')
         {
             if (!Layer.points || Layer.points.length < 2) continue;
@@ -662,11 +725,14 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                     Pt[2] = Math.round(Heights[Gz * Nx + Gx] * 10) / 10;
                 }
             }
-            // 'arch3d' & 'tunnel' are extracted as true 3D volumetric geometry (rock bridge & mountain tunnel bore)!
-            if (Layer.splineMode === 'arch3d' || Layer.splineMode === 'tunnel') continue;
+            // 'arch3d', 'tunnel', and 'cave' are extracted purely as true 3D volumetric geometry (leaving overhead rock intact)!
+            if (Layer.splineMode === 'arch3d' || Layer.splineMode === 'tunnel' || Layer.splineMode === 'cave') continue;
 
             Poly = SampleCatmullRomPolyline(Layer.points, 8);
-            const MaxReach = (Number(Layer.width) || 90.0) * 2.5 + 45.0;
+            SplineMetrics = ComputeSplineCorridorMetrics(Layer);
+            const MeanderPad = SplineMetrics.widthM * 0.55 * Math.abs(Number(Layer.meander) || 0.0);
+            const CliffButtressPad = Layer.splineMode === 'cliff_path' ? 76.0 : 0.0;
+            const MaxReach = Math.max(SplineMetrics.outerRadiusM + MeanderPad + CliffButtressPad + Math.max(StepX, StepZ) * 2.0, 24.0);
             let PMinX = 1e9, PMinZ = 1e9, PMaxX = -1e9, PMaxZ = -1e9;
             for (const Pt of Poly)
             {
@@ -757,24 +823,134 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                     const Meander = Number(Layer.meander) || 0.0;
                     if (Meander > 0.01)
                     {
-                        const Mw = (Number(Layer.width) || 80.0) * 0.45 * Meander;
+                        const Mw = SplineMetrics.widthM * 0.45 * Meander;
                         Qx += (GradNoise2D(Wx * 0.004, Wz * 0.004, Seed) - 0.5) * Mw * 2.0;
                         Qz += (GradNoise2D(Wx * 0.004 + 13.7, Wz * 0.004 + 9.2, Seed + 41) - 0.5) * Mw * 2.0;
                     }
                     const { dist: SDist, along: AlongT, elevY: KnotElevY } = PointToPolylineDist(Qx, Qz, Poly);
-                    const HalfW = Math.max(6.0, (Number(Layer.width) || 90.0) * 0.5);
-                    if (SDist >= HalfW * 2.1) continue;
+                    const Mode = SplineMetrics.mode;
+                    const HalfW = SplineMetrics.halfW;
+                    const Bank = SplineMetrics.bank;
+                    const InfScale = SplineMetrics.influenceScale;
+                    const GridCell = Math.max(StepX, StepZ);
+                    // Anti-aliasing floor ONLY prevents sub-grid trail dropouts on coarse grids while preserving strict metric scaling
+                    const OuterR = (Mode === 'pathway' || Mode === 'cliff_path')
+                        ? Math.max(SplineMetrics.outerRadiusM, GridCell * 0.65)
+                        : SplineMetrics.outerRadiusM;
+                    const MaxCheckR = Mode === 'cliff_path' ? (OuterR + 74.0) : OuterR;
+                    if (SDist >= MaxCheckR) continue;
 
-                    const Bank = Clamp(Number(Layer.bankSmooth) ?? 0.55, 0.05, 1.0);
-                    const NormD = SDist / (HalfW * (1.0 + Bank));
-                    if (NormD >= 1.0) continue;
-
+                    const NormD = Math.min(1.0, SDist / Math.max(1e-4, OuterR));
                     const Profile = Math.pow(1.0 - Smoothstep(0.0, 1.0, NormD), Mix(2.2, 0.75, Bank));
                     const Amt = Number(Layer.amount) ?? 32.0;
-                    const Mode = Layer.splineMode || 'grade';
                     const Has3DElev = Number.isFinite(KnotElevY);
 
-                    if (Mode === 'grade' || Mode === 'road')
+                    if (Mode === 'pathway')
+                    {
+                        // Real-world metric footpath / mountain trail (2m .. 25m): flat walkable tread + worn recess/camber + user-scaled blend shoulder
+                        const EffHalfW = Math.max(HalfW, GridCell * 0.32);
+                        const TrailEmbed = Clamp(Math.abs(Amt), 0.0, 48.0);
+                        const Camber = SDist < EffHalfW
+                            ? (1.0 - (SDist / EffHalfW) * (SDist / EffHalfW)) * Math.min(0.65, TrailEmbed * 0.14)
+                            : 0.0;
+                        const TargetY = (Has3DElev ? KnotElevY : CurH) - TrailEmbed * 0.45 + Camber;
+                        let BlendW = 1.0;
+                        if (SDist > EffHalfW)
+                        {
+                            const ShoulderT = Clamp((SDist - EffHalfW) / Math.max(1e-4, OuterR - EffHalfW), 0.0, 1.0);
+                            BlendW = Math.pow(1.0 - Smoothstep(0.0, 1.0, ShoulderT), Mix(2.1, 0.9, Bank));
+                        }
+                        Heights[Idx] = Math.max(SlabBottom + 0.6, Mix(CurH, TargetY, Clamp(BlendW * MaskW, 0.0, 1.0)));
+                        const CoreTrail = 1.0 - Smoothstep(EffHalfW * 0.65, EffHalfW * 1.25, SDist);
+                        if (CoreTrail > 0.01) TrailMask[Idx] = Math.max(TrailMask[Idx], CoreTrail * MaskW);
+                    }
+                    else if (Mode === 'cliff_path')
+                    {
+                        // Steep cliffside pathway: crisp walkable ledge + downhill rock retaining buttress + optional 3D cliff gallery overhang!
+                        const EffHalfW = Math.max(HalfW, GridCell * 0.38);
+                        const TargetY = Has3DElev ? KnotElevY : CurH;
+                        const Gallery = Clamp(Number(Layer.cliffGallery) ?? 0.68, 0.0, 1.0);
+                        const Retain = Clamp(Number(Layer.retainingDepth) ?? 0.80, 0.10, 1.0);
+                        const GalleryH = Math.max(4.5, Amt);
+
+                        if (CurH < TargetY)
+                        {
+                            // Downhill side: build physical stone retaining buttress / talus embankment down the cliff face
+                            // Low retainingDepth -> broad sloping talus ramp; high retainingDepth -> sheer cliff masonry wall!
+                            const DropM = TargetY - CurH;
+                            const ButtressRun = Math.min(72.0, DropM * Mix(0.62, 0.10, Retain) * Math.min(2.2, InfScale));
+                            const FillOuterR = OuterR + ButtressRun;
+                            if (SDist < FillOuterR)
+                            {
+                                let FillW = 1.0;
+                                if (SDist > EffHalfW)
+                                {
+                                    const OutT = Clamp((SDist - EffHalfW) / Math.max(1e-4, FillOuterR - EffHalfW), 0.0, 1.0);
+                                    FillW = Math.pow(1.0 - Smoothstep(0.0, 1.0, OutT), Mix(1.10, 3.6, Retain));
+                                }
+                                const BuiltY = Mix(CurH, TargetY, Clamp(FillW * MaskW, 0.0, 1.0));
+                                Heights[Idx] = Math.max(SlabBottom + 0.6, BuiltY);
+                            }
+                        }
+                        else if (SDist < OuterR && (Gallery <= 0.04 || CurH <= TargetY + GalleryH * 0.62))
+                        {
+                            // Open-air cliff cut (when cliffGallery == 0) OR lower outer lip: carve flat walkable cliff shelf
+                            let CutW = 1.0;
+                            if (SDist > EffHalfW)
+                            {
+                                const OutT = Clamp((SDist - EffHalfW) / Math.max(1e-4, OuterR - EffHalfW), 0.0, 1.0);
+                                CutW = Math.pow(1.0 - Smoothstep(0.0, 1.0, OutT), Mix(2.4, 0.95, Bank));
+                            }
+                            Heights[Idx] = Math.max(SlabBottom + 0.6, Mix(CurH, TargetY, Clamp(CutW * MaskW, 0.0, 1.0)));
+                        }
+                        // Else: CurH > TargetY + GalleryH * 0.62 AND Gallery > 0.04 -> keep uphill cliff crown SOLID
+                        // so BuildVolumetric3DBricks carves a genuine True-3D overhanging rock gallery ceiling!
+                        const CoreTrail = 1.0 - Smoothstep(EffHalfW * 0.65, EffHalfW * 1.30, SDist);
+                        if (CoreTrail > 0.01 && Math.abs(Heights[Idx] - TargetY) <= GalleryH * 0.85)
+                        {
+                            TrailMask[Idx] = Math.max(TrailMask[Idx], CoreTrail * MaskW);
+                        }
+                    }
+                    else if (Mode === 'mound')
+                    {
+                        // Organic spline-drawn earthen mound / berm / drumlin with controllable crown roundness, end taper, knoll lumpiness & influence skirt!
+                        const Round = Clamp(Number(Layer.moundRoundness) ?? 0.55, 0.0, 1.0);
+                        const Taper = Clamp(Number(Layer.endTaper) ?? 0.72, 0.0, 1.0);
+                        const Lump = Clamp(Number(Layer.lumpiness) ?? 0.30, 0.0, 1.0);
+
+                        let CrossProf = 0.0;
+                        const CoreEdge = Mix(0.54, 0.90, Round);
+                        if (SDist <= HalfW)
+                        {
+                            const Ct = SDist / Math.max(1e-4, HalfW);
+                            const CrownExp = Mix(1.25, 2.85, Round);
+                            CrossProf = Mix(1.0, CoreEdge, Math.pow(Ct, CrownExp));
+                        }
+                        else
+                        {
+                            const St = Clamp((SDist - HalfW) / Math.max(1e-4, OuterR - HalfW), 0.0, 1.0);
+                            const SkirtExp = Mix(2.35, 1.05, Round);
+                            CrossProf = CoreEdge * Math.pow(1.0 - Smoothstep(0.0, 1.0, St), SkirtExp);
+                        }
+
+                        const TaperSpan = Mix(0.03, 0.44, Taper);
+                        const EndEnv = Smoothstep(0.0, TaperSpan, AlongT) * Smoothstep(0.0, TaperSpan, 1.0 - AlongT);
+
+                        let KnollMod = 1.0;
+                        if (Lump > 0.005)
+                        {
+                            const Wave = 0.5 + 0.32 * Math.sin(AlongT * Math.PI * 5.0 + (Seed % 97) * 0.11)
+                                             + 0.18 * Math.cos(AlongT * Math.PI * 9.0 + 1.3);
+                            const Tex = (GradNoise2D(Wx * 0.014, Wz * 0.014, Seed + 73) - 0.5) * 0.44;
+                            KnollMod = Mix(1.0, Clamp(0.62 + Wave * 0.76 + Tex, 0.38, 1.48), Lump);
+                        }
+
+                        const MoundBaseH = Math.max(0.5, Math.abs(Amt));
+                        const KnotDelta = Has3DElev ? Clamp((KnotElevY - CurH) * 0.65, -MoundBaseH * 0.65, MoundBaseH * 1.5) : 0.0;
+                        const MoundLift = Math.max(0.0, (MoundBaseH + KnotDelta) * CrossProf * EndEnv * KnollMod);
+                        Heights[Idx] = Math.max(SlabBottom + 0.6, CurH + MoundLift * MaskW);
+                    }
+                    else if (Mode === 'grade' || Mode === 'road')
                     {
                         // Direct 3D Elevation Cut & Fill: raising/lowering any knot on the Y-axis Gizmo pulls or carves the terrain right to KnotElevY!
                         const TargetY = Has3DElev ? KnotElevY : Mix(BaseTop + Amt * 0.8, BaseTop + 8.0, AlongT);
@@ -789,7 +965,8 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                     }
                     else if (Mode === 'canyon')
                     {
-                        const GorgeProfile = 1.0 - Smoothstep(0.18, 0.95, SDist / HalfW);
+                        const GorgeSpan = Math.max(HalfW, HalfW * (0.45 + 0.55 * InfScale));
+                        const GorgeProfile = 1.0 - Smoothstep(0.18, 0.95, SDist / GorgeSpan);
                         const FloorY = Has3DElev ? (KnotElevY - Amt) : (CurH - Amt);
                         Heights[Idx] = Math.max(SlabBottom + 0.6, Mix(CurH, FloorY, GorgeProfile * MaskW));
                     }
@@ -935,7 +1112,7 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
         topSculptLayerId: TopLiveSculptIdx >= 0 ? Region.stack[TopLiveSculptIdx].id : null,
         baseSignature: BaseSig,
         erosionStale: !!(Region.erosionBaseSig && Region.erosionBaseSig !== BaseSig),
-        falloffMap: FalloffPreview, waterChannel: WaterChannel,
+        falloffMap: FalloffPreview, waterChannel: WaterChannel, trailMask: TrailMask,
         hasLand: true, maxHeight: MaxHeight, landAreaKm2: LandAreaKm2
     };
     // Preserve live erosion state + data-map lens across stack re-evaluations
@@ -973,7 +1150,7 @@ export function ComputeRegionBaseSignature(World, Region)
     for (const Lyr of Region.stack)
     {
         if (!Lyr || Lyr.name === 'Erosion Baked Surface') continue;
-        MixStr(`|l:${Lyr.id}:${Lyr.type}:${Lyr.enabled ? 1 : 0}:${Lyr.opacity ?? 1}:${Lyr.combine || 'add'}:${Lyr.smoothK ?? 0}:${Lyr.amplitude ?? 0}:${Lyr.scale ?? 0}:${Lyr.seed ?? 0}:${Lyr.octaves ?? 0}:${Lyr.gain ?? 0}:${Lyr.warp ?? 0}:${Lyr.sharpness ?? 0}:${Lyr.azimuth ?? 0}:${Lyr.variant ?? 0}:${Lyr.bedCount ?? 0}:${Lyr.strength ?? 0}:${Lyr.dipDeg ?? 0}:${Lyr.splineMode || ''}:${Lyr.width ?? 0}:${Lyr.amount ?? 0}:${Lyr.strokeCount ?? 0}:${Lyr.falloff?.mode || ''}:${Lyr.falloff?.distance ?? 0}:${Lyr.falloff?.edgeFloor ?? 0}`);
+        MixStr(`|l:${Lyr.id}:${Lyr.type}:${Lyr.enabled ? 1 : 0}:${Lyr.opacity ?? 1}:${Lyr.combine || 'add'}:${Lyr.smoothK ?? 0}:${Lyr.amplitude ?? 0}:${Lyr.scale ?? 0}:${Lyr.seed ?? 0}:${Lyr.octaves ?? 0}:${Lyr.gain ?? 0}:${Lyr.warp ?? 0}:${Lyr.sharpness ?? 0}:${Lyr.azimuth ?? 0}:${Lyr.variant ?? 0}:${Lyr.bedCount ?? 0}:${Lyr.strength ?? 0}:${Lyr.dipDeg ?? 0}:${Lyr.splineMode || ''}:${Lyr.width ?? 0}:${Lyr.amount ?? 0}:${Lyr.bankSmooth ?? 0}:${Lyr.influenceScale ?? 1}:${Lyr.meander ?? 0}:${Lyr.cliffGallery ?? 0}:${Lyr.retainingDepth ?? 0}:${Lyr.moundRoundness ?? 0}:${Lyr.endTaper ?? 0}:${Lyr.lumpiness ?? 0}:${Lyr.caveRoughness ?? 0}:${Lyr.chamberSwell ?? 0}:${Lyr.floorFlatness ?? 0}:${Lyr.strokeCount ?? 0}:${Lyr.falloff?.mode || ''}:${Lyr.falloff?.distance ?? 0}:${Lyr.falloff?.edgeFloor ?? 0}`);
         if (Lyr.type === 'landform')
         {
             MixStr(`|lf:${Lyr.archetype || ''}:${Lyr.placementMode || 'single'}:${Lyr.instanceCount ?? 1}:${Lyr.spread ?? 0}:${Lyr.rangeCurvature ?? 0}:${Lyr.scaleTaper ?? 0}:${Lyr.jitter ?? 0}:${Lyr.centerX ?? 0}:${Lyr.centerZ ?? 0}:${Lyr.radius ?? 0}:${Lyr.length ?? 0}:${Lyr.height ?? 0}:${Lyr.aspectRatio ?? 1}:${Lyr.rockDetail ?? 0}:${JSON.stringify(Lyr.params || {})}`);
@@ -1261,8 +1438,14 @@ export function ExtractRegionTriangleMesh(World, Region, Options = {})
 
             const Litho = ComputeFlatLithologyColor(H, SeaLevel, SlopeDeg, Rt.waterChannel[Cell], D2, SlabBottom);
 
-            // ---- Erosion overlays (live simulated surface state) ----
+            // ---- Pathway & Cliff-Trail natural compacted earth / crushed rock tread coloration ----
             let CR = Litho[0], CG = Litho[1], CB = Litho[2];
+            if (Rt.trailMask && Cell < Rt.trailMask.length && Rt.trailMask[Cell] > 0.015)
+            {
+                const TrT = Clamp(Rt.trailMask[Cell], 0.0, 1.0) * 0.62;
+                CR = Mix(CR, 0.66, TrT); CG = Mix(CG, 0.58, TrT); CB = Mix(CB, 0.46, TrT);
+            }
+            // ---- Erosion overlays (live simulated surface state) ----
             const Er = Rt.erosion;
             if (Er && Cell < Er.nx * Er.nz)
             {
@@ -1713,14 +1896,136 @@ function TunnelSegSdf3D(Px, Py, Pz, Ax, Ay, Az, Bx, By, Bz, HalfWidth, ArchHeigh
     return Math.max(RoofOrWall, FloorD);
 }
 
+/**
+ * True-3D Pure-SDF Organic Limestone Cave Passage Group evaluator along a 3D Catmull-Rom spline:
+ * - Periodic cavern chamber swelling (`chamberSwell`)
+ * - Walkable flat floor vs rounded karst solution tube (`floorFlatness`)
+ * - Multi-frequency 3D limestone wall & ceiling stalactite displacement (`caveRoughness`, quieted along flat floor)
+ */
+function EvalCaveGroupSdf3D(Px, Py, Pz, Grp)
+{
+    if (Px < Grp.minX || Px > Grp.maxX || Py < Grp.minY || Py > Grp.maxY || Pz < Grp.minZ || Pz > Grp.maxZ)
+    {
+        return 1e6;
+    }
+    const Segs = Grp.segs;
+    const Swell = Grp.chamberSwell;
+    const Flat = Grp.floorFlatness;
+    const Seed = Grp.seed;
+    let BestD = 1e6;
+    let BestFloorY = Py;
+    let BestMinDim = Grp.halfW;
+
+    for (let I = 0; I < Segs.length; ++I)
+    {
+        const S = Segs[I];
+        const Bax = S.bx - S.ax, Bay = S.by - S.ay, Baz = S.bz - S.az;
+        const Pax = Px - S.ax, Pay = Py - S.ay, Paz = Pz - S.az;
+        const BaDot = Bax * Bax + Bay * Bay + Baz * Baz;
+        const T = BaDot > 1e-6 ? Clamp((Pax * Bax + Pay * Bay + Paz * Baz) / BaDot, 0.0, 1.0) : 0.0;
+        const Cx = S.ax + Bax * T, Cy = S.ay + Bay * T, Cz = S.az + Baz * T;
+        const Along = Mix(S.along0, S.along1, T);
+
+        // Organic cavern chambers swelling periodically along the cave passage
+        const ChamberWave = 0.5 + 0.5 * Math.sin(Along * Math.PI * 3.5 + (Seed % 61) * 0.11);
+        const LocalW = Math.max(1.5, Grp.halfW * (1.0 + Swell * 0.62 * ChamberWave));
+        const LocalH = Math.max(2.2, Grp.archH * (0.86 + Swell * 0.42 * ChamberWave));
+
+        const HorizDist = Math.hypot(Px - Cx, Pz - Cz);
+        const ArchCenterY = Cy + LocalH * Mix(0.48, 0.14, Flat);
+        const EffRy = Math.max(1.8, LocalH * Mix(0.52, 0.86, Flat));
+        const MinDim = Math.min(LocalW, EffRy);
+        const TubeD = (Math.hypot(HorizDist / LocalW, (Py - ArchCenterY) / EffRy) - 1.0) * MinDim;
+        const FloorD = Cy - Py;
+        const SegD = Flat > 0.05 ? SdfSmoothMaxPoly(TubeD, FloorD, Math.max(0.4, (1.0 - Flat) * 3.2)) : TubeD;
+
+        if (SegD < BestD)
+        {
+            BestD = SegD;
+            BestFloorY = Cy;
+            BestMinDim = MinDim;
+        }
+    }
+
+    if (BestD > BestMinDim * 0.9 + Grp.blend) return BestD;
+
+    if (Grp.caveRoughness > 0.01)
+    {
+        const Freq = 2.4 / Math.max(6.0, Grp.halfW);
+        const FloorQuiet = Mix(1.0, Smoothstep(0.0, Math.max(1.5, Grp.archH * 0.34), Py - BestFloorY), Flat * 0.84);
+        const Disp = CaveNoise3D(Px * Freq, Py * Freq * 1.15, Pz * Freq, Seed) * Grp.caveRoughness * BestMinDim * 0.34 * FloorQuiet;
+        BestD += Disp;
+    }
+    return BestD;
+}
+
+/**
+ * True-3D Pure-SDF Cliffside Half-Tunnel Gallery Group evaluator along a steep `cliff_path` spline:
+ * - Flat walkable trail floor at `Py == Cy` (preserving the downhill retaining rock shelf below!)
+ * - Vaulted rocky cliff ceiling arching cleanly up to `Cy + galleryH`, biting horizontally into steep uphill cliffs
+ *   so solid rock overhead forms a genuine overhanging cliff gallery (`Ny < -0.15`) while opening out to the valley!
+ */
+function EvalCliffGalleryGroupSdf3D(Px, Py, Pz, Grp)
+{
+    if (Px < Grp.minX || Px > Grp.maxX || Py < Grp.minY || Py > Grp.maxY || Pz < Grp.minZ || Pz > Grp.maxZ)
+    {
+        return 1e6;
+    }
+    const Segs = Grp.segs;
+    const GalW = Grp.galleryHalfW;
+    const GalH = Grp.galleryH;
+    const MinDim = Math.min(GalW, GalH);
+    let BestD = 1e6;
+    let BestFloorY = Py;
+
+    for (let I = 0; I < Segs.length; ++I)
+    {
+        const S = Segs[I];
+        const Bax = S.bx - S.ax, Bay = S.by - S.ay, Baz = S.bz - S.az;
+        const Pax = Px - S.ax, Pay = Py - S.ay, Paz = Pz - S.az;
+        const BaDot = Bax * Bax + Bay * Bay + Baz * Baz;
+        const T = BaDot > 1e-6 ? Clamp((Pax * Bax + Pay * Bay + Paz * Baz) / BaDot, 0.0, 1.0) : 0.0;
+        const Cx = S.ax + Bax * T, Cy = S.ay + Bay * T, Cz = S.az + Baz * T;
+
+        const HorizDist = Math.hypot(Px - Cx, Pz - Cz);
+        const RelY = Py - Cy;
+        const NormX = HorizDist / GalW;
+        const NormY = Math.max(0.0, RelY) / GalH;
+        const VaultD = (Math.hypot(NormX, NormY) - 1.0) * MinDim;
+        const FloorD = Cy - Py;
+        const SegD = Math.max(VaultD, FloorD);
+        if (SegD < BestD)
+        {
+            BestD = SegD;
+            BestFloorY = Cy;
+        }
+    }
+
+    if (BestD < MinDim * 0.8 + Grp.blend)
+    {
+        // Chiseled rocky ceiling & inner cliff wall irregularity while keeping the walkable trail deck crisp and flat!
+        const CeilingEnv = Smoothstep(0.4, Math.max(1.5, GalH * 0.35), Py - BestFloorY);
+        const Rough = CaveNoise3D(Px * 0.28, Py * 0.34, Pz * 0.28, Grp.seed + 37) * Math.min(2.0, GalH * 0.14) * CeilingEnv;
+        BestD += Rough;
+    }
+    return BestD;
+}
+
 function BuildVolumetric3DBricks(World, Region, Rt)
 {
     const Ops = Region.sdf3DOps || [];
     const TunnelLayers = (Region.stack || []).filter(
         L => L && L.enabled !== false && L.type === 'spline' && L.splineMode === 'tunnel' && L.points && L.points.length >= 2
     );
+    const CaveLayers = (Region.stack || []).filter(
+        L => L && L.enabled !== false && L.type === 'spline' && L.splineMode === 'cave' && L.points && L.points.length >= 2
+    );
+    const CliffGalLayers = (Region.stack || []).filter(
+        L => L && L.enabled !== false && L.type === 'spline' && L.splineMode === 'cliff_path'
+            && (Clamp(Number(L.cliffGallery) ?? 0.68, 0.0, 1.0) > 0.04) && L.points && L.points.length >= 2
+    );
     const VolLandforms = CollectVolumetricLandformPrimitives(Region, Rt, World?.seaLevel ?? 0.0);
-    if (Ops.length === 0 && TunnelLayers.length === 0 && VolLandforms.length === 0) return [];
+    if (Ops.length === 0 && TunnelLayers.length === 0 && CaveLayers.length === 0 && CliffGalLayers.length === 0 && VolLandforms.length === 0) return [];
 
     const B = Region.bounds;
     const Nx = Rt.nx, Nz = Rt.nz;
@@ -1735,16 +2040,17 @@ function BuildVolumetric3DBricks(World, Region, Rt)
             minX: Math.min(Op.ax, Op.bx) - R, maxX: Math.max(Op.ax, Op.bx) + R,
             minY: Math.min(Op.ay, Op.by) - R, maxY: Math.max(Op.ay, Op.by) + R,
             minZ: Math.min(Op.az, Op.bz) - R, maxZ: Math.max(Op.az, Op.bz) + R,
-            ops: [Op], tunnelSegs: [], landformPrims: []
+            ops: [Op], tunnelSegs: [], caveGroups: [], cliffGalGroups: [], landformPrims: []
         });
     }
 
     for (const Lyr of TunnelLayers)
     {
         const Poly = SampleCatmullRomPolyline(Lyr.points, 8);
-        const HalfW = Math.max(6.0, (Number(Lyr.width) || 44.0) * 0.5);
-        const ArchH = Math.max(6.0, Number(Lyr.amount) || 22.0);
-        const Blend = Math.max(3.0, (Number(Lyr.bankSmooth) ?? 0.35) * 16.0);
+        const InfScale = Clamp(Number(Lyr.influenceScale) ?? 1.0, 0.20, 4.0);
+        const HalfW = Math.max(2.0, (Number(Lyr.width) || 44.0) * 0.5);
+        const ArchH = Math.max(3.0, Number(Lyr.amount) || 22.0);
+        const Blend = Math.max(1.5, (Number(Lyr.bankSmooth) ?? 0.35) * 14.0 * Math.min(2.0, InfScale));
         const Segs = [];
         let MinX = 1e9, MinY = 1e9, MinZ = 1e9, MaxX = -1e9, MaxY = -1e9, MaxZ = -1e9;
         for (let I = 0; I < Poly.length - 1; ++I)
@@ -1763,7 +2069,90 @@ function BuildVolumetric3DBricks(World, Region, Rt)
             minX: MinX - PadXZ, maxX: MaxX + PadXZ,
             minY: MinY - PadY,  maxY: MaxY + PadY,
             minZ: MinZ - PadXZ, maxZ: MaxZ + PadXZ,
-            ops: [], tunnelSegs: Segs, landformPrims: []
+            ops: [], tunnelSegs: Segs, caveGroups: [], cliffGalGroups: [], landformPrims: []
+        });
+    }
+
+    for (const Lyr of CaveLayers)
+    {
+        const Poly = SampleCatmullRomPolyline(Lyr.points, 8);
+        const Metrics = ComputeSplineCorridorMetrics(Lyr);
+        const HalfW = Math.max(1.5, Metrics.halfW);
+        const ArchH = Math.max(2.5, Number(Lyr.amount) || 11.0);
+        const Swell = Clamp(Number(Lyr.chamberSwell) ?? 0.65, 0.0, 1.5);
+        const Rough = Clamp(Number(Lyr.caveRoughness) ?? 0.52, 0.0, 1.0);
+        const FlatFloor = Clamp(Number(Lyr.floorFlatness) ?? 0.76, 0.0, 1.0);
+        const Blend = Math.max(1.2, (Number(Lyr.bankSmooth) ?? 0.35) * 8.0 * Math.min(2.2, Metrics.influenceScale));
+        const Segs = [];
+        const SegCount = Math.max(1, Poly.length - 1);
+        let MinX = 1e9, MinY = 1e9, MinZ = 1e9, MaxX = -1e9, MaxY = -1e9, MaxZ = -1e9;
+        for (let I = 0; I < Poly.length - 1; ++I)
+        {
+            const P0 = Poly[I], P1 = Poly[I + 1];
+            const Y0 = Number.isFinite(P0[2]) ? P0[2] : 25.0;
+            const Y1 = Number.isFinite(P1[2]) ? P1[2] : 25.0;
+            Segs.push({
+                ax: P0[0], ay: Y0, az: P0[1], bx: P1[0], by: Y1, bz: P1[1],
+                along0: I / SegCount, along1: (I + 1) / SegCount
+            });
+            MinX = Math.min(MinX, P0[0], P1[0]); MaxX = Math.max(MaxX, P0[0], P1[0]);
+            MinY = Math.min(MinY, Y0, Y1);       MaxY = Math.max(MaxY, Y0, Y1);
+            MinZ = Math.min(MinZ, P0[1], P1[1]); MaxZ = Math.max(MaxZ, P0[1], P1[1]);
+        }
+        const MaxW = HalfW * (1.0 + Swell * 0.75) + Blend + 6.0;
+        const MaxH = ArchH * (1.1 + Swell * 0.55) + Blend + 6.0;
+        const Grp = {
+            minX: MinX - MaxW, maxX: MaxX + MaxW,
+            minY: MinY - 8.0,  maxY: MaxY + MaxH,
+            minZ: MinZ - MaxW, maxZ: MaxZ + MaxW,
+            halfW: HalfW, archH: ArchH, blend: Blend,
+            chamberSwell: Swell, caveRoughness: Rough, floorFlatness: FlatFloor,
+            seed: (Lyr.seed | 0) || 4029,
+            segs: Segs
+        };
+        PrimBoxes.push({
+            minX: Grp.minX - MarginM, maxX: Grp.maxX + MarginM,
+            minY: Grp.minY - 6.0,     maxY: Grp.maxY + 8.0,
+            minZ: Grp.minZ - MarginM, maxZ: Grp.maxZ + MarginM,
+            ops: [], tunnelSegs: [], caveGroups: [Grp], cliffGalGroups: [], landformPrims: []
+        });
+    }
+
+    for (const Lyr of CliffGalLayers)
+    {
+        const Poly = SampleCatmullRomPolyline(Lyr.points, 8);
+        const Metrics = ComputeSplineCorridorMetrics(Lyr);
+        const Gallery = Clamp(Number(Lyr.cliffGallery) ?? 0.68, 0.0, 1.0);
+        const HalfW = Math.max(1.5, Metrics.halfW);
+        const GalleryHalfW = Math.max(3.5, HalfW * (1.0 + 1.15 * Gallery));
+        const GalleryH = Math.max(4.5, Number(Lyr.amount) || 9.0);
+        const Blend = Math.max(1.2, (Number(Lyr.bankSmooth) ?? 0.45) * 5.0 * Math.min(1.8, Metrics.influenceScale));
+        const Segs = [];
+        let MinX = 1e9, MinY = 1e9, MinZ = 1e9, MaxX = -1e9, MaxY = -1e9, MaxZ = -1e9;
+        for (let I = 0; I < Poly.length - 1; ++I)
+        {
+            const P0 = Poly[I], P1 = Poly[I + 1];
+            const Y0 = Number.isFinite(P0[2]) ? P0[2] : 25.0;
+            const Y1 = Number.isFinite(P1[2]) ? P1[2] : 25.0;
+            Segs.push({ ax: P0[0], ay: Y0, az: P0[1], bx: P1[0], by: Y1, bz: P1[1] });
+            MinX = Math.min(MinX, P0[0], P1[0]); MaxX = Math.max(MaxX, P0[0], P1[0]);
+            MinY = Math.min(MinY, Y0, Y1);       MaxY = Math.max(MaxY, Y0, Y1);
+            MinZ = Math.min(MinZ, P0[1], P1[1]); MaxZ = Math.max(MaxZ, P0[1], P1[1]);
+        }
+        const PadXZ = GalleryHalfW + Blend + 6.0;
+        const Grp = {
+            minX: MinX - PadXZ, maxX: MaxX + PadXZ,
+            minY: MinY - 6.0,   maxY: MaxY + GalleryH + Blend + 6.0,
+            minZ: MinZ - PadXZ, maxZ: MaxZ + PadXZ,
+            galleryHalfW: GalleryHalfW, galleryH: GalleryH, blend: Blend,
+            seed: (Lyr.seed | 0) || 4029,
+            segs: Segs
+        };
+        PrimBoxes.push({
+            minX: Grp.minX - MarginM, maxX: Grp.maxX + MarginM,
+            minY: Grp.minY - 6.0,     maxY: Grp.maxY + 8.0,
+            minZ: Grp.minZ - MarginM, maxZ: Grp.maxZ + MarginM,
+            ops: [], tunnelSegs: [], caveGroups: [], cliffGalGroups: [Grp], landformPrims: []
         });
     }
 
@@ -1773,11 +2162,11 @@ function BuildVolumetric3DBricks(World, Region, Rt)
             minX: Lp.minX - MarginM, maxX: Lp.maxX + MarginM,
             minY: Lp.minY - 8.0,     maxY: Lp.maxY + 8.0,
             minZ: Lp.minZ - MarginM, maxZ: Lp.maxZ + MarginM,
-            ops: [], tunnelSegs: [], landformPrims: [Lp]
+            ops: [], tunnelSegs: [], caveGroups: [], cliffGalGroups: [], landformPrims: [Lp]
         });
     }
 
-    // Merge overlapping AABB clusters so neighboring cave/overhang/tunnel/landform volumes share one watertight Dual-Surface-Nets brick!
+    // Merge overlapping AABB clusters so neighboring cave/overhang/tunnel/cliff-gallery/landform volumes share one watertight Dual-Surface-Nets brick!
     let Merged = true;
     while (Merged && PrimBoxes.length > 1)
     {
@@ -1795,6 +2184,8 @@ function BuildVolumetric3DBricks(World, Region, Rt)
                     A.minZ = Math.min(A.minZ, C.minZ); A.maxZ = Math.max(A.maxZ, C.maxZ);
                     A.ops.push(...C.ops);
                     A.tunnelSegs.push(...C.tunnelSegs);
+                    A.caveGroups.push(...C.caveGroups);
+                    A.cliffGalGroups.push(...C.cliffGalGroups);
                     A.landformPrims.push(...C.landformPrims);
                     PrimBoxes.splice(J, 1);
                     Merged = true;
@@ -1835,6 +2226,8 @@ function BuildVolumetric3DBricks(World, Region, Rt)
             wy1: Math.max(SurfMaxY, Box.maxY) + StepX * 2.0,
             ops: Box.ops,
             tunnelSegs: Box.tunnelSegs,
+            caveGroups: Box.caveGroups,
+            cliffGalGroups: Box.cliffGalGroups,
             landformPrims: Box.landformPrims
         });
     }
@@ -1870,11 +2263,18 @@ function AppendVolumetric3DBricksMesh(World, Region, Rt, Bricks, PosList, NormLi
         const SpanY = Math.max(8.0, Brk.wy1 - Brk.wy0);
         const SpanZ = Brk.wz1 - Brk.wz0;
 
-        // Choose crisp 3D Dual-Surface-Nets voxel pitch (~half terrain grid cell, capped at 56^3 per brick for instant live updates!)
-        const TargetPitch = Math.max(2.6, Math.min(StepX, StepZ) * 0.58);
-        const VxN = Clamp(Math.round(SpanX / TargetPitch), Brk.gx1 - Brk.gx0, 56);
-        const VyN = Clamp(Math.round(SpanY / TargetPitch), 12, 52);
-        const VzN = Clamp(Math.round(SpanZ / TargetPitch), Brk.gz1 - Brk.gz0, 56);
+        // Adaptive crisp Dual-Surface-Nets voxel pitch: tightens automatically for real-world scale caves & cliff galleries!
+        const HasFineScale = (Brk.caveGroups && Brk.caveGroups.length > 0)
+                          || (Brk.cliffGalGroups && Brk.cliffGalGroups.length > 0)
+                          || (Brk.landformPrims && Brk.landformPrims.some(P => P.kind === 'cave_cavern' || P.kind === 'cliff_pathway'));
+        const TargetPitch = HasFineScale
+            ? Math.max(1.45, Math.min(StepX, StepZ) * 0.44)
+            : Math.max(2.6, Math.min(StepX, StepZ) * 0.58);
+        const MaxXZ = HasFineScale ? 64 : 56;
+        const MaxY = HasFineScale ? 58 : 52;
+        const VxN = Clamp(Math.round(SpanX / TargetPitch), Brk.gx1 - Brk.gx0, MaxXZ);
+        const VyN = Clamp(Math.round(SpanY / TargetPitch), 14, MaxY);
+        const VzN = Clamp(Math.round(SpanZ / TargetPitch), Brk.gz1 - Brk.gz0, MaxXZ);
 
         const Dx = SpanX / VxN, Dy = SpanY / VyN, Dz = SpanZ / VzN;
         const EdgeCollarM = Math.max(StepX, StepZ) * 1.8;
@@ -1911,6 +2311,24 @@ function AppendVolumetric3DBricksMesh(World, Region, Rt, Bricks, PosList, NormLi
                 const Seg = Brk.tunnelSegs[I];
                 const TunD = TunnelSegSdf3D(Px, Py, Pz, Seg.ax, Seg.ay, Seg.az, Seg.bx, Seg.by, Seg.bz, Seg.halfW, Seg.archH);
                 D = SdfSmoothMaxPoly(D, -TunD, Seg.blend);
+            }
+            if (Brk.caveGroups && Brk.caveGroups.length > 0)
+            {
+                for (let I = 0; I < Brk.caveGroups.length; ++I)
+                {
+                    const Grp = Brk.caveGroups[I];
+                    const CaveD = EvalCaveGroupSdf3D(Px, Py, Pz, Grp);
+                    if (CaveD < 1e5) D = SdfSmoothMaxPoly(D, -CaveD, Grp.blend);
+                }
+            }
+            if (Brk.cliffGalGroups && Brk.cliffGalGroups.length > 0)
+            {
+                for (let I = 0; I < Brk.cliffGalGroups.length; ++I)
+                {
+                    const Grp = Brk.cliffGalGroups[I];
+                    const GalD = EvalCliffGalleryGroupSdf3D(Px, Py, Pz, Grp);
+                    if (GalD < 1e5) D = SdfSmoothMaxPoly(D, -GalD, Grp.blend);
+                }
             }
             if (Brk.landformPrims && Brk.landformPrims.length > 0)
             {

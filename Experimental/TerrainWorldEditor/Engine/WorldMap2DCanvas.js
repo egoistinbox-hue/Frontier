@@ -6,7 +6,7 @@
 // Brush / Erase / Smooth / Polygon Landmass Drawing, Interactive Draw/Move/8-Handle Resize Terrain Bounds Boxes, Multi-Select, & 2D Splines.
 
 import { MASK_TILE_RES, TILE_WORLD_METERS } from './WorldMask2D.js';
-import { SampleCatmullRomPolyline, CreateTerrainLayer, GetLandformSpec, GetLandformFamily, ResolveLandformInstances } from './TerrainLayerStack.js';
+import { SampleCatmullRomPolyline, ComputeSplineCorridorMetrics, CreateTerrainLayer, GetLandformSpec, GetLandformFamily, ResolveLandformInstances } from './TerrainLayerStack.js';
 
 const HANDLE_NAMES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
@@ -1157,13 +1157,49 @@ export class WorldMap2DCanvas
             Ctx.restore();
         }
 
-        // Draw Spline Landform overlays inside this region
+        // Draw Spline Landform overlays inside this region (with live real-world core width + Influence Scale envelope!)
         for (const Layer of Region.stack)
         {
             if (Layer.type !== 'spline' || !Layer.enabled || !Layer.points || Layer.points.length === 0) continue;
+            const Mode = Layer.splineMode || 'grade';
+            const SplineStroke = Mode === 'pathway' ? '#e5c687'
+                : Mode === 'cliff_path' ? '#ffbe5c'
+                : Mode === 'mound' ? '#8ce28d'
+                : Mode === 'cave' ? '#be95ff'
+                : Mode === 'ridge' ? '#f0935b'
+                : Mode === 'canyon' ? '#ff7b7b'
+                : '#5ac8fa';
+            const IsActiveSpline = Layer.id === this.activeSplineLayerId || (this.tool === 'spline' && IsPrimary);
+
             if (Layer.points.length >= 2)
             {
                 const Poly = SampleCatmullRomPolyline(Layer.points, 7);
+                const Metrics = ComputeSplineCorridorMetrics(Layer);
+                const PxPerM = this.zoom;
+
+                // Translucent outer Influence Scale corridor halo + core width band when editing splines
+                if (IsActiveSpline && PxPerM > 0.02)
+                {
+                    Ctx.save();
+                    Ctx.lineCap = 'round';
+                    Ctx.lineJoin = 'round';
+                    Ctx.beginPath();
+                    Poly.forEach((Pt, Idx) =>
+                    {
+                        const [Px, Py] = this.worldToScreen(Pt[0], Pt[1]);
+                        if (Idx === 0) Ctx.moveTo(Px, Py);
+                        else Ctx.lineTo(Px, Py);
+                    });
+                    Ctx.strokeStyle = 'rgba(134, 214, 255, 0.14)';
+                    Ctx.lineWidth = Math.max(4.0, Metrics.outerRadiusM * 2.0 * PxPerM);
+                    Ctx.stroke();
+
+                    Ctx.strokeStyle = `${SplineStroke}33`;
+                    Ctx.lineWidth = Math.max(2.5, Metrics.widthM * PxPerM);
+                    Ctx.stroke();
+                    Ctx.restore();
+                }
+
                 Ctx.beginPath();
                 Poly.forEach((Pt, Idx) =>
                 {
@@ -1171,7 +1207,7 @@ export class WorldMap2DCanvas
                     if (Idx === 0) Ctx.moveTo(Px, Py);
                     else Ctx.lineTo(Px, Py);
                 });
-                Ctx.strokeStyle = Layer.splineMode === 'ridge' ? '#f0935b' : (Layer.splineMode === 'canyon' ? '#ff7b7b' : '#5ac8fa');
+                Ctx.strokeStyle = SplineStroke;
                 Ctx.lineWidth = this.tool === 'spline' && IsPrimary ? 2.5 : 1.7;
                 Ctx.stroke();
             }
@@ -1185,7 +1221,7 @@ export class WorldMap2DCanvas
                     Ctx.arc(Px, Py, 5.2, 0, Math.PI * 2);
                     Ctx.fillStyle = '#141a20';
                     Ctx.fill();
-                    Ctx.strokeStyle = '#3ec46d';
+                    Ctx.strokeStyle = SplineStroke;
                     Ctx.lineWidth = 2.0;
                     Ctx.stroke();
                 }

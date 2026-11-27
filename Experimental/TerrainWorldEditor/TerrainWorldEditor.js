@@ -22,6 +22,7 @@ import {
     CreateLandformLayer,
     SeedLandformShowcaseWorld,
     CreateTerrainLayer,
+    ComputeSplineCorridorMetrics,
     EvaluateTerrainRegion,
     StitchAdjacentRegionBorders,
     ExportWorldTerrainsObj,
@@ -108,6 +109,10 @@ import { RockFormation2Viewport } from './Engine/RockCliff/RockFormation2Viewpor
 const MASK_PALETTE = ['#58b982', '#5ac8fa', '#a3d977', '#e8c27a', '#f0935b', '#d6a2e8'];
 
 const SPLINE_MODES = [
+    ['Natural Pathway / Trail (Real-Scale Cut & Fill)', 'pathway'],
+    ['Steep Cliffside Pathway (Ledge + 3D Rock Gallery)', 'cliff_path'],
+    ['Organic Earthen Mound / Berm (Spline-Drawn)', 'mound'],
+    ['3D Limestone Cave Passage (Organic Chambers)', 'cave'],
     ['3D Elevation Ramp (Cut & Fill — Gizmo Y ↕)', 'grade'],
     ['3D SDF Rock Bridge / Overhang Arch', 'arch3d'],
     ['3D Mountain Tunnel Bore (Arched Roof + Flat Floor)', 'tunnel'],
@@ -861,7 +866,7 @@ class TerrainWorldStudioApp
     {
         this.pushUndoSnapshot();
         this.activeShowcaseId = ShowcaseId;
-        SeedLandformShowcaseWorld(this.world, ShowcaseId);
+        const SeedRes = SeedLandformShowcaseWorld(this.world, ShowcaseId);
         for (const R of this.world.regions) R.meshDirty = true;
         this.map2D.activeMaskLayerId = this.world.maskLayers[0]?.id || null;
         this.view3D.viewScope = 'all';
@@ -869,12 +874,25 @@ class TerrainWorldStudioApp
         if (Sc) Sc.value = 'all';
 
         const FirstReg = this.world.regions[0];
-        const FirstLf = FirstReg?.stack.find(L => L.type === 'landform');
-        this.activeLayerId = FirstLf?.id || FirstReg?.stack[0]?.id || null;
-        this.view3D.activeLandformLayerId = FirstLf?.id || null;
-        this.view3D.activeSplineLayerId = null;
+        const FocusLyr = (SeedRes?.focusLandformLayerId && FirstReg?.stack.find(L => L.id === SeedRes.focusLandformLayerId))
+                      || FirstReg?.stack.find(L => L.type === 'landform')
+                      || FirstReg?.stack[0] || null;
+        this.activeLayerId = FocusLyr?.id || null;
+        if (FocusLyr?.type === 'spline')
+        {
+            this.view3D.activeSplineLayerId = FocusLyr.id;
+            this.view3D.activeLandformLayerId = null;
+            this.view3D.selectedKnotIndex = Math.min(2, Math.max(0, (FocusLyr.points?.length || 1) - 1));
+            this.inspectorTab = 'spline';
+        }
+        else
+        {
+            const FirstLf = FocusLyr?.type === 'landform' ? FocusLyr : FirstReg?.stack.find(L => L.type === 'landform');
+            this.view3D.activeLandformLayerId = FirstLf?.id || null;
+            this.view3D.activeSplineLayerId = null;
+            this.inspectorTab = 'landforms';
+        }
 
-        this.inspectorTab = 'landforms';
         this._syncInspectorTabButtons();
         this._setRegionSelection(FirstReg.id, [FirstReg.id]);
         this.map2D.invalidateMaskCache();
@@ -957,26 +975,79 @@ class TerrainWorldStudioApp
         const P1x = Math.round(B.x + B.width * 0.50), P1z = Math.round(B.z + B.depth * 0.50);
         const P2x = Math.round(B.x + B.width * 0.72), P2z = Math.round(B.z + B.depth * 0.66);
 
-        // Give the middle knot a clear initial +42m uplift so the 3D spline & Y-Gizmo effect is immediately dramatic!
-        const MidBoost = SplineMode === 'arch3d' ? 68.0 : (SplineMode === 'canyon' || SplineMode === 'river' ? -18.0 : 42.0);
+        const H0 = SampleH(P0x, P0z);
+        const H1 = SampleH(P1x, P1z);
+        const H2 = SampleH(P2x, P2z);
+
+        // Calibrated real-world metric defaults & 3D knot elevation curves per spline mode
+        let WidthM = 110.0, AmtM = 34.0, InfScale = 1.0, Bank = 0.62, Meander = 0.08;
+        let Y0 = H0 + 6.0, Y1 = H1 + 42.0, Y2 = H2 + 6.0;
+
+        if (SplineMode === 'pathway')
+        {
+            WidthM = 4.5; AmtM = 1.5; InfScale = 1.35; Bank = 0.58; Meander = 0.08;
+            Y0 = H0; Y1 = H1; Y2 = H2;
+        }
+        else if (SplineMode === 'cliff_path')
+        {
+            WidthM = 8.5; AmtM = 9.0; InfScale = 1.45; Bank = 0.52; Meander = 0.04;
+            const BaseCliffY = Math.min(H0, H1, H2);
+            Y0 = BaseCliffY + 4.0;
+            Y1 = Math.max(BaseCliffY + 18.0, H1 - 12.0);
+            Y2 = Math.max(Y1 + 16.0, H2 + 4.0);
+        }
+        else if (SplineMode === 'mound')
+        {
+            WidthM = 38.0; AmtM = 24.0; InfScale = 1.75; Bank = 0.68; Meander = 0.10;
+            Y0 = H0; Y1 = H1; Y2 = H2;
+        }
+        else if (SplineMode === 'cave')
+        {
+            WidthM = 14.0; AmtM = 11.0; InfScale = 1.0; Bank = 0.35; Meander = 0.0;
+            const SlabSafe = (this.world.seaLevel ?? 0.0) + 4.0;
+            Y0 = Math.max(SlabSafe, H0 - 4.0);
+            Y1 = Math.max(SlabSafe, H1 - 18.0);
+            Y2 = Math.max(SlabSafe, H2 - 4.0);
+        }
+        else if (SplineMode === 'arch3d')
+        {
+            WidthM = 64.0; AmtM = 28.0; InfScale = 1.0;
+            Y0 = H0 + 6.0; Y1 = H1 + 68.0; Y2 = H2 + 6.0;
+        }
+        else if (SplineMode === 'tunnel')
+        {
+            WidthM = 28.0; AmtM = 16.0; InfScale = 1.0; Bank = 0.35; Meander = 0.0;
+            const SlabSafe = (this.world.seaLevel ?? 0.0) + 4.0;
+            Y0 = Math.max(SlabSafe, H0 - 2.0);
+            Y1 = Math.max(SlabSafe, H1 - 22.0);
+            Y2 = Math.max(SlabSafe, H2 - 2.0);
+        }
+        else if (SplineMode === 'canyon' || SplineMode === 'river')
+        {
+            Meander = SplineMode === 'river' ? 0.22 : 0.12;
+            Y0 = H0 + 4.0; Y1 = H1 - 18.0; Y2 = H2 + 4.0;
+        }
+
         const NewSpline = CreateTerrainLayer('spline', {
             name: CustomName,
             splineMode: SplineMode,
-            width: SplineMode === 'arch3d' ? 64.0 : 110.0,
-            amount: SplineMode === 'arch3d' ? 28.0 : 34.0,
-            bankSmooth: 0.62,
-            meander: SplineMode === 'river' ? 0.22 : 0.08,
+            width: WidthM,
+            amount: AmtM,
+            bankSmooth: Bank,
+            influenceScale: InfScale,
+            meander: Meander,
             falloff: { mode: 'none', distance: 120.0, edgeFloor: 1.0 },
             points: [
-                [P0x, P0z, Math.round((SampleH(P0x, P0z) + 6.0) * 10) / 10],
-                [P1x, P1z, Math.round((SampleH(P1x, P1z) + MidBoost) * 10) / 10],
-                [P2x, P2z, Math.round((SampleH(P2x, P2z) + 6.0) * 10) / 10]
+                [P0x, P0z, Math.round(Y0 * 10) / 10],
+                [P1x, P1z, Math.round(Y1 * 10) / 10],
+                [P2x, P2z, Math.round(Y2 * 10) / 10]
             ]
         });
 
         Reg.stack.push(NewSpline);
         this.activeLayerId = NewSpline.id;
         this.view3D.activeSplineLayerId = NewSpline.id;
+        this.view3D.activeLandformLayerId = null;
         this.view3D.selectedKnotIndex = 1; // Select middle knot so user can drag Green Y ↕ arrow immediately!
         this.view3D.showGizmo = true;
         this.select3DTool('spline');
@@ -2674,9 +2745,11 @@ class TerrainWorldStudioApp
         const XfGrp = MakePropertyGroup('3D Footprint & Gizmo Transform', 'Gizmo', `${Math.round(ActiveLf.height)}m`, true,
             'Drag handles in the 3D viewport (◇ Move · Green H ↕ · Cyan R · Amber AZ/WIND) or fine-tune numerically here.');
 
-        const HeightLabel = (ActiveLf.combine === 'sub' || ActiveLf.combine === 'smooth_sub') ? 'Carve Depth (H)' : 'Peak / Relief Height (H)';
+        const IsFineScaleLf = Spec.id === 'cliff_pathway' || Spec.id === 'cave_cavern';
+        const HeightLabel = Spec.id === 'cave_cavern' ? 'Vault / Cavern Height (H)'
+            : ((ActiveLf.combine === 'sub' || ActiveLf.combine === 'smooth_sub') ? 'Carve Depth (H)' : 'Peak / Relief Height (H)');
         const HCtrl = MakeSliderPillRow(
-            HeightLabel, 8, 560, 2, ActiveLf.height ?? Spec.defaultHeight, 0, 'm',
+            HeightLabel, IsFineScaleLf ? 4 : 8, 560, IsFineScaleLf ? 1 : 2, ActiveLf.height ?? Spec.defaultHeight, 0, 'm',
             V => { ActiveLf.height = V; TriggerRebuild(false); },
             () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
         );
@@ -2684,8 +2757,10 @@ class TerrainWorldStudioApp
         XfGrp.Body.appendChild(HCtrl);
 
         const RadCtrl = MakeSliderPillRow(
-            Spec.hasLength ? 'Corridor Half-Width (R)' : 'Footprint Radius (R)',
-            30, 1400, 5, ActiveLf.radius ?? Spec.defaultRadius, 0, 'm',
+            Spec.id === 'cliff_pathway' ? 'Trail Core Width (R)'
+                : (Spec.id === 'cave_cavern' ? 'Cave Chamber Half-Width (R)'
+                : (Spec.hasLength ? 'Corridor Half-Width (R)' : 'Footprint Radius (R)')),
+            IsFineScaleLf ? 4 : 20, 1400, IsFineScaleLf ? 1 : 5, ActiveLf.radius ?? Spec.defaultRadius, 0, 'm',
             V => { ActiveLf.radius = V; TriggerRebuild(false); },
             () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
         );
@@ -2695,7 +2770,7 @@ class TerrainWorldStudioApp
         if (Spec.hasLength)
         {
             const LenCtrl = MakeSliderPillRow(
-                'Strike / Corridor Length', 80, 2400, 10, ActiveLf.length ?? Spec.defaultLength, 0, 'm',
+                'Strike / Corridor Length', IsFineScaleLf ? 24 : 80, 2400, IsFineScaleLf ? 4 : 10, ActiveLf.length ?? Spec.defaultLength, 0, 'm',
                 V => { ActiveLf.length = V; TriggerRebuild(false); },
                 () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
             );
@@ -3066,18 +3141,40 @@ class TerrainWorldStudioApp
     --------------------------------------------------------------------------------------------------------------------------------------*/
     _buildSplineInspectorTab(Content, Region)
     {
-        const CreateCard = MakePropertyGroup('Create 3D Spline Landforms', 'Spline', '3D GIZMO', true,
-            'Add a 3D Spline Layer, click any numbered knot in 3D, and drag the Green Y ↕ Gizmo arrow UP or DOWN (or Shift+Click terrain to add knots).');
+        const CreateCard = MakePropertyGroup('Create Real-Scale 3D Spline Features', 'Spline', '3D GIZMO', true,
+            'Draw real-scale footpaths, steep cliffside 3D gallery pathways, organic earthen mounds, or 3D limestone caves. Click knots in 3D & drag Green Y ↕ (Shift+Click to place knots).');
 
-        const AddBtns = MakeEl('div', 'studio-btn-row');
-        const B1 = MakeEl('button', 'button export-button', '+ Graded Ramp / Ridge');
+        const Row1 = MakeEl('div', 'studio-btn-row');
+        const BtnCliff = MakeEl('button', 'button export-button', '+ Cliff Pathway (3D)');
+        BtnCliff.type = 'button';
+        BtnCliff.addEventListener('click', () => this.addNew3DSplineLayer('cliff_path', 'Steep Cliffside Pathway (3D)'));
+
+        const BtnPath = MakeEl('button', 'button export-button', '+ Natural Pathway');
+        BtnPath.type = 'button';
+        BtnPath.addEventListener('click', () => this.addNew3DSplineLayer('pathway', 'Natural Footpath (4.5m)'));
+        Row1.append(BtnCliff, BtnPath);
+
+        const Row2 = MakeEl('div', 'studio-btn-row');
+        const BtnMound = MakeEl('button', 'button', '+ Draw Mound (Spline)');
+        BtnMound.type = 'button';
+        BtnMound.addEventListener('click', () => this.addNew3DSplineLayer('mound', 'Organic Earthen Mound'));
+
+        const BtnCave = MakeEl('button', 'button', '+ 3D Limestone Cave');
+        BtnCave.type = 'button';
+        BtnCave.addEventListener('click', () => this.addNew3DSplineLayer('cave', '3D Limestone Cave Passage'));
+        Row2.append(BtnMound, BtnCave);
+
+        const Row3 = MakeEl('div', 'studio-btn-row');
+        const B1 = MakeEl('button', 'button', '+ Graded Ramp / Ridge');
         B1.type = 'button';
         B1.addEventListener('click', () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp'));
 
         const B2 = MakeEl('button', 'button', '+ 3D Rock Arch Bridge');
         B2.type = 'button';
         B2.addEventListener('click', () => this.addNew3DSplineLayer('arch3d', '3D Rock Arch Bridge'));
+        Row3.append(B1, B2);
 
+        const Row4 = MakeEl('div', 'studio-btn-row');
         const B2b = MakeEl('button', 'button', '+ 3D Mountain Tunnel');
         B2b.type = 'button';
         B2b.addEventListener('click', () => this.addNew3DSplineLayer('tunnel', '3D Mountain Tunnel Bore'));
@@ -3089,21 +3186,49 @@ class TerrainWorldStudioApp
             if (this.workspaceMode === '2d') this.setWorkspaceMode('split');
             this.select3DTool('spline-add');
         });
-        AddBtns.append(B1, B2);
-        CreateCard.Body.append(AddBtns);
-        const PlaceWrap = MakeEl('div', 'studio-btn-row');
-        PlaceWrap.append(B2b, B3);
-        CreateCard.Body.appendChild(PlaceWrap);
+        Row4.append(B2b, B3);
+
+        CreateCard.Body.append(Row1, Row2, Row3, Row4);
         Content.appendChild(CreateCard.Group);
 
-        // Find active spline layer on Region
-        let SplineLayer = Region.stack.find(L => L.id === this.activeLayerId && L.type === 'spline')
-                       || Region.stack.find(L => L.id === this.view3D.activeSplineLayerId && L.type === 'spline')
-                       || Region.stack.find(L => L.type === 'spline');
+        // Find all spline layers on Region & allow quick 1-click switching between them!
+        const AllSplines = Region.stack.filter(L => L && L.type === 'spline');
+        let SplineLayer = AllSplines.find(L => L.id === this.activeLayerId)
+                       || AllSplines.find(L => L.id === this.view3D.activeSplineLayerId)
+                       || AllSplines[0];
 
         if (!SplineLayer) return;
         this.view3D.activeSplineLayerId = SplineLayer.id;
         this.activeLayerId = SplineLayer.id;
+
+        if (AllSplines.length > 1)
+        {
+            const SplineListCard = MakePropertyGroup('Active Region Splines', 'Layers', `${AllSplines.length}`, true);
+            const KWrap = MakeEl('div', 'knot-list');
+            for (const Sp of AllSplines)
+            {
+                const Metrics = ComputeSplineCorridorMetrics(Sp);
+                const Row = MakeEl('div', 'knot-chip-row' + (Sp.id === SplineLayer.id ? ' active' : ''));
+                Row.append(
+                    MakeEl('span', 'knot-badge', (Sp.splineMode || 'grade').slice(0, 3).toUpperCase()),
+                    MakeEl('span', 'knot-coords', Sp.name || Sp.splineMode),
+                    MakeEl('span', 'knot-elev-pill', `${Metrics.widthM.toFixed(1)}m · ${Metrics.influenceScale.toFixed(2)}×`)
+                );
+                Row.addEventListener('click', () =>
+                {
+                    this.activeLayerId = Sp.id;
+                    this.view3D.activeSplineLayerId = Sp.id;
+                    this.view3D.activeLandformLayerId = null;
+                    this.view3D.selectedKnotIndex = Math.min(this.view3D.selectedKnotIndex | 0, Math.max(0, (Sp.points?.length || 1) - 1));
+                    this.select3DTool('spline');
+                    this.refreshChrome();
+                    this.rebuildInspector();
+                });
+                KWrap.appendChild(Row);
+            }
+            SplineListCard.Body.appendChild(KWrap);
+            Content.appendChild(SplineListCard.Group);
+        }
 
         const TriggerSpline = () =>
         {
@@ -3217,24 +3342,163 @@ class TerrainWorldStudioApp
             Content.appendChild(KnotGroup.Group);
         }
 
-        // Spline Corridor Profile Card
-        const ProfGroup = MakePropertyGroup(`${SplineLayer.name} · Profile`, 'Sliders', SplineLayer.splineMode.toUpperCase(), true);
-        ProfGroup.Body.appendChild(MakeSelectRow('Spline Landform Mode', SPLINE_MODES, SplineLayer.splineMode || 'grade', Val =>
+        // Spline Corridor Profile & Real-World Metric Influence Scale Card
+        const Mode = SplineLayer.splineMode || 'grade';
+        const ProfGroup = MakePropertyGroup(`${SplineLayer.name} · Profile & Scale`, 'Sliders', Mode.replace('_', ' ').toUpperCase(), true);
+        ProfGroup.Body.appendChild(MakeSelectRow('Spline Landform Mode', SPLINE_MODES, Mode, Val =>
         {
             this.pushUndoSnapshot();
             SplineLayer.splineMode = Val;
+            // Apply sensible real-world scale defaults when switching into fine-scale modes while leaving sliders 100% unlocked
+            if (Val === 'pathway' && SplineLayer.width > 30) { SplineLayer.width = 4.5; SplineLayer.amount = 1.5; SplineLayer.influenceScale = 1.35; }
+            else if (Val === 'cliff_path' && SplineLayer.width > 35) { SplineLayer.width = 8.5; SplineLayer.amount = 9.0; SplineLayer.influenceScale = 1.45; }
+            else if (Val === 'cave' && SplineLayer.width > 45) { SplineLayer.width = 14.0; SplineLayer.amount = 11.0; SplineLayer.influenceScale = 1.0; }
+            else if (Val === 'mound' && SplineLayer.width < 12) { SplineLayer.width = 38.0; SplineLayer.amount = 24.0; SplineLayer.influenceScale = 1.75; }
             TriggerSpline();
             this.refreshChrome();
             this.rebuildInspector();
         }));
-        ProfGroup.Body.appendChild(MakeSliderPillRow('Corridor Width', 16, 380, 2, SplineLayer.width, 0, 'm', V => { SplineLayer.width = V; TriggerSpline(); }));
-        ProfGroup.Body.appendChild(MakeSliderPillRow(
-            SplineLayer.splineMode === 'arch3d' ? 'Arch Tube Thickness'
-                : (SplineLayer.splineMode === 'tunnel' ? 'Tunnel Arch Clearance' : 'Height / Carve Depth'),
-            4, 220, 2, SplineLayer.amount, 0, 'm', V => { SplineLayer.amount = V; TriggerSpline(); }
-        ));
-        ProfGroup.Body.appendChild(MakeSliderPillRow('Bank Smoothness', 0.05, 1.0, 0.02, SplineLayer.bankSmooth, 2, 'w', V => { SplineLayer.bankSmooth = V; TriggerSpline(); }));
-        ProfGroup.Body.appendChild(MakeSliderPillRow('Natural Meander', 0.0, 0.8, 0.02, SplineLayer.meander, 2, 'w', V => { SplineLayer.meander = V; TriggerSpline(); }));
+
+        // Live Real-World Metric Telemetry Strip
+        const MetricsReadout = MakeEl('div', 'lf-volumetric-banner');
+        const SyncMetricsReadout = () =>
+        {
+            const M = ComputeSplineCorridorMetrics(SplineLayer);
+            MetricsReadout.textContent = `Real Scale · Core ${M.widthM.toFixed(1)}m · Influence ${M.influenceScale.toFixed(2)}× (Outer Span ${(M.outerRadiusM * 2.0).toFixed(1)}m)`;
+        };
+        SyncMetricsReadout();
+        ProfGroup.Body.appendChild(MetricsReadout);
+
+        // Quick 1-click Real-World Metric Scale Presets (sets sliders freely; zero locking!)
+        const ScaleRow = MakeEl('div', 'studio-btn-row');
+        const ScalePresets = [
+            ['Footpath 3.5m', 3.5, 1.25],
+            ['Cliff 8m', 8.0, 1.45],
+            ['Cave/Mound 18m', 18.0, 1.60],
+            ['Ridge 90m', 90.0, 1.00]
+        ];
+        for (const [Label, WVal, InfVal] of ScalePresets)
+        {
+            const Btn = MakeEl('button', 'button', Label);
+            Btn.type = 'button';
+            Btn.addEventListener('click', () =>
+            {
+                this.pushUndoSnapshot();
+                SplineLayer.width = WVal;
+                SplineLayer.influenceScale = InfVal;
+                TriggerSpline();
+                this.rebuildInspector();
+            });
+            ScaleRow.appendChild(Btn);
+        }
+        ProfGroup.Body.appendChild(ScaleRow);
+
+        const WidthLabel = Mode === 'pathway' ? 'Pathway Tread Width'
+            : Mode === 'cliff_path' ? 'Cliff Ledge Walkable Width'
+            : Mode === 'cave' ? 'Cave Passage Width'
+            : Mode === 'mound' ? 'Mound Core Crest Width'
+            : 'Core Corridor Width';
+        ProfGroup.Body.appendChild(MakeSliderPillRow(WidthLabel, 2.0, 360.0, 0.5, SplineLayer.width ?? 14.0, 1, 'm', V =>
+        {
+            SplineLayer.width = V;
+            SyncMetricsReadout();
+            TriggerSpline();
+        }));
+
+        ProfGroup.Body.appendChild(MakeSliderPillRow('Spline Influence Scale', 0.20, 4.00, 0.05, SplineLayer.influenceScale ?? 1.0, 2, '×', V =>
+        {
+            SplineLayer.influenceScale = V;
+            SyncMetricsReadout();
+            TriggerSpline();
+        }));
+
+        const AmtLabel = Mode === 'arch3d' ? 'Arch Tube Thickness'
+            : Mode === 'tunnel' ? 'Tunnel Arch Clearance'
+            : Mode === 'cave' ? 'Cave Vault Height'
+            : Mode === 'cliff_path' ? 'Gallery Ceiling Clearance'
+            : Mode === 'mound' ? 'Mound Peak Height'
+            : Mode === 'pathway' ? 'Path Camber / Cut Depth'
+            : 'Height / Carve Depth';
+        const AmtMin = Mode === 'pathway' ? 0.5 : (Mode === 'cave' || Mode === 'cliff_path' ? 3.0 : 4.0);
+        const AmtStep = Mode === 'pathway' ? 0.5 : 1.0;
+        ProfGroup.Body.appendChild(MakeSliderPillRow(AmtLabel, AmtMin, 220, AmtStep, SplineLayer.amount ?? 12.0, Mode === 'pathway' ? 1 : 0, 'm', V =>
+        {
+            SplineLayer.amount = V;
+            TriggerSpline();
+        }));
+
+        ProfGroup.Body.appendChild(MakeSliderPillRow('Bank / Shoulder Smoothness', 0.05, 1.0, 0.02, SplineLayer.bankSmooth ?? 0.58, 2, 'w', V =>
+        {
+            SplineLayer.bankSmooth = V;
+            SyncMetricsReadout();
+            TriggerSpline();
+        }));
+
+        // Zero-Dead-Control: Natural Meander applies to heightfield spline modes only
+        if (Mode !== 'cave' && Mode !== 'tunnel' && Mode !== 'arch3d')
+        {
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Natural Meander', 0.0, 0.8, 0.02, SplineLayer.meander ?? 0.08, 2, 'w', V =>
+            {
+                SplineLayer.meander = V;
+                TriggerSpline();
+            }));
+        }
+
+        // Contextual Zero-Dead-Control sliders for Steep Cliffside Pathway
+        if (Mode === 'cliff_path')
+        {
+            ProfGroup.Body.appendChild(MakeSliderPillRow('3D Cliff Gallery Overhang', 0.0, 1.0, 0.02, SplineLayer.cliffGallery ?? 0.68, 2, 'w', V =>
+            {
+                SplineLayer.cliffGallery = V;
+                TriggerSpline();
+            }));
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Retaining Buttress Steepness', 0.10, 1.0, 0.02, SplineLayer.retainingDepth ?? 0.80, 2, 'w', V =>
+            {
+                SplineLayer.retainingDepth = V;
+                TriggerSpline();
+            }));
+        }
+
+        // Contextual Zero-Dead-Control sliders for Organic Spline-Drawn Mound
+        if (Mode === 'mound')
+        {
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Crown Roundness', 0.0, 1.0, 0.02, SplineLayer.moundRoundness ?? 0.55, 2, 'w', V =>
+            {
+                SplineLayer.moundRoundness = V;
+                TriggerSpline();
+            }));
+            ProfGroup.Body.appendChild(MakeSliderPillRow('End Tail Taper', 0.0, 1.0, 0.02, SplineLayer.endTaper ?? 0.72, 2, 'w', V =>
+            {
+                SplineLayer.endTaper = V;
+                TriggerSpline();
+            }));
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Organic Knoll Lumpiness', 0.0, 1.0, 0.02, SplineLayer.lumpiness ?? 0.30, 2, 'w', V =>
+            {
+                SplineLayer.lumpiness = V;
+                TriggerSpline();
+            }));
+        }
+
+        // Contextual Zero-Dead-Control sliders for True-3D Limestone Cave Spline
+        if (Mode === 'cave')
+        {
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Limestone Wall Roughness', 0.0, 1.0, 0.02, SplineLayer.caveRoughness ?? 0.52, 2, 'w', V =>
+            {
+                SplineLayer.caveRoughness = V;
+                TriggerSpline();
+            }));
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Cavern Chamber Swell', 0.0, 1.5, 0.02, SplineLayer.chamberSwell ?? 0.65, 2, 'w', V =>
+            {
+                SplineLayer.chamberSwell = V;
+                TriggerSpline();
+            }));
+            ProfGroup.Body.appendChild(MakeSliderPillRow('Walkable Floor Flatness', 0.0, 1.0, 0.02, SplineLayer.floorFlatness ?? 0.76, 2, 'w', V =>
+            {
+                SplineLayer.floorFlatness = V;
+                TriggerSpline();
+            }));
+        }
+
         Content.appendChild(ProfGroup.Group);
     }
 

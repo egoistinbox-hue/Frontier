@@ -6,7 +6,7 @@
 // Brush / Erase / Smooth / Polygon Landmass Drawing, Interactive Draw/Move/8-Handle Resize Terrain Bounds Boxes, Multi-Select, & 2D Splines.
 
 import { MASK_TILE_RES, TILE_WORLD_METERS } from './WorldMask2D.js';
-import { SampleCatmullRomPolyline, CreateTerrainLayer } from './TerrainLayerStack.js';
+import { SampleCatmullRomPolyline, CreateTerrainLayer, GetLandformSpec, GetLandformFamily, ResolveLandformInstances } from './TerrainLayerStack.js';
 
 const HANDLE_NAMES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
@@ -1102,6 +1102,59 @@ export class WorldMap2DCanvas
             // SW
             Ctx.moveTo(X0 + CornerLen, Y1); Ctx.lineTo(X0, Y1); Ctx.lineTo(X0, Y1 - CornerLen);
             Ctx.stroke();
+        }
+
+        // Draw Basic Landform Generator footprints & azimuth ticks inside this region
+        for (const Layer of Region.stack)
+        {
+            if (Layer.type !== 'landform' || !Layer.enabled) continue;
+            const Spec = GetLandformSpec(Layer.archetype);
+            const Fam = GetLandformFamily(Spec.family);
+            const Resolved = ResolveLandformInstances(Layer);
+
+            Ctx.save();
+            for (let I = 0; I < Resolved.instances.length; ++I)
+            {
+                const Inst = Resolved.instances[I];
+                const [Px, Py] = this.worldToScreen(Inst.cx, Inst.cz);
+                const RxPx = (Spec.hasLength ? Inst.length * 0.5 : Inst.radius) * this.pixelsPerMeter;
+                const RzPx = (Spec.hasLength ? Inst.radius : Inst.radius * Inst.aspect) * this.pixelsPerMeter;
+                if (Math.max(RxPx, RzPx) < 2.5) continue;
+
+                Ctx.save();
+                Ctx.translate(Px, Py);
+                Ctx.rotate(Inst.azRad);
+                Ctx.beginPath();
+                if (Spec.hasLength)
+                {
+                    Ctx.roundRect(-RxPx, -RzPx, RxPx * 2, RzPx * 2, Math.min(RxPx, RzPx) * 0.55);
+                }
+                else
+                {
+                    Ctx.ellipse(0, 0, RxPx, RzPx, 0, 0, Math.PI * 2);
+                }
+                Ctx.strokeStyle = Fam.accent || '#e8c27a';
+                Ctx.globalAlpha = I === 0 ? (IsPrimary ? 0.85 : 0.45) : 0.38;
+                Ctx.lineWidth = I === 0 ? 1.8 : 1.2;
+                if (Layer.combine === 'sub' || Layer.combine === 'smooth_sub') Ctx.setLineDash([4, 3]);
+                Ctx.stroke();
+
+                // Small strike/wind azimuth indicator line on primary instance
+                if (I === 0 && RxPx > 10)
+                {
+                    Ctx.setLineDash([]);
+                    Ctx.beginPath();
+                    Ctx.moveTo(0, 0);
+                    Ctx.lineTo(RxPx * 0.85, 0);
+                    Ctx.stroke();
+                    Ctx.beginPath();
+                    Ctx.arc(0, 0, 2.8, 0, Math.PI * 2);
+                    Ctx.fillStyle = Fam.accent || '#eff4cf';
+                    Ctx.fill();
+                }
+                Ctx.restore();
+            }
+            Ctx.restore();
         }
 
         // Draw Spline Landform overlays inside this region

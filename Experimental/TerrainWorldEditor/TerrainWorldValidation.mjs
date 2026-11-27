@@ -17,7 +17,19 @@ import {
     ComputeRegionBaseSignature,
     ExportWorldTerrainsObj,
     ExportWorldTerrainsBinaryStl,
-    SeedThreeDemoTerrains
+    SeedThreeDemoTerrains,
+    LANDFORM_FAMILIES,
+    LANDFORM_CATALOG,
+    LANDFORM_PLACEMENT_MODES,
+    LANDFORM_COMBINE_MODES,
+    LANDFORM_SHOWCASE_WORLDS,
+    GetLandformSpec,
+    CreateLandformLayer,
+    ResolveLandformInstances,
+    EvaluateLandformLayerAt,
+    ApplyLandformCombine,
+    CollectVolumetricLandformPrimitives,
+    SeedLandformShowcaseWorld
 } from './Engine/TerrainLayerStack.js';
 import { evalHierarchical90Crazing3D } from './Engine/RockCliff/Core/SpatialNoise3D.js';
 import {
@@ -2633,5 +2645,457 @@ Suite('36. Pure-SDF Crystals (crystal_prism), Upgraded Basalt Colonnades (colonn
     }
 });
 
-console.log(`\nAll ${Passed}/36 Open-World SDF Terrain & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
+// =========================================================================================================================================
+// 37. Basic Landform Generators: All 6 Families, All 20 Archetypes, Geological Morphology & Zero-Dead-Controls Sweep
+// =========================================================================================================================================
+Suite('37. Basic Landforms: all 6 families & 20 archetypes evaluate finite relief, exact morphology & zero dead controls', () =>
+{
+    assert.equal(LANDFORM_FAMILIES.length, 6, 'Must define all 6 geological landform families');
+    assert.equal(LANDFORM_CATALOG.length, 20, 'Must define all 20 basic landform archetypes');
+    assert.equal(LANDFORM_PLACEMENT_MODES.length, 4, 'Must define 4 placement modes (single, range, cluster, field)');
+    assert.equal(LANDFORM_COMBINE_MODES.length, 7, 'Must define 7 composable SDF combine modes');
+
+    const MakeTestRegion = (BaseElev = 140.0, ExtraLayers = []) =>
+    {
+        const W = new WorldMask2D();
+        const M = W.addMaskLayer({ name: 'Test Plateau', color: '#58b982' });
+        W.paintCapsuleMeters(M, [-10, 0], [10, 0], 1150, 'paint', 1.0, 0.0, 1001);
+        const Reg = W.addTerrainRegion({
+            name: 'Landform Test Region',
+            maskLayerId: M.id,
+            bounds: { x: -750, z: -750, width: 1500, depth: 1500 },
+            resolution: 72,
+            baseElevation: BaseElev,
+            slabThickness: 8.0,
+            shorelineBevel: 14.0,
+            stack: ExtraLayers
+        });
+        return { W, Reg };
+    };
+
+    const SampleRegionH = (Reg, Wx, Wz) =>
+    {
+        const Rt = Reg.runtime;
+        const B = Reg.bounds;
+        const Fx = ((Wx - B.x) / B.width) * (Rt.nx - 1);
+        const Fz = ((Wz - B.z) / B.depth) * (Rt.nz - 1);
+        const Ix = Math.max(0, Math.min(Rt.nx - 1, Math.round(Fx)));
+        const Iz = Math.max(0, Math.min(Rt.nz - 1, Math.round(Fz)));
+        return Rt.heights[Iz * Rt.nx + Ix];
+    };
+
+    // A. Evaluate EVERY SINGLE ONE of the 20 archetypes inside a real TerrainRegion + Zero-Dead-Controls Sweep!
+    for (const Spec of LANDFORM_CATALOG)
+    {
+        const IsCarve = Spec.defaultCombine === 'sub' || Spec.defaultCombine === 'smooth_sub';
+        const BaseE = IsCarve ? 180.0 : 25.0;
+        const Lyr = CreateLandformLayer(Spec.id, {
+            centerX: 0,
+            centerZ: 0,
+            falloff: { mode: 'none', distance: 120, edgeFloor: 1.0 }
+        });
+
+        const { W, Reg } = MakeTestRegion(BaseE, [Lyr]);
+        const Rt = EvaluateTerrainRegion(W, Reg);
+
+        let MinH = Infinity, MaxH = -Infinity;
+        for (let I = 0; I < Rt.heights.length; ++I)
+        {
+            const H = Rt.heights[I];
+            assert.ok(Number.isFinite(H), `${Spec.id} produced non-finite height at cell ${I}`);
+            if (Rt.coverage[I] > 0.5)
+            {
+                if (H < MinH) MinH = H;
+                if (H > MaxH) MaxH = H;
+            }
+        }
+        assert.ok(MaxH - MinH > 5.0, `${Spec.id} must produce measurable topographic relief > 5m (got ${(MaxH - MinH).toFixed(2)}m)`);
+
+        // Zero-Dead-Controls Sweep: perturb EVERY SINGLE declared parameter in Spec.controls & confirm non-zero SDF delta!
+        const SampleGrid = (TestLyr) =>
+        {
+            const Resolved = ResolveLandformInstances(TestLyr);
+            const Out = [];
+            const Span = Math.max(TestLyr.radius || 200, (TestLyr.length || 0) * 0.55) * 1.15;
+            const Steps = 11;
+            for (let Iz = 0; Iz < Steps; ++Iz)
+            {
+                const Wz = -Span + (2 * Span * Iz) / (Steps - 1);
+                for (let Ix = 0; Ix < Steps; ++Ix)
+                {
+                    const Wx = -Span + (2 * Span * Ix) / (Steps - 1);
+                    Out.push(EvaluateLandformLayerAt(TestLyr, Resolved, Wx, Wz).value);
+                }
+            }
+            return Out;
+        };
+
+        const BaseSig = SampleGrid(Lyr);
+        const BaseVol = Spec.hasVolumetric3D ? CollectVolumetricLandformPrimitives(Reg, Rt) : [];
+
+        for (const Ctrl of Spec.controls)
+        {
+            const DefVal = Spec.defaultParams[Ctrl.key];
+            const FarVal = Math.abs(Ctrl.max - DefVal) >= Math.abs(DefVal - Ctrl.min) ? Ctrl.max : Ctrl.min;
+            const AltLyr = CreateLandformLayer(Spec.id, {
+                centerX: 0,
+                centerZ: 0,
+                falloff: { mode: 'none', distance: 120, edgeFloor: 1.0 },
+                params: { ...Spec.defaultParams, [Ctrl.key]: FarVal }
+            });
+            const AltSig = SampleGrid(AltLyr);
+            let MaxDiff = 0.0;
+            for (let K = 0; K < BaseSig.length; ++K) MaxDiff = Math.max(MaxDiff, Math.abs(BaseSig[K] - AltSig[K]));
+
+            // Volumetric-only parameters (e.g. overhangAmount, waveFlutes) directly drive True-3D volumetric evalSdf(x,y,z)!
+            if (MaxDiff < 1e-4 && Spec.hasVolumetric3D)
+            {
+                const { W: W2, Reg: Reg2 } = MakeTestRegion(BaseE, [AltLyr]);
+                const Rt2 = EvaluateTerrainRegion(W2, Reg2);
+                const AltVol = CollectVolumetricLandformPrimitives(Reg2, Rt2);
+                let MaxVolDiff = 0.0;
+                if (BaseVol.length !== AltVol.length)
+                {
+                    // E.g. setting overhangAmount to 0.0 cleanly disables the 3D volumetric overhang primitive!
+                    MaxVolDiff = 100.0;
+                }
+                else if (BaseVol.length > 0 && AltVol.length > 0)
+                {
+                    const P1 = BaseVol[0], P2 = AltVol[0];
+                    const N = 7;
+                    for (let Iy = 0; Iy < N; ++Iy)
+                    {
+                        const Py = P1.minY + ((P1.maxY - P1.minY) * (Iy + 0.5)) / N;
+                        for (let Iz = 0; Iz < N; ++Iz)
+                        {
+                            const Pz = P1.minZ + ((P1.maxZ - P1.minZ) * (Iz + 0.5)) / N;
+                            for (let Ix = 0; Ix < N; ++Ix)
+                            {
+                                const Px = P1.minX + ((P1.maxX - P1.minX) * (Ix + 0.5)) / N;
+                                const D1 = P1.evalSdf(Px, Py, Pz, -20.0);
+                                const D2 = P2.evalSdf(Px, Py, Pz, -20.0);
+                                MaxVolDiff = Math.max(MaxVolDiff, Math.abs(D1 - D2));
+                            }
+                        }
+                    }
+                }
+                assert.ok(MaxVolDiff > 1e-3, `${Spec.id} control "${Ctrl.key}" must affect either heightfield SDF or True-3D Volumetric evalSdf (volDiff=${MaxVolDiff})`);
+            }
+            else
+            {
+                assert.ok(MaxDiff > 1e-4, `${Spec.id} control "${Ctrl.key}" (default ${DefVal} -> ${FarVal}) is DEAD (maxDiff=${MaxDiff})`);
+            }
+        }
+    }
+
+    // B. Exact Geological Morphology Checks
+    // 1. Stratovolcano summit caldera bowl MUST be lower than surrounding crater rim!
+    {
+        const Volc = CreateLandformLayer('stratovolcano', {
+            centerX: 0, centerZ: 0, radius: 420, height: 260, rockDetail: 0.0,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { slopeCurve: 1.55, craterRadius: 0.28, craterDepth: 0.50, rimLipBoost: 0.16, resurgentDome: 0.0, ridgeCount: 8, ridgeSharpness: 0.0, breachDepth: 0.0 }
+        });
+        const { W, Reg } = MakeTestRegion(20.0, [Volc]);
+        EvaluateTerrainRegion(W, Reg);
+        const CenterH = SampleRegionH(Reg, 0, 0);
+        const RimH = SampleRegionH(Reg, 420 * 0.28, 0);
+        const FootH = SampleRegionH(Reg, 420 * 0.95, 0);
+        assert.ok(RimH > CenterH + 30.0, `Stratovolcano crater rim (${RimH.toFixed(1)}m) must rise > 30m above summit caldera floor (${CenterH.toFixed(1)}m)`);
+        assert.ok(RimH > FootH + 100.0, `Stratovolcano crater rim (${RimH.toFixed(1)}m) must rise well above base foot (${FootH.toFixed(1)}m)`);
+    }
+
+    // 2. Mesa Plateau MUST have a flat caprock summit and steep rim drop!
+    {
+        const Mesa = CreateLandformLayer('mesa_plateau', {
+            centerX: 0, centerZ: 0, radius: 380, height: 180, rockDetail: 0.0,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { footprintRoundness: 3.0, lobing: 0.0, cliffSteepness: 0.92, talusRatio: 0.26, terraceSteps: 4, terraceStrength: 0.0, dipDeg: 0.0 }
+        });
+        const { W, Reg } = MakeTestRegion(15.0, [Mesa]);
+        EvaluateTerrainRegion(W, Reg);
+        const H0 = SampleRegionH(Reg, 0, 0);
+        const H1 = SampleRegionH(Reg, 120, 0);
+        const HOut = SampleRegionH(Reg, 410, 0);
+        assert.ok(Math.abs(H0 - H1) < 12.0, `Mesa caprock summit must stay flat across inner plateau (|${H0.toFixed(1)} - ${H1.toFixed(1)}| < 12m)`);
+        assert.ok(H0 - HOut > 120.0, `Mesa caprock (${H0.toFixed(1)}m) must tower cleanly above base plain (${HOut.toFixed(1)}m)`);
+    }
+
+    // 3. Barchan Dune MUST exhibit windward gentle stoss slope vs steeper downwind slipface!
+    {
+        const Dune = CreateLandformLayer('barchan_dune', {
+            centerX: 0, centerZ: 0, radius: 280, height: 70, azimuth: 0, rockDetail: 0.0,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { slipfaceSteepness: 0.90, crestSharpness: 0.84, hornLength: 0.72, hornCurvature: 0.66, duneWaves: 1 }
+        });
+        const Res = ResolveLandformInstances(Dune);
+        const CrestX = -0.22 * 280;
+        const HUpwind = EvaluateLandformLayerAt(Dune, Res, CrestX - 95, 0).value;
+        const HCrest = EvaluateLandformLayerAt(Dune, Res, CrestX, 0).value;
+        const HLeeClose = EvaluateLandformLayerAt(Dune, Res, CrestX + 95, 0).value;
+        assert.ok(HCrest > 45.0, `Barchan crest height must be substantial (${HCrest.toFixed(1)}m)`);
+        assert.ok(HUpwind > HLeeClose + 15.0, `Barchan gentle windward stoss slope (${HUpwind.toFixed(1)}m) must stay >15m higher at equal distance from crest than steep 34° downwind slipface (${HLeeClose.toFixed(1)}m)`);
+    }
+
+    // 4. Impact Crater MUST be bipolar: depressed center bowl AND raised ejecta rim!
+    {
+        const Crater = CreateLandformLayer('impact_crater', {
+            centerX: 0, centerZ: 0, radius: 340, height: 110, rockDetail: 0.0,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { craterRadius: 0.52, craterDepth: 0.80, rimHeight: 0.52, centralPeak: 0.0, terraceSteps: 2, ejectaRays: 0.15 }
+        });
+        const { W, Reg } = MakeTestRegion(110.0, [Crater]);
+        EvaluateTerrainRegion(W, Reg);
+        const HCenter = SampleRegionH(Reg, 0, 0);
+        const HRim = SampleRegionH(Reg, 340 * 0.54, 0);
+        assert.ok(HCenter < 110.0 - 30.0, `Impact crater bowl (${HCenter.toFixed(1)}m) must depress well below 110m plain`);
+        assert.ok(HRim > 110.0 + 18.0, `Impact crater rim (${HRim.toFixed(1)}m) must uplift clearly above 110m plain`);
+    }
+
+    // 5. Tectonic Thrust Fault Scarp MUST create an elevation step across the strike line!
+    {
+        const Scarp = CreateLandformLayer('fault_scarp', {
+            centerX: 0, centerZ: 0, radius: 340, length: 900, height: 150, azimuth: 0, rockDetail: 0.0,
+            falloff: { mode: 'none', distance: 100, edgeFloor: 1.0 },
+            params: { cliffSteepness: 0.90, rolloverAmp: 0.22, ridgeCount: 6, ridgeSharpness: 0.2, strikeBow: 0.0 }
+        });
+        const { W, Reg } = MakeTestRegion(40.0, [Scarp]);
+        EvaluateTerrainRegion(W, Reg);
+        const HS1 = SampleRegionH(Reg, 0, 120);
+        const HS2 = SampleRegionH(Reg, 0, -140);
+        assert.ok(Math.abs(HS1 - HS2) > 50.0, `Fault scarp must create a strong >50m tectonic elevation step across strike (|${HS1.toFixed(1)} - ${HS2.toFixed(1)}|)`);
+    }
+});
+
+// =========================================================================================================================================
+// 38. Placement Modes (Single/Range/Cluster/Field), 7 SDF Combine Modes, BaseSignature Staleness & JSON/OBJ/STL Round-Trip
+// =========================================================================================================================================
+Suite('38. Basic Landforms: all 4 placement modes, 7 SDF combine modes, BaseSignature staleness & JSON/OBJ/STL round-trip', () =>
+{
+    // A. All 4 Placement Modes produce deterministic instances & tight valid AABBs
+    for (const Mode of ['single', 'range', 'cluster', 'field'])
+    {
+        const Lyr = CreateLandformLayer('alpine_peak', {
+            placementMode: Mode,
+            instanceCount: 6,
+            spread: 760,
+            centerX: 100,
+            centerZ: -80,
+            azimuth: 35,
+            seed: 4242
+        });
+        const R1 = ResolveLandformInstances(Lyr);
+        const R2 = ResolveLandformInstances(Lyr);
+        const ExpectedCount = Mode === 'single' ? 1 : 6;
+        assert.equal(R1.instances.length, ExpectedCount, `Placement mode "${Mode}" must generate ${ExpectedCount} instance(s)`);
+        assert.deepEqual(R1, R2, `Placement mode "${Mode}" must be 100% deterministic for same seed`);
+
+        for (const Inst of R1.instances)
+        {
+            assert.ok(Inst.cx >= R1.bounds.minX && Inst.cx <= R1.bounds.maxX, `${Mode} instance cx must lie inside AABB`);
+            assert.ok(Inst.cz >= R1.bounds.minZ && Inst.cz <= R1.bounds.maxZ, `${Mode} instance cz must lie inside AABB`);
+        }
+    }
+
+    // B. Smooth Union vs Raw Max produces genuinely elevated smooth alluvial saddle between overlapping features
+    const HBase = 20.0;
+    const SlabBot = -6.5;
+    const SmoothVal = ApplyLandformCombine(65.0, HBase, SlabBot, 45.0, { combine: 'smooth_union', smoothK: 28.0 }, 1.0, 1.0);
+    const MaxVal = ApplyLandformCombine(65.0, HBase, SlabBot, 45.0, { combine: 'max', smoothK: 28.0 }, 1.0, 1.0);
+    assert.ok(SmoothVal > MaxVal + 4.0, `Smooth Union (${SmoothVal.toFixed(2)}m) must build smooth fillet above sharp Max (${MaxVal.toFixed(2)}m)`);
+
+    // Smooth Subtract vs Hard Subtract smooths the cut floor transition
+    const HardSub = ApplyLandformCombine(120.0, HBase, SlabBot, 40.0, { combine: 'sub', smoothK: 25.0 }, 1.0, 1.0);
+    const SmoothSub = ApplyLandformCombine(120.0, HBase, SlabBot, 40.0, { combine: 'smooth_sub', smoothK: 25.0 }, 1.0, 1.0);
+    assert.ok(HardSub < 120.0 && SmoothSub < 120.0, 'Both sub and smooth_sub must carve below current terrain');
+
+    // All 7 combine modes return finite results
+    for (const [, ModeId] of LANDFORM_COMBINE_MODES)
+    {
+        const Res = ApplyLandformCombine(80.0, HBase, SlabBot, 55.0, { combine: ModeId, smoothK: 22.0 }, 1.0, 1.0);
+        assert.ok(Number.isFinite(Res), `Combine mode "${ModeId}" must return finite elevation`);
+    }
+
+    // C. ComputeRegionBaseSignature reacts to landform mutations + JSON/OBJ/STL round-trip
+    const W = new WorldMask2D();
+    const M = W.addMaskLayer({ name: 'Composite Island', color: '#58b982' });
+    W.paintCapsuleMeters(M, [-10, 0], [10, 0], 900, 'paint', 1.0, 0.0, 1002);
+    const Lf1 = CreateLandformLayer('alpine_peak', { centerX: -120, centerZ: 0, radius: 340, height: 220, placementMode: 'range', instanceCount: 3, spread: 420 });
+    const Lf2 = CreateLandformLayer('v_gorge', { centerX: 120, centerZ: 40, radius: 130, length: 650, height: 90, combine: 'smooth_sub' });
+    const Reg = W.addTerrainRegion({
+        name: 'Composite World',
+        maskLayerId: M.id,
+        bounds: { x: -800, z: -800, width: 1600, depth: 1600 },
+        resolution: 64,
+        baseElevation: 45.0,
+        slabThickness: 6.5,
+        stack: [Lf1, Lf2]
+    });
+
+    const RtBefore = EvaluateTerrainRegion(W, Reg);
+    const Sig1 = ComputeRegionBaseSignature(W, Reg);
+    Lf1.height = 285.0;
+    const Sig2 = ComputeRegionBaseSignature(W, Reg);
+    assert.notEqual(Sig1, Sig2, 'BaseSignature must change when a Basic Landform height changes');
+    Lf1.params.ridgeSharpness = 0.95;
+    const Sig3 = ComputeRegionBaseSignature(W, Reg);
+    assert.notEqual(Sig2, Sig3, 'BaseSignature must change when an archetype-specific landform parameter changes');
+    Lf1.height = 220.0;
+    Lf1.params.ridgeSharpness = GetLandformSpec('alpine_peak').defaultParams.ridgeSharpness;
+
+    // JSON round-trip preserves landform heightfield identically!
+    const JsonCopy = JSON.parse(JSON.stringify(W.toJSON()));
+    const W2 = new WorldMask2D();
+    W2.loadFromJSON(JsonCopy);
+    const RtAfter = EvaluateTerrainRegion(W2, W2.regions[0]);
+    let MaxRoundTripErr = 0.0;
+    for (let I = 0; I < RtBefore.heights.length; ++I)
+    {
+        MaxRoundTripErr = Math.max(MaxRoundTripErr, Math.abs(RtBefore.heights[I] - RtAfter.heights[I]));
+    }
+    assert.ok(MaxRoundTripErr < 1e-3, `JSON round-trip must reproduce exact landform heights (err=${MaxRoundTripErr})`);
+
+    // Export .OBJ & Binary .STL cleanly
+    const ObjRes = ExportWorldTerrainsObj(W, [Reg]);
+    assert.ok(ObjRes.text.includes('v ') && ObjRes.text.includes('f ') && ObjRes.triangleCount > 500, 'Landform terrain must export valid Wavefront .OBJ');
+    const StlRes = ExportWorldTerrainsBinaryStl(W, [Reg]);
+    assert.ok(StlRes.bytes.byteLength > 84 + 50 * 100 && StlRes.triangleCount > 500, 'Landform terrain must export valid binary .STL triangles');
+});
+
+// =========================================================================================================================================
+// 39. True-3D Volumetric Landform Overhangs & Shafts (Slot Canyon, Karst Cenote, Sea-Cliff Wave Notch) via Dual-Surface-Nets
+// =========================================================================================================================================
+Suite('39. True-3D Volumetric Landforms (Slot Canyon, Karst Cenote, Sea-Cliff Notch) extract genuine downward overhang normals', () =>
+{
+    const VolumetricCases = [
+        {
+            id: 'slot_canyon',
+            kind: 'slot_canyon',
+            baseElev: 165.0,
+            opts: { centerX: 0, centerZ: 0, radius: 135, length: 680, height: 115, azimuth: 15, params: { meanderAmp: 0.45, meanderFreq: 2.2, floorRatio: 0.22, cliffSteepness: 0.92, overhangAmount: 0.78, waveFlutes: 3 } }
+        },
+        {
+            id: 'karst_cenote',
+            kind: 'karst_cenote',
+            baseElev: 120.0,
+            opts: { centerX: 0, centerZ: 0, radius: 195, height: 95, params: { shaftRadius: 0.52, funnelSlope: 0.30, cliffSteepness: 0.92, overhangAmount: 0.76, lobing: 0.16 } }
+        },
+        {
+            id: 'sea_cliff_headland',
+            kind: 'sea_cliff_headland',
+            baseElev: 18.0,
+            opts: { centerX: 0, centerZ: 0, radius: 260, length: 560, height: 135, azimuth: 0, params: { cliffSteepness: 0.92, platformWidth: 0.30, platformHeight: 0.12, overhangAmount: 0.78, lobing: 0.20, terraceSteps: 4 } }
+        }
+    ];
+
+    for (const Case of VolumetricCases)
+    {
+        const W = new WorldMask2D();
+        const M = W.addMaskLayer({ name: Case.id, color: '#a78bfa' });
+        W.paintCapsuleMeters(M, [-10, 0], [10, 0], 720, 'paint', 1.0, 0.0, 1003);
+        const Lyr = CreateLandformLayer(Case.id, {
+            ...Case.opts,
+            falloff: { mode: 'none', distance: 80, edgeFloor: 1.0 }
+        });
+        const Reg = W.addTerrainRegion({
+            name: `Vol3D ${Case.id}`,
+            maskLayerId: M.id,
+            bounds: { x: -550, z: -550, width: 1100, depth: 1100 },
+            resolution: 72,
+            baseElevation: Case.baseElev,
+            slabThickness: 8.0,
+            shorelineBevel: 12.0,
+            stack: [Lyr]
+        });
+
+        const Rt = EvaluateTerrainRegion(W, Reg);
+        const Prims = CollectVolumetricLandformPrimitives(Reg, Rt);
+        assert.ok(Prims.length >= 1 && Prims[0].kind === Case.kind,
+            `${Case.id} must emit volumetric 3D SDF primitive of kind "${Case.kind}"`);
+
+        const Mesh = ExtractRegionTriangleMesh(W, Reg);
+        assert.ok(Mesh.triangleCount > 1200, `${Case.id} must extract complete mesh with Dual-Surface-Nets bricks (${Mesh.triangleCount} tris)`);
+
+        // Verify zero NaN vertices AND count genuine downward-facing overhang/ceiling normals (Ny < -0.15)
+        let OverhangVerts = 0;
+        for (let I = 0; I < Mesh.vertexCount; ++I)
+        {
+            const Px = Mesh.positions[I * 3], Py = Mesh.positions[I * 3 + 1], Pz = Mesh.positions[I * 3 + 2];
+            const Ny = Mesh.normals[I * 3 + 1];
+            assert.ok(Number.isFinite(Px) && Number.isFinite(Py) && Number.isFinite(Pz), `${Case.id} mesh contains NaN vertex`);
+            if (Ny < -0.15 && Py > (W.seaLevel - Reg.slabThickness + 2.5)) OverhangVerts++;
+        }
+        assert.ok(OverhangVerts >= 12,
+            `${Case.id} Dual-Surface-Nets volume must extract genuine True-3D overhanging roof/lip geometry (Ny < -0.15 verts=${OverhangVerts})`);
+    }
+});
+
+// =========================================================================================================================================
+// 40. All 7 Curated Landform Showcase Worlds + Priority-Flood Crater Lakes + Erosion Physics Compatibility + UI Structural Verification
+// =========================================================================================================================================
+Suite('40. All 7 Landform Showcase Worlds, Priority-Flood crater lake, erosion physics compatibility & studio UI wiring', () =>
+{
+    assert.equal(LANDFORM_SHOWCASE_WORLDS.length, 7, 'Must ship 7 curated Landform Showcase Worlds');
+
+    for (const Sw of LANDFORM_SHOWCASE_WORLDS)
+    {
+        const W = new WorldMask2D();
+        SeedLandformShowcaseWorld(W, Sw.id);
+        assert.ok(W.regions.length >= 1, `Showcase "${Sw.id}" must seed at least 1 Terrain Region`);
+
+        let TotalTris = 0;
+        let TotalLandforms = 0;
+        for (const Reg of W.regions)
+        {
+            assert.ok(Reg.runtime && Reg.runtime.heights.length > 0, `Showcase "${Sw.id}" region "${Reg.name}" must be pre-evaluated`);
+            TotalLandforms += Reg.stack.filter(L => L.type === 'landform').length;
+            for (let I = 0; I < Reg.runtime.heights.length; ++I)
+            {
+                assert.ok(Number.isFinite(Reg.runtime.heights[I]), `Showcase "${Sw.id}" has non-finite elevation`);
+            }
+            const Mesh = ExtractRegionTriangleMesh(W, Reg);
+            TotalTris += Mesh.triangleCount;
+        }
+        assert.ok(TotalLandforms >= 2, `Showcase "${Sw.id}" must compose multiple Basic Landform Generators (got ${TotalLandforms})`);
+        assert.ok(TotalTris > 2000, `Showcase "${Sw.id}" must extract rich triangle geometry (got ${TotalTris} tris)`);
+
+        // Verify Volcanic Caldera showcase solves a real upland hydrostatic crater lake via Priority-Flood!
+        if (Sw.id === 'volcanic-caldera')
+        {
+            const Water = ComputeHydrostaticWaterBodies(W, W.regions[0]);
+            assert.ok(Water.lakeCells >= 8 && Water.triangleCount >= 8,
+                `Volcanic Caldera showcase must solve an upland hydrostatic crater lake (cells=${Water.lakeCells}, tris=${Water.triangleCount})`);
+        }
+    }
+
+    // Verify Erosion Physics Engine runs cleanly on top of a Basic Landform region with zero NaN
+    const WE = new WorldMask2D();
+    SeedLandformShowcaseWorld(WE, 'alpine-fjord');
+    const RegE = WE.regions[0];
+    const EState = CreateErosionState(WE, RegE);
+    for (let Day = 0; Day < 4; ++Day) StepErosionDay(EState);
+    ApplyErosionToRegion(WE, RegE, EState);
+    for (let I = 0; I < RegE.runtime.heights.length; ++I)
+    {
+        assert.ok(Number.isFinite(RegE.runtime.heights[I]), 'Erosion physics on Basic Landform terrain must never produce NaN');
+    }
+
+    // Verify Studio HTML, CSS, Viewport & Editor wiring for Basic Landform Generators
+    const Html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+    const Css = readFileSync(new URL('./TerrainWorldEditor.css', import.meta.url), 'utf8');
+    const EditorJs = readFileSync(new URL('./TerrainWorldEditor.js', import.meta.url), 'utf8');
+    const View3dJs = readFileSync(new URL('./Engine/TerrainOceanViewport.js', import.meta.url), 'utf8');
+    const Map2dJs = readFileSync(new URL('./Engine/WorldMap2DCanvas.js', import.meta.url), 'utf8');
+
+    assert.ok(Html.includes('./Engine/BasicLandformEngine.js'), 'index.html importmap must register ./Engine/BasicLandformEngine.js');
+    assert.ok(Html.includes('data-itab="landforms"'), 'index.html must expose Landforms inspector tab');
+    assert.ok(Html.includes('pill-add-landform'), 'index.html must expose + Add Landform quick button');
+    assert.ok(Html.includes('landform-family-bar'), 'index.html must expose Landform Family filter bar');
+    assert.ok(Css.includes('.landform-family-bar') && Css.includes('.lf-volumetric-banner'), 'CSS must style landform family chips & volumetric banner');
+    assert.ok(EditorJs.includes('_buildLandformsInspectorTab') && EditorJs.includes('loadLandformShowcaseWorld'), 'Editor must wire Landforms inspector & showcase loader');
+    assert.ok(View3dJs.includes('_renderLandformGizmoOverlay') && View3dJs.includes('_hitTestLandformGizmo'), '3D viewport must render & hit-test interactive landform gizmos');
+    assert.ok(Map2dJs.includes('ResolveLandformInstances'), '2D map canvas must render landform footprint overlays');
+});
+
+console.log(`\nAll ${Passed}/40 Open-World SDF Terrain, Basic Landform Generators & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
 

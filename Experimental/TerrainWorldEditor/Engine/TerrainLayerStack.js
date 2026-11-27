@@ -10,6 +10,43 @@ import {
     buildFracturedFormation,
     bakeFracturedFormationQefMesh
 } from './RockCliff/PureSdfFractureEngine.js';
+import {
+    LANDFORM_FAMILIES,
+    LANDFORM_CATALOG,
+    LANDFORM_PLACEMENT_MODES,
+    LANDFORM_COMBINE_MODES,
+    LANDFORM_SHOWCASE_WORLDS,
+    GetLandformSpec,
+    GetLandformFamily,
+    CreateLandformLayer,
+    ResolveLandformInstances,
+    EvaluateLandformLayerAt,
+    ApplyLandformCombine,
+    CollectVolumetricLandformPrimitives,
+    SeedLandformShowcaseWorld as _SeedLandformShowcaseWorldRaw
+} from './BasicLandformEngine.js';
+
+export {
+    LANDFORM_FAMILIES,
+    LANDFORM_CATALOG,
+    LANDFORM_PLACEMENT_MODES,
+    LANDFORM_COMBINE_MODES,
+    LANDFORM_SHOWCASE_WORLDS,
+    GetLandformSpec,
+    GetLandformFamily,
+    CreateLandformLayer,
+    ResolveLandformInstances,
+    EvaluateLandformLayerAt,
+    ApplyLandformCombine,
+    CollectVolumetricLandformPrimitives
+};
+
+export function SeedLandformShowcaseWorld(World, ShowcaseId = 'universal-archipelago')
+{
+    const Res = _SeedLandformShowcaseWorldRaw(World, ShowcaseId, EvaluateTerrainRegion);
+    StitchAdjacentRegionBorders(World);
+    return Res;
+}
 
 const RockFormationQefCache = new WeakMap();
 
@@ -204,7 +241,9 @@ export const BOUNDARY_FALLOFF_MODES = [
 
 export const COMBINE_MODES = [
     ['Add (Uplift)', 'add'],
+    ['Smooth Union (Alluvial Blend)', 'smooth_union'],
     ['Subtract (Carve)', 'sub'],
+    ['Smooth Subtract (Rounded Rim)', 'smooth_sub'],
     ['Max (Union)', 'max'],
     ['Min (Clip)', 'min'],
     ['Blend (Lerp)', 'lerp']
@@ -286,11 +325,12 @@ export function EvaluateBoundaryFalloff(InlandDistM, BoxEdgeDistM, FalloffSpec)
                                         COMPOSABLE LAYER STACK SPECIFICATION & FACTORY
 ==========================================================================================================================================*/
 export const LAYER_TYPE_META = {
-    multifractal: { label: 'Hybrid Multifractal', badge: 'FRACTAL', glyph: 'Mountain', accent: '#e8c27a' },
-    ridged:       { label: 'Ridged Mountain Noise', badge: 'RIDGE', glyph: 'Activity', accent: '#f0935b' },
-    voronoi:      { label: 'Voronoi / Mesa Blocks', badge: 'CELLULAR', glyph: 'Boxes', accent: '#5ac8fa' },
-    billow:       { label: 'Billow Hills & Dunes', badge: 'FOLDED', glyph: 'Wind', accent: '#a3d977' },
-    terrace:      { label: 'Terrace & Strata', badge: 'STRATA', glyph: 'Layers', accent: '#d6a2e8' },
+    landform:       { label: 'Basic SDF Landform', badge: 'LANDFORM', glyph: 'Volcano', accent: '#f0935b' },
+    multifractal:   { label: 'Hybrid Multifractal', badge: 'FRACTAL', glyph: 'Mountain', accent: '#e8c27a' },
+    ridged:         { label: 'Ridged Mountain Noise', badge: 'RIDGE', glyph: 'Activity', accent: '#f0935b' },
+    voronoi:        { label: 'Voronoi / Mesa Blocks', badge: 'CELLULAR', glyph: 'Boxes', accent: '#5ac8fa' },
+    billow:         { label: 'Billow Hills & Dunes', badge: 'FOLDED', glyph: 'Wind', accent: '#a3d977' },
+    terrace:        { label: 'Terrace & Strata', badge: 'STRATA', glyph: 'Layers', accent: '#d6a2e8' },
     spline:         { label: 'Spline Landform', badge: 'SPLINE', glyph: 'Spline', accent: '#3ec46d' },
     sculpt:         { label: 'SDF Sculpt Layer', badge: 'SCULPT', glyph: 'Brush', accent: '#ff7b7b' },
     rock_formation: { label: 'Pure-SDF Fractured Rock', badge: 'SDF ROCK', glyph: 'Boxes', accent: '#eff4cf' }
@@ -298,6 +338,10 @@ export const LAYER_TYPE_META = {
 
 export function CreateTerrainLayer(Type = 'multifractal', Overrides = {})
 {
+    if (Type === 'landform')
+    {
+        return CreateLandformLayer(Overrides.archetype || 'stratovolcano', Overrides);
+    }
     const Meta = LAYER_TYPE_META[Type] || LAYER_TYPE_META.multifractal;
     const Base = {
         id: Overrides.id || MakeTerrainUid('lyr'),
@@ -634,6 +678,13 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
             PolyBounds = [PMinX - MaxReach, PMinZ - MaxReach, PMaxX + MaxReach, PMaxZ + MaxReach];
         }
 
+        // Precompute Basic Landform instance list & tight world AABB
+        let LandformResolved = null;
+        if (Type === 'landform')
+        {
+            LandformResolved = ResolveLandformInstances(Layer);
+        }
+
         // Ensure sculpt layer buffer matches grid resolution (bilinearly resampling if resolution changed)
         if (Type === 'sculpt')
         {
@@ -763,6 +814,23 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                     continue;
                 }
 
+                if (Type === 'landform')
+                {
+                    const LB = LandformResolved.bounds;
+                    if (Wx < LB.minX || Wx > LB.maxX || Wz < LB.minZ || Wz > LB.maxZ) continue;
+                    const LRes = EvaluateLandformLayerAt(Layer, LandformResolved, Wx, Wz);
+                    if (!LRes.active) continue;
+                    const ShoreProtect = (Layer.falloff?.mode === 'none')
+                        ? (D2 <= 0.0 ? 1.0 : 0.0)
+                        : (ShoreBevel > 0.5 ? Smoothstep(0.0, Math.min(ShoreBevel, 22.0), InlandDist) : 1.0);
+                    Heights[Idx] = ApplyLandformCombine(CurH, BaseTop, SlabBottom, LRes.value, Layer, MaskW, ShoreProtect);
+                    if (LRes.waterMask > 0.02)
+                    {
+                        WaterChannel[Idx] = Math.max(WaterChannel[Idx], LRes.waterMask * MaskW);
+                    }
+                    continue;
+                }
+
                 // Procedural Landform Generators (Multifractal, Ridged, Voronoi, Billow)
                 const Scale = Math.max(0.2, Number(Layer.scale) || 2.2);
                 let NxCoord = (Wx / RefSpan) * Scale;
@@ -823,8 +891,11 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                 }
 
                 const Delta = Signal * (Number(Layer.amplitude) || 120.0);
+                const SmoothK = Math.max(2.0, Number(Layer.smoothK) || 24.0);
                 let TargetH = CurH + Delta;
                 if (Combine === 'sub') TargetH = Math.max(SlabBottom + 0.5, CurH - Math.abs(Delta));
+                else if (Combine === 'smooth_union') TargetH = SdfSmoothMaxPoly(CurH, BaseTop + Delta, SmoothK);
+                else if (Combine === 'smooth_sub') TargetH = Math.max(SlabBottom + 0.5, SdfSmoothMinPoly(CurH, CurH - Math.abs(Delta), SmoothK * 0.65));
                 else if (Combine === 'max') TargetH = Math.max(CurH, BaseTop + Delta);
                 else if (Combine === 'min') TargetH = Math.min(CurH, BaseTop + Delta);
                 else if (Combine === 'lerp') TargetH = BaseTop + Delta;
@@ -902,7 +973,11 @@ export function ComputeRegionBaseSignature(World, Region)
     for (const Lyr of Region.stack)
     {
         if (!Lyr || Lyr.name === 'Erosion Baked Surface') continue;
-        MixStr(`|l:${Lyr.id}:${Lyr.type}:${Lyr.enabled ? 1 : 0}:${Lyr.opacity ?? 1}:${Lyr.combine || 'add'}:${Lyr.amplitude ?? 0}:${Lyr.scale ?? 0}:${Lyr.seed ?? 0}:${Lyr.octaves ?? 0}:${Lyr.gain ?? 0}:${Lyr.warp ?? 0}:${Lyr.sharpness ?? 0}:${Lyr.azimuth ?? 0}:${Lyr.variant ?? 0}:${Lyr.bedCount ?? 0}:${Lyr.strength ?? 0}:${Lyr.dipDeg ?? 0}:${Lyr.splineMode || ''}:${Lyr.width ?? 0}:${Lyr.amount ?? 0}:${Lyr.strokeCount ?? 0}:${Lyr.falloff?.mode || ''}:${Lyr.falloff?.distance ?? 0}:${Lyr.falloff?.edgeFloor ?? 0}`);
+        MixStr(`|l:${Lyr.id}:${Lyr.type}:${Lyr.enabled ? 1 : 0}:${Lyr.opacity ?? 1}:${Lyr.combine || 'add'}:${Lyr.smoothK ?? 0}:${Lyr.amplitude ?? 0}:${Lyr.scale ?? 0}:${Lyr.seed ?? 0}:${Lyr.octaves ?? 0}:${Lyr.gain ?? 0}:${Lyr.warp ?? 0}:${Lyr.sharpness ?? 0}:${Lyr.azimuth ?? 0}:${Lyr.variant ?? 0}:${Lyr.bedCount ?? 0}:${Lyr.strength ?? 0}:${Lyr.dipDeg ?? 0}:${Lyr.splineMode || ''}:${Lyr.width ?? 0}:${Lyr.amount ?? 0}:${Lyr.strokeCount ?? 0}:${Lyr.falloff?.mode || ''}:${Lyr.falloff?.distance ?? 0}:${Lyr.falloff?.edgeFloor ?? 0}`);
+        if (Lyr.type === 'landform')
+        {
+            MixStr(`|lf:${Lyr.archetype || ''}:${Lyr.placementMode || 'single'}:${Lyr.instanceCount ?? 1}:${Lyr.spread ?? 0}:${Lyr.rangeCurvature ?? 0}:${Lyr.scaleTaper ?? 0}:${Lyr.jitter ?? 0}:${Lyr.centerX ?? 0}:${Lyr.centerZ ?? 0}:${Lyr.radius ?? 0}:${Lyr.length ?? 0}:${Lyr.height ?? 0}:${Lyr.aspectRatio ?? 1}:${Lyr.rockDetail ?? 0}:${JSON.stringify(Lyr.params || {})}`);
+        }
         if (Array.isArray(Lyr.points))
         {
             for (const Pt of Lyr.points) MixStr(`(${Pt[0]},${Pt[1]},${Pt[2] ?? 0})`);
@@ -1228,9 +1303,9 @@ export function ExtractRegionTriangleMesh(World, Region, Options = {})
         }
     }
 
-    // Identify snapped 2D grid footprints of true 3D volumetric features (caves, smooth overhangs & 3D mountain tunnel bores)
+    // Identify snapped 2D grid footprints of true 3D volumetric features (caves, smooth overhangs, tunnel bores & 3D undercut landforms)
     // so their overlapping 2.5D top surface quads are replaced cleanly by watertight 3D Dual-Surface-Nets patches!
-    const VolBricks = BuildVolumetric3DBricks(Region, Rt);
+    const VolBricks = BuildVolumetric3DBricks(World, Region, Rt);
     const SuppressTopQuad = VolBricks.length > 0 ? new Uint8Array((Nx - 1) * (Nz - 1)) : null;
     if (SuppressTopQuad)
     {
@@ -1638,13 +1713,14 @@ function TunnelSegSdf3D(Px, Py, Pz, Ax, Ay, Az, Bx, By, Bz, HalfWidth, ArchHeigh
     return Math.max(RoofOrWall, FloorD);
 }
 
-function BuildVolumetric3DBricks(Region, Rt)
+function BuildVolumetric3DBricks(World, Region, Rt)
 {
     const Ops = Region.sdf3DOps || [];
     const TunnelLayers = (Region.stack || []).filter(
         L => L && L.enabled !== false && L.type === 'spline' && L.splineMode === 'tunnel' && L.points && L.points.length >= 2
     );
-    if (Ops.length === 0 && TunnelLayers.length === 0) return [];
+    const VolLandforms = CollectVolumetricLandformPrimitives(Region, Rt, World?.seaLevel ?? 0.0);
+    if (Ops.length === 0 && TunnelLayers.length === 0 && VolLandforms.length === 0) return [];
 
     const B = Region.bounds;
     const Nx = Rt.nx, Nz = Rt.nz;
@@ -1659,7 +1735,7 @@ function BuildVolumetric3DBricks(Region, Rt)
             minX: Math.min(Op.ax, Op.bx) - R, maxX: Math.max(Op.ax, Op.bx) + R,
             minY: Math.min(Op.ay, Op.by) - R, maxY: Math.max(Op.ay, Op.by) + R,
             minZ: Math.min(Op.az, Op.bz) - R, maxZ: Math.max(Op.az, Op.bz) + R,
-            ops: [Op], tunnelSegs: []
+            ops: [Op], tunnelSegs: [], landformPrims: []
         });
     }
 
@@ -1687,11 +1763,21 @@ function BuildVolumetric3DBricks(Region, Rt)
             minX: MinX - PadXZ, maxX: MaxX + PadXZ,
             minY: MinY - PadY,  maxY: MaxY + PadY,
             minZ: MinZ - PadXZ, maxZ: MaxZ + PadXZ,
-            ops: [], tunnelSegs: Segs
+            ops: [], tunnelSegs: Segs, landformPrims: []
         });
     }
 
-    // Merge overlapping AABB clusters so neighboring cave/overhang/tunnel strokes share one watertight Dual-Surface-Nets brick!
+    for (const Lp of VolLandforms)
+    {
+        PrimBoxes.push({
+            minX: Lp.minX - MarginM, maxX: Lp.maxX + MarginM,
+            minY: Lp.minY - 8.0,     maxY: Lp.maxY + 8.0,
+            minZ: Lp.minZ - MarginM, maxZ: Lp.maxZ + MarginM,
+            ops: [], tunnelSegs: [], landformPrims: [Lp]
+        });
+    }
+
+    // Merge overlapping AABB clusters so neighboring cave/overhang/tunnel/landform volumes share one watertight Dual-Surface-Nets brick!
     let Merged = true;
     while (Merged && PrimBoxes.length > 1)
     {
@@ -1709,6 +1795,7 @@ function BuildVolumetric3DBricks(Region, Rt)
                     A.minZ = Math.min(A.minZ, C.minZ); A.maxZ = Math.max(A.maxZ, C.maxZ);
                     A.ops.push(...C.ops);
                     A.tunnelSegs.push(...C.tunnelSegs);
+                    A.landformPrims.push(...C.landformPrims);
                     PrimBoxes.splice(J, 1);
                     Merged = true;
                     break;
@@ -1747,7 +1834,8 @@ function BuildVolumetric3DBricks(Region, Rt)
             wy0: Math.max(Rt.slabBottom - 2.0, Math.min(SurfMinY, Box.minY) - StepX * 2.0),
             wy1: Math.max(SurfMaxY, Box.maxY) + StepX * 2.0,
             ops: Box.ops,
-            tunnelSegs: Box.tunnelSegs
+            tunnelSegs: Box.tunnelSegs,
+            landformPrims: Box.landformPrims
         });
     }
     return OutBricks;
@@ -1823,6 +1911,13 @@ function AppendVolumetric3DBricksMesh(World, Region, Rt, Bricks, PosList, NormLi
                 const Seg = Brk.tunnelSegs[I];
                 const TunD = TunnelSegSdf3D(Px, Py, Pz, Seg.ax, Seg.ay, Seg.az, Seg.bx, Seg.by, Seg.bz, Seg.halfW, Seg.archH);
                 D = SdfSmoothMaxPoly(D, -TunD, Seg.blend);
+            }
+            if (Brk.landformPrims && Brk.landformPrims.length > 0)
+            {
+                for (let I = 0; I < Brk.landformPrims.length; ++I)
+                {
+                    D = Brk.landformPrims[I].evalSdf(Px, Py, Pz, D);
+                }
             }
             // Keep thin-slab underside floor intact
             D = Math.max(D, (SlabBottom + 0.35) - Py);

@@ -51,7 +51,13 @@ export const GlyphPaths = {
     SplitFault: '<path d="M3 19L5.5 7 11.5 4.5 9.8 10.2l2.1 2.1L9.5 19z"/><path d="M14.5 5.5L20 8.5 21 19.5h-7.5l2.2-6.2-2.1-2.1z"/><path d="M13 2.5l-2.5 19" stroke-dasharray="2 2"/>',
     Boolean:   '<circle cx="9.2" cy="11.2" r="5.8"/><circle cx="14.8" cy="12.8" r="5.8" stroke-dasharray="2.4 2"/>',
     Crystal:   '<path d="M12 2.5 18.2 7.2v9.6L12 21.5 5.8 16.8V7.2z"/><path d="M12 2.5v19M5.8 7.2 12 10.4l6.2-3.2M5.8 16.8 12 13.6l6.2 3.2"/>',
-    LinearDike:'<path d="M2.5 19.5 6.2 6.8 12.4 4.2l3.4 2.4 5.7 12.9z"/><path d="M12.4 4.2 9.4 19.5M15.8 6.6 13.8 19.5"/>'
+    LinearDike:'<path d="M2.5 19.5 6.2 6.8 12.4 4.2l3.4 2.4 5.7 12.9z"/><path d="M12.4 4.2 9.4 19.5M15.8 6.6 13.8 19.5"/>',
+    Volcano:   '<path d="M3 20 9 8.5c1.5 1.2 4.5 1.2 6 0L21 20H3z"/><path d="M9 8.5c1.2-.8 4.8-.8 6 0"/><path d="M10.5 5.5c.6-1.2 2.4-1.2 3 0"/>',
+    Mesa:      '<path d="M2.5 20 6 12.5h1.5L9 7.5h6l1.5 5H18L21.5 20z"/><path d="M6.8 15.5h10.4"/>',
+    Canyon:    '<path d="M2.5 6h5.5l2 13h4l2-13h5.5"/><path d="M6.5 11.5h2.3M15.2 11.5h2.3"/>',
+    Fault:     '<path d="M3 18h7.5L13.5 7H21"/><path d="M3 13.5h6M14.8 11.5H21"/><path d="M10 21l4.5-18" stroke-dasharray="2.2 2"/>',
+    Dune:      '<path d="M2.5 19c4-6 8-10 11.5-10.5-1.5 3.5.5 7 7.5 10.5H2.5z"/><path d="M14 8.5c-.8 4.2 1.2 7.2 4.2 10.5"/>',
+    Atoll:     '<ellipse cx="12" cy="12.5" rx="9" ry="5.5"/><ellipse cx="12" cy="12.5" rx="4.5" ry="2.4"/><path d="M19.8 11.8l1.6-.4"/>'
 };
 
 export function ConstructGlyph(Name, ClassName = 'glyph')

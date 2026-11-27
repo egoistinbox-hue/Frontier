@@ -12,6 +12,15 @@ import {
     BOUNDARY_FALLOFF_MODES,
     COMBINE_MODES,
     LAYER_TYPE_META,
+    LANDFORM_FAMILIES,
+    LANDFORM_CATALOG,
+    LANDFORM_PLACEMENT_MODES,
+    LANDFORM_COMBINE_MODES,
+    LANDFORM_SHOWCASE_WORLDS,
+    GetLandformSpec,
+    GetLandformFamily,
+    CreateLandformLayer,
+    SeedLandformShowcaseWorld,
     CreateTerrainLayer,
     EvaluateTerrainRegion,
     StitchAdjacentRegionBorders,
@@ -110,20 +119,22 @@ const SPLINE_MODES = [
 
 const AUTOSAVE_DB_NAME = 'frontier-terrain-world-studio-db';
 const AUTOSAVE_STORE = 'workspaces';
-const AUTOSAVE_KEY = 'autosave-v1';
+const AUTOSAVE_KEY = 'autosave-v2';
 
 class TerrainWorldStudioApp
 {
     constructor()
     {
         this.world = new WorldMask2D();
-        SeedThreeDemoTerrains(this.world);
+        this.activeShowcaseId = 'universal-archipelago';
+        this.landformFamilyFilter = 'all';
+        SeedLandformShowcaseWorld(this.world, this.activeShowcaseId);
 
         const UrlParams = new URLSearchParams(window.location.search);
         const ReqWs = UrlParams.get('ws') || UrlParams.get('mode');
-        this.workspaceMode = (ReqWs === '2d' || ReqWs === '3d' || ReqWs === 'split' || ReqWs === 'fracture' || ReqWs === 'rock2') ? ReqWs : 'rock2';
-        this.inspectorTab = this.workspaceMode === 'rock2' ? 'rock2' : (this.workspaceMode === 'fracture' ? 'fracture' : 'layers');
-        this.outlinerFilter = 'all';  // 'all' | 'terrains' | 'splines' | 'masks'
+        this.workspaceMode = (ReqWs === '2d' || ReqWs === '3d' || ReqWs === 'split' || ReqWs === 'fracture' || ReqWs === 'rock2') ? ReqWs : '3d';
+        this.inspectorTab = this.workspaceMode === 'rock2' ? 'rock2' : (this.workspaceMode === 'fracture' ? 'fracture' : 'landforms');
+        this.outlinerFilter = 'all';  // 'all' | 'terrains' | 'landforms' | 'splines'
         this.outlinerSearch = '';
 
         // ---- Pure-SDF Brittle Fracture & Thermal Cracking Lab State (Rock Formation 1.0) ----
@@ -173,10 +184,11 @@ class TerrainWorldStudioApp
 
         this.activeRegionId = this.world.regions[0]?.id || null;
         this.selectedRegionIds = new Set(this.activeRegionId ? [this.activeRegionId] : []);
-        // Select the Spline layer by default on Terrain 01 so the 3D Gizmo is immediately visible & ready!
+        // Select the primary Landform (or Spline) layer on Region 01 so the 3D Gizmo is immediately active!
         const InitReg = this.world.regions[0];
+        const InitLandform = InitReg?.stack.find(L => L.type === 'landform');
         const InitSpline = InitReg?.stack.find(L => L.type === 'spline');
-        this.activeLayerId = InitSpline?.id || InitReg?.stack[0]?.id || null;
+        this.activeLayerId = InitLandform?.id || InitSpline?.id || InitReg?.stack[0]?.id || null;
 
         this.undoStack = [];
         this.redoStack = [];
@@ -273,10 +285,53 @@ class TerrainWorldStudioApp
                     const Primary = NextSet.has(Region.id) ? Region.id : Array.from(NextSet)[0];
                     this._setRegionSelection(Primary, Array.from(NextSet));
                 },
+                onLandformSelectedIn3D: (_Region, Layer) =>
+                {
+                    this.activeLayerId = Layer.id;
+                    this.view3D.activeLandformLayerId = Layer.id;
+                    this.view3D.activeSplineLayerId = null;
+                    this.inspectorTab = 'landforms';
+                    this._syncInspectorTabButtons();
+                    this.refreshChrome();
+                    this.rebuildInspector();
+                },
+                onBeforeLandformGizmoEdit: () => this.pushUndoSnapshot(),
+                onLandformGizmoLive: (Region, Layer) =>
+                {
+                    this.activeLayerId = Layer.id;
+                    this.view3D.activeLandformLayerId = Layer.id;
+                    EvaluateTerrainRegion(this.world, Region, Layer.id);
+                    Region.meshDirty = true;
+                    this.map2D.invalidateRegionPreview(Region.id);
+                    this.map2D.requestRedraw();
+                    // Live-sync open sliders without rebuilding DOM mid-drag!
+                    if (this._lfLiveSliders)
+                    {
+                        this._lfLiveSliders.cx?.SetValue(Layer.centerX);
+                        this._lfLiveSliders.cz?.SetValue(Layer.centerZ);
+                        this._lfLiveSliders.height?.SetValue(Layer.height);
+                        this._lfLiveSliders.radius?.SetValue(Layer.radius);
+                        this._lfLiveSliders.azimuth?.SetValue(Layer.azimuth);
+                        this._lfLiveSliders.length?.SetValue(Layer.length);
+                        this._lfLiveSliders.spread?.SetValue(Layer.spread);
+                    }
+                },
+                onLandformGizmoFinished: (Region, Layer) =>
+                {
+                    EvaluateTerrainRegion(this.world, Region, Layer.id);
+                    StitchAdjacentRegionBorders(this.world);
+                    Region.meshDirty = true;
+                    this.map2D.invalidateRegionPreview(Region.id);
+                    this.map2D.requestRedraw();
+                    this.refreshChrome();
+                    this.rebuildInspector();
+                    this._scheduleAutosave();
+                },
                 onSplineKnotSelected: (_Region, Layer, KnotIndex) =>
                 {
                     this.activeLayerId = Layer.id;
                     this.view3D.activeSplineLayerId = Layer.id;
+                    this.view3D.activeLandformLayerId = null;
                     this.view3D.selectedKnotIndex = KnotIndex;
                     this.inspectorTab = 'spline';
                     this._syncInspectorTabButtons();
@@ -336,7 +391,8 @@ class TerrainWorldStudioApp
             }
         );
 
-        if (InitSpline) this.view3D.activeSplineLayerId = InitSpline.id;
+        if (InitLandform) this.view3D.activeLandformLayerId = InitLandform.id;
+        else if (InitSpline) this.view3D.activeSplineLayerId = InitSpline.id;
 
         // 3. Initialize Pure-SDF Brittle Fracture & QEF Dual-Contour 3D Lab Viewport
         const FracCanvas = document.getElementById('CanvasFracture');
@@ -632,88 +688,91 @@ class TerrainWorldStudioApp
             return;
         }
 
-        if (TitleEl) TitleEl.textContent = 'Add Layer & Splines';
-
-        const QuickItems = [
-            {
-                title: '+ 3D Graded Spline (Gizmo)',
-                desc: 'Ramp, ridge, road or pass — drag Green Y ↕ arrow up/down',
-                glyph: 'Gizmo',
-                badge: '3D GIZMO',
-                featured: true,
-                action: () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp')
-            },
-            {
-                title: '+ 3D Rock Arch Bridge Spline',
-                desc: 'True 3D overhanging rock arch swept along 3D knots',
-                glyph: 'Arch',
-                badge: '3D SDF',
-                featured: false,
-                action: () => this.addNew3DSplineLayer('arch3d', '3D Rock Arch Bridge')
-            },
-            {
-                title: '+ 3D Mountain Tunnel Bore',
-                desc: 'Arched roof + flat highway floor carved through mountains',
-                glyph: 'Arch',
-                badge: 'TUNNEL',
-                featured: false,
-                action: () => this.addNew3DSplineLayer('tunnel', '3D Mountain Tunnel Bore')
-            },
-            {
-                title: '+ River / Canyon Spline',
-                desc: 'Carve 3D graded river valley or gorge channel',
-                glyph: 'Spline',
-                badge: 'SPLINE',
-                featured: false,
-                action: () => this.addNew3DSplineLayer('river', '3D River Valley Spline')
-            },
-            {
-                title: '+ Hybrid Multifractal',
-                desc: 'Alluvial valleys + craggy continental peaks',
-                glyph: 'Mountain',
-                badge: 'FRACTAL',
-                featured: false,
-                action: () => this.addProceduralLayer('multifractal')
-            },
-            {
-                title: '+ Ridged Mountain Spine',
-                desc: 'Sharp tectonic arête crests & directional chains',
-                glyph: 'Activity',
-                badge: 'RIDGE',
-                featured: false,
-                action: () => this.addProceduralLayer('ridged')
-            },
-            {
-                title: '+ Voronoi Cliff Mesa',
-                desc: 'Stepped basalt blocks, craters, or fracture ridges',
-                glyph: 'Boxes',
-                badge: 'CELLULAR',
-                featured: false,
-                action: () => this.addProceduralLayer('voronoi')
-            },
-            {
-                title: '+ Stratigraphic Terraces',
-                desc: 'Geological dipping benches & canyon strata',
-                glyph: 'Layers',
-                badge: 'STRATA',
-                featured: false,
-                action: () => this.addProceduralLayer('terrace')
-            }
-        ];
-        if (CountEl) CountEl.textContent = String(QuickItems.length);
-
-        for (const Item of QuickItems)
+        // Terrain Studio: Basic Landform Generators (6 Families, 20 Archetypes) + Splines & Noise Layers
+        const FamBar = document.getElementById('landform-family-bar');
+        const Q = (this.outlinerSearch || '').toLowerCase();
+        if (FamBar)
         {
-            const Btn = MakeEl('button', 'quick-add-card' + (Item.featured ? ' featured-spline' : ''));
+            FamBar.innerHTML = '';
+            const FamChips = [
+                { id: 'all', name: 'All 20', accent: '#eff4cf' },
+                ...LANDFORM_FAMILIES.map(F => ({ id: F.id, name: F.shortLabel, accent: F.accent })),
+                { id: 'splines_noise', name: 'Splines & Noise', accent: '#5ac8fa' }
+            ];
+            for (const Fc of FamChips)
+            {
+                const Btn = MakeEl('button', 'landform-fam-chip' + (this.landformFamilyFilter === Fc.id ? ' active' : ''));
+                Btn.type = 'button';
+                const Dot = MakeEl('span', 'landform-fam-dot');
+                Dot.style.background = Fc.accent;
+                Btn.append(Dot, document.createTextNode(Fc.name));
+                Btn.addEventListener('click', () =>
+                {
+                    this.landformFamilyFilter = Fc.id;
+                    this._buildQuickAddLibrary();
+                });
+                FamBar.appendChild(Btn);
+            }
+        }
+
+        if (this.landformFamilyFilter === 'splines_noise')
+        {
+            if (TitleEl) TitleEl.textContent = 'Splines & Noise Layers';
+            const QuickItems = [
+                { title: '+ 3D Graded Spline (Gizmo)', desc: 'Ramp, ridge, road or pass — drag Green Y ↕ arrow up/down', glyph: 'Gizmo', badge: '3D GIZMO', featured: true, action: () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp') },
+                { title: '+ 3D Rock Arch Bridge Spline', desc: 'True 3D overhanging rock arch swept along 3D knots', glyph: 'Arch', badge: '3D SDF', featured: false, action: () => this.addNew3DSplineLayer('arch3d', '3D Rock Arch Bridge') },
+                { title: '+ 3D Mountain Tunnel Bore', desc: 'Arched roof + flat highway floor carved through mountains', glyph: 'Arch', badge: 'TUNNEL', featured: false, action: () => this.addNew3DSplineLayer('tunnel', '3D Mountain Tunnel Bore') },
+                { title: '+ River / Canyon Spline', desc: 'Carve 3D graded river valley or gorge channel', glyph: 'Spline', badge: 'SPLINE', featured: false, action: () => this.addNew3DSplineLayer('river', '3D River Valley Spline') },
+                { title: '+ Hybrid Multifractal', desc: 'Alluvial valleys + craggy continental peaks', glyph: 'Mountain', badge: 'FRACTAL', featured: false, action: () => this.addProceduralLayer('multifractal') },
+                { title: '+ Ridged Mountain Spine', desc: 'Sharp tectonic arête crests & directional chains', glyph: 'Activity', badge: 'RIDGE', featured: false, action: () => this.addProceduralLayer('ridged') },
+                { title: '+ Voronoi Cliff Mesa', desc: 'Stepped basalt blocks, craters, or fracture ridges', glyph: 'Boxes', badge: 'CELLULAR', featured: false, action: () => this.addProceduralLayer('voronoi') },
+                { title: '+ Stratigraphic Terraces', desc: 'Geological dipping benches & canyon strata', glyph: 'Layers', badge: 'STRATA', featured: false, action: () => this.addProceduralLayer('terrace') }
+            ];
+            if (CountEl) CountEl.textContent = String(QuickItems.length);
+            for (const Item of QuickItems)
+            {
+                const Btn = MakeEl('button', 'quick-add-card' + (Item.featured ? ' featured-spline' : ''));
+                Btn.type = 'button';
+                const Icon = MakeEl('span', 'quick-add-icon', ConstructGlyph(Item.glyph));
+                const Copy = MakeEl('span', 'quick-add-copy', [MakeEl('strong', '', Item.title), MakeEl('small', '', Item.desc)]);
+                const Badge = MakeEl('span', 'preset-badge', Item.badge);
+                Btn.append(Icon, Copy, Badge);
+                Btn.addEventListener('click', Item.action);
+                List.appendChild(Btn);
+            }
+            return;
+        }
+
+        const FilteredLandforms = LANDFORM_CATALOG.filter(Spec =>
+        {
+            if (this.landformFamilyFilter !== 'all' && Spec.family !== this.landformFamilyFilter) return false;
+            if (!Q) return true;
+            return Spec.name.toLowerCase().includes(Q) || Spec.badge.toLowerCase().includes(Q) || Spec.desc.toLowerCase().includes(Q) || Spec.family.toLowerCase().includes(Q);
+        });
+
+        if (TitleEl) TitleEl.textContent = 'Basic Landform Generators';
+        if (CountEl) CountEl.textContent = String(FilteredLandforms.length);
+
+        for (const Spec of FilteredLandforms)
+        {
+            const Fam = GetLandformFamily(Spec.family);
+            const Btn = MakeEl('button', 'quick-add-card landform-card');
             Btn.type = 'button';
-            const Icon = MakeEl('span', 'quick-add-icon', ConstructGlyph(Item.glyph));
+            Btn.style.setProperty('--lf-accent', Fam.accent || '#e8c27a');
+            Btn.title = `Add Pure-SDF ${Spec.name} (${Fam.label}) with Interactive 3D Gizmo`;
+
+            const Icon = MakeEl('span', 'quick-add-icon', ConstructGlyph(Fam.glyph || 'Mountain'));
+            Icon.style.color = Fam.accent || '#eff4cf';
+
+            const Strong = MakeEl('strong', '', `+ ${Spec.name}`);
+            if (Spec.hasVolumetric3D) Strong.appendChild(MakeEl('span', 'lf-badge-3d', '3D SDF'));
             const Copy = MakeEl('span', 'quick-add-copy', [
-                MakeEl('strong', '', Item.title),
-                MakeEl('small', '', Item.desc)
+                Strong,
+                MakeEl('small', '', Spec.desc)
             ]);
-            const Badge = MakeEl('span', 'preset-badge', Item.badge);
+            const Badge = MakeEl('span', 'preset-badge', Spec.badge);
             Btn.append(Icon, Copy, Badge);
-            Btn.addEventListener('click', Item.action);
+            Btn.addEventListener('click', () => this.addLandformLayer(Spec.id));
             List.appendChild(Btn);
         }
     }
@@ -757,30 +816,115 @@ class TerrainWorldStudioApp
             return;
         }
 
-        if (HeadingEl) HeadingEl.textContent = 'WORLD';
-        if (CounterEl) CounterEl.textContent = '3 DEMO MASKS';
-        const Chips = [
-            ['All 3 Demo Terrains', () => { this.view3D.viewScope = 'all'; document.getElementById('scope-select').value = 'all'; this.view3D.frameVisibleWorld(); this.refreshChrome(); }],
-            ['Solo: Highland Massif (Soft Falloff)', () => this._focusSingleRegion(0)],
-            ['Solo: Basalt Cliffs (No Falloff · Sheer Cliff)', () => this._focusSingleRegion(1)],
-            ['Solo: Caldera Atoll (Rim Ring Falloff)', () => this._focusSingleRegion(2)],
-            ['Inspect Thin SDF Slab (Ocean OFF)', () => { this.world.oceanVisible = false; this._syncOceanUI(); }],
-            ['Export .STL Binary', () => this._exportStl()]
-        ];
+        if (HeadingEl) HeadingEl.textContent = 'WORLDS';
+        if (CounterEl) CounterEl.textContent = `${LANDFORM_SHOWCASE_WORLDS.length} SHOWCASES`;
 
-        for (let I = 0; I < Chips.length; ++I)
+        for (const Sw of LANDFORM_SHOWCASE_WORLDS)
         {
-            const [Label, Fn] = Chips[I];
-            const Chip = MakeEl('button', 'history-chip' + (I === 0 ? ' current' : ''), Label);
+            const Chip = MakeEl('button', 'history-chip lf-showcase-chip' + (this.activeShowcaseId === Sw.id ? ' current active' : ''), Sw.name);
             Chip.type = 'button';
-            Chip.addEventListener('click', () =>
-            {
-                for (const C of Strip.querySelectorAll('.history-chip')) C.classList.remove('current');
-                Chip.classList.add('current');
-                Fn();
-            });
+            Chip.title = `${Sw.name} · ${Sw.desc}`;
+            Chip.addEventListener('click', () => this.loadLandformShowcaseWorld(Sw.id));
             Strip.appendChild(Chip);
         }
+
+        // Classic 3 Demo Masks button for backward-compatible multi-terrain workflow
+        const ClassicChip = MakeEl('button', 'history-chip' + (this.activeShowcaseId === 'classic-3-demo' ? ' current' : ''), 'Classic 3 Demo Masks');
+        ClassicChip.type = 'button';
+        ClassicChip.title = 'Load the original 3 Demo Masks (Highland Massif, Basalt Cliffs, Caldera Atoll)';
+        ClassicChip.addEventListener('click', () =>
+        {
+            this.pushUndoSnapshot();
+            this.activeShowcaseId = 'classic-3-demo';
+            SeedThreeDemoTerrains(this.world);
+            for (const R of this.world.regions) R.meshDirty = true;
+            this.map2D.activeMaskLayerId = this.world.maskLayers[0]?.id || null;
+            this.view3D.viewScope = 'all';
+            const Sc = document.getElementById('scope-select');
+            if (Sc) Sc.value = 'all';
+            this._setRegionSelection(this.world.regions[0].id, [this.world.regions[0].id]);
+            this.map2D.invalidateMaskCache();
+            this._syncOceanUI();
+            this._buildPresetStrip();
+            this.map2D.frameAllRegions();
+            this.view3D.frameVisibleWorld();
+        });
+        Strip.appendChild(ClassicChip);
+
+        const SlabChip = MakeEl('button', 'history-chip', 'Toggle Ocean / Thin Slab');
+        SlabChip.type = 'button';
+        SlabChip.addEventListener('click', () => { this.world.oceanVisible = !this.world.oceanVisible; this._syncOceanUI(); this.rebuildInspector(); });
+        Strip.appendChild(SlabChip);
+    }
+
+    loadLandformShowcaseWorld(ShowcaseId)
+    {
+        this.pushUndoSnapshot();
+        this.activeShowcaseId = ShowcaseId;
+        SeedLandformShowcaseWorld(this.world, ShowcaseId);
+        for (const R of this.world.regions) R.meshDirty = true;
+        this.map2D.activeMaskLayerId = this.world.maskLayers[0]?.id || null;
+        this.view3D.viewScope = 'all';
+        const Sc = document.getElementById('scope-select');
+        if (Sc) Sc.value = 'all';
+
+        const FirstReg = this.world.regions[0];
+        const FirstLf = FirstReg?.stack.find(L => L.type === 'landform');
+        this.activeLayerId = FirstLf?.id || FirstReg?.stack[0]?.id || null;
+        this.view3D.activeLandformLayerId = FirstLf?.id || null;
+        this.view3D.activeSplineLayerId = null;
+
+        this.inspectorTab = 'landforms';
+        this._syncInspectorTabButtons();
+        this._setRegionSelection(FirstReg.id, [FirstReg.id]);
+        this.map2D.invalidateMaskCache();
+        this._syncOceanUI();
+        this._buildPresetStrip();
+        this.map2D.frameAllRegions();
+        this.view3D.frameVisibleWorld();
+        this._scheduleAutosave();
+    }
+
+    addLandformLayer(ArchetypeId = 'alpine_peak', Extra = {})
+    {
+        const Reg = this.getActiveRegion();
+        if (!Reg) return;
+        this.pushUndoSnapshot();
+
+        const B = Reg.bounds;
+        const ExistingLfCount = Reg.stack.filter(L => L.type === 'landform').length;
+        // Gently offset new landforms from exact center when stacking multiple features so they don't overlap identically
+        const Angle = ExistingLfCount * 2.15;
+        const Shift = ExistingLfCount === 0 ? 0.0 : Math.min(B.width, B.depth) * 0.16;
+        const Cx = Math.round(B.x + B.width * 0.5 + Math.cos(Angle) * Shift);
+        const Cz = Math.round(B.z + B.depth * 0.5 + Math.sin(Angle) * Shift);
+
+        const NewLyr = CreateLandformLayer(ArchetypeId, {
+            centerX: Cx,
+            centerZ: Cz,
+            seed: Math.floor(1000 + Math.random() * 89000),
+            ...Extra
+        });
+
+        Reg.stack.push(NewLyr);
+        this.activeLayerId = NewLyr.id;
+        this.view3D.activeLandformLayerId = NewLyr.id;
+        this.view3D.activeSplineLayerId = null;
+        this.view3D.showGizmo = true;
+        if (this.workspaceMode === '2d') this.setWorkspaceMode('split');
+        if (this.workspaceMode === 'rock2' || this.workspaceMode === 'fracture') this.setWorkspaceMode('3d');
+
+        EvaluateTerrainRegion(this.world, Reg, NewLyr.id);
+        StitchAdjacentRegionBorders(this.world);
+        Reg.meshDirty = true;
+        this.map2D.invalidateRegionPreview(Reg.id);
+        this.map2D.requestRedraw();
+
+        this.inspectorTab = 'landforms';
+        this._syncInspectorTabButtons();
+        this.refreshChrome();
+        this.rebuildInspector();
+        this._scheduleAutosave();
     }
 
     _focusSingleRegion(Index)
@@ -1016,9 +1160,13 @@ class TerrainWorldStudioApp
         const First = this.world.regions[0];
         this.activeRegionId = First?.id || null;
         this.selectedRegionIds = new Set(this.activeRegionId ? [this.activeRegionId] : []);
-        const Sp = First?.stack.find(L => L.type === 'spline');
-        this.activeLayerId = Sp?.id || First?.stack[0]?.id || null;
-        this.view3D.activeSplineLayerId = Sp?.id || null;
+        const Lf = First?.stack.find(L => L.id === this.activeLayerId && L.type === 'landform')
+                || First?.stack.find(L => L.type === 'landform');
+        const Sp = First?.stack.find(L => L.id === this.activeLayerId && L.type === 'spline')
+                || First?.stack.find(L => L.type === 'spline');
+        this.activeLayerId = Lf?.id || Sp?.id || First?.stack[0]?.id || null;
+        this.view3D.activeLandformLayerId = Lf?.id || null;
+        this.view3D.activeSplineLayerId = Lf ? null : (Sp?.id || null);
         this.map2D.activeMaskLayerId = this.world.maskLayers[0]?.id || null;
         this.map2D.activeRegionId = this.activeRegionId;
         this.map2D.selectedRegionIds = new Set(this.selectedRegionIds);
@@ -1081,12 +1229,28 @@ class TerrainWorldStudioApp
             if (Reg.maskLayerId) this.map2D.activeMaskLayerId = Reg.maskLayerId;
             if (!Reg.stack.some(L => L.id === this.activeLayerId))
             {
+                const Lf = Reg.stack.find(L => L.type === 'landform');
                 const Sp = Reg.stack.find(L => L.type === 'spline');
-                this.activeLayerId = Sp?.id || Reg.stack[Reg.stack.length - 1]?.id || null;
+                this.activeLayerId = Lf?.id || Sp?.id || Reg.stack[Reg.stack.length - 1]?.id || null;
             }
-            const ActiveSp = Reg.stack.find(L => L.id === this.activeLayerId && L.type === 'spline')
-                          || Reg.stack.find(L => L.type === 'spline');
-            this.view3D.activeSplineLayerId = ActiveSp?.id || null;
+            const ActiveLyr = Reg.stack.find(L => L.id === this.activeLayerId);
+            if (ActiveLyr?.type === 'landform')
+            {
+                this.view3D.activeLandformLayerId = ActiveLyr.id;
+                this.view3D.activeSplineLayerId = null;
+            }
+            else if (ActiveLyr?.type === 'spline')
+            {
+                this.view3D.activeSplineLayerId = ActiveLyr.id;
+                this.view3D.activeLandformLayerId = null;
+            }
+            else
+            {
+                const AnyLf = Reg.stack.find(L => L.type === 'landform');
+                const AnySp = Reg.stack.find(L => L.type === 'spline');
+                this.view3D.activeLandformLayerId = AnyLf?.id || null;
+                this.view3D.activeSplineLayerId = AnyLf ? null : (AnySp?.id || null);
+            }
         }
         this.map2D.requestRedraw();
         this.refreshChrome();
@@ -1155,16 +1319,16 @@ class TerrainWorldStudioApp
         const ResetBtn = document.getElementById('reset-demo-btn');
         if (ResetBtn)
         {
-            ResetBtn.textContent = Mode === 'rock2' ? 'Reset Stack ↗' : '3 Demo Masks ↗';
+            ResetBtn.textContent = Mode === 'rock2' ? 'Reset Stack ↗' : 'Reset Showcase ↗';
             ResetBtn.title = Mode === 'rock2'
                 ? 'Reset active starter Layer Stack to clean defaults'
-                : 'Reset to the 3 Demonstration Masks & Terrains';
+                : 'Reset to Universal Landform Archipelago Showcase';
         }
 
         const AddBtn = document.getElementById('add-button');
         if (AddBtn)
         {
-            AddBtn.title = Mode === 'rock2' ? 'Add a Plain Big Boulder Layer to Stack' : 'Quick-add a 3D Spline Landform Layer';
+            AddBtn.title = Mode === 'rock2' ? 'Add a Plain Big Boulder Layer to Stack' : 'Quick-add a Basic Landform Generator Layer';
         }
 
         const ImpBtn = document.getElementById('import-btn');
@@ -1185,7 +1349,7 @@ class TerrainWorldStudioApp
         }
         else if ((Prev === 'fracture' || Prev === 'rock2') && (this.inspectorTab === 'fracture' || this.inspectorTab === 'rock2'))
         {
-            this.inspectorTab = 'layers';
+            this.inspectorTab = 'landforms';
             this._syncInspectorTabButtons();
         }
 
@@ -1277,7 +1441,7 @@ class TerrainWorldStudioApp
         document.getElementById('scene-search')?.addEventListener('input', E =>
         {
             this.outlinerSearch = E.target.value.trim().toLowerCase();
-            if (this.workspaceMode === 'rock2') this._buildQuickAddLibrary();
+            this._buildQuickAddLibrary();
             this.refreshChrome();
         });
         for (const Btn of document.querySelectorAll('#scene-filters button'))
@@ -1296,7 +1460,7 @@ class TerrainWorldStudioApp
             E.currentTarget.classList.toggle('active');
         });
 
-        // One-Click Add Layer buttons (in RockFormation 2.0 adds a Plain Rock Layer; in Terrain adds a 3D Spline)
+        // One-Click Add Layer buttons (in RockFormation 2.0 adds a Plain Rock Layer; in Terrain adds a Basic Landform)
         document.getElementById('add-button')?.addEventListener('click', () =>
         {
             if (this.workspaceMode === 'rock2')
@@ -1304,8 +1468,9 @@ class TerrainWorldStudioApp
                 this._addRock2Layer('big_boulder');
                 return;
             }
-            this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp');
+            this.addLandformLayer('alpine_peak');
         });
+        document.getElementById('pill-add-landform')?.addEventListener('click', () => this.addLandformLayer('alpine_peak'));
         document.getElementById('pill-add-spline')?.addEventListener('click', () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp'));
         document.getElementById('dock-new-spline-btn')?.addEventListener('click', () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp'));
 
@@ -1436,7 +1601,7 @@ class TerrainWorldStudioApp
             }
         });
 
-        // Reset 3 Demo Terrains (or Reset Starter Stack in RockFormation 2.0)
+        // Reset Showcase (or Reset Starter Stack in RockFormation 2.0)
         document.getElementById('reset-demo-btn')?.addEventListener('click', () =>
         {
             if (this.workspaceMode === 'rock2')
@@ -1444,16 +1609,8 @@ class TerrainWorldStudioApp
                 this._selectRock2StarterStack(this.rock2?.stack?.starterId || 'stack-cliff-outcrop');
                 return;
             }
-            this.pushUndoSnapshot();
             this._clearAutosave();
-            SeedThreeDemoTerrains(this.world);
-            for (const R of this.world.regions) R.meshDirty = true;
-            this.map2D.activeMaskLayerId = this.world.maskLayers[0]?.id || null;
-            this._setRegionSelection(this.world.regions[0].id, [this.world.regions[0].id]);
-            this.map2D.invalidateMaskCache();
-            this._syncOceanUI();
-            this.map2D.frameAllRegions();
-            this.view3D.frameVisibleWorld();
+            this.loadLandformShowcaseWorld(this.activeShowcaseId && this.activeShowcaseId !== 'classic-3-demo' ? this.activeShowcaseId : 'universal-archipelago');
         });
 
         // Lower Transport Sliders (Brush/Spline Width, Exposure, Sky Atmosphere, Fit Bounds, Save JSON)
@@ -1837,11 +1994,11 @@ class TerrainWorldStudioApp
         const StatLbl1 = document.getElementById('stat-label-1');
         const StatLbl2 = document.getElementById('stat-label-2');
         if (StatLbl1) StatLbl1.textContent = 'Terrains ON';
-        if (StatLbl2) StatLbl2.textContent = 'Layers & Splines';
+        if (StatLbl2) StatLbl2.textContent = 'Landforms & Layers';
         const SearchInp = document.getElementById('scene-search');
-        if (SearchInp) SearchInp.placeholder = 'Search terrains, masks, splines…';
+        if (SearchInp) SearchInp.placeholder = 'Search landforms, terrains, splines…';
         const LeftFoot = document.getElementById('left-footer-label');
-        if (LeftFoot) LeftFoot.textContent = 'Infinite Sparse 2D Mask · Thin-Slab SDF';
+        if (LeftFoot) LeftFoot.textContent = 'Universal Pure-SDF Landforms · Thin-Slab SDF';
         const StageTitle = document.getElementById('stage-bar-title');
         if (StageTitle) StageTitle.textContent = 'Stage';
         const InspFootL = document.getElementById('inspector-foot-left');
@@ -1926,26 +2083,47 @@ class TerrainWorldStudioApp
                     Group.appendChild(Row);
                 }
 
-                // Show nested layers for active region (or all spline layers when filtering by 'splines')
-                if ((R.id === this.activeRegionId && this.outlinerFilter === 'all') || this.outlinerFilter === 'splines')
+                // Show nested layers for active region (or filtered landform / spline layers across all regions)
+                if ((R.id === this.activeRegionId && this.outlinerFilter === 'all') || this.outlinerFilter === 'splines' || this.outlinerFilter === 'landforms')
                 {
                     for (let I = R.stack.length - 1; I >= 0; --I)
                     {
                         const Lyr = R.stack[I];
                         if (this.outlinerFilter === 'splines' && Lyr.type !== 'spline') continue;
-                        if (Q && !Lyr.name.toLowerCase().includes(Q)) continue;
+                        if (this.outlinerFilter === 'landforms' && Lyr.type !== 'landform') continue;
+                        if (Q && !Lyr.name.toLowerCase().includes(Q) && !(Lyr.archetype || '').toLowerCase().includes(Q)) continue;
 
                         const IsSelLyr = R.id === this.activeRegionId && Lyr.id === this.activeLayerId;
                         const LRow = MakeEl('div', 'tree-row child-layer' + (IsSelLyr ? ' selected' : '') + (!Lyr.enabled ? ' is-off' : ''));
                         const Meta = LAYER_TYPE_META[Lyr.type] || LAYER_TYPE_META.multifractal;
-                        LRow.style.setProperty('--row-accent', Lyr.type === 'spline' ? '#eff4cf' : Meta.accent);
+                        let Accent = Lyr.type === 'spline' ? '#eff4cf' : Meta.accent;
+                        let IconName = Lyr.type === 'spline' ? 'Spline' : 'Layers';
+                        let FallTag;
+
+                        if (Lyr.type === 'landform')
+                        {
+                            const Spec = GetLandformSpec(Lyr.archetype);
+                            const Fam = GetLandformFamily(Spec.family);
+                            Accent = Fam.accent || '#f0b868';
+                            IconName = Fam.glyph || 'Mountain';
+                            const PlaceTag = Lyr.placementMode && Lyr.placementMode !== 'single' ? ` · ${Lyr.placementMode} ×${Lyr.instanceCount}` : '';
+                            FallTag = `${Spec.badge}${Spec.hasVolumetric3D ? ' · 3D SDF' : ''}${PlaceTag} · H ${Math.round(Lyr.height)}m`;
+                        }
+                        else if (Lyr.type === 'spline')
+                        {
+                            FallTag = `${Lyr.points?.length || 0} 3D knots · ${Lyr.splineMode}`;
+                        }
+                        else
+                        {
+                            FallTag = Lyr.falloff?.mode === 'none' ? 'Falloff: NONE (Cliff)' : `Falloff: ${Lyr.falloff?.mode} (${Math.round(Lyr.falloff?.distance || 260)}m)`;
+                        }
+
+                        LRow.style.setProperty('--row-accent', Accent);
 
                         const LSel = MakeEl('button', 'row-select');
                         LSel.type = 'button';
-                        const LGlyph = MakeEl('span', 'row-glyph', ConstructGlyph(Lyr.type === 'spline' ? 'Spline' : 'Layers'));
-                        const FallTag = Lyr.type === 'spline'
-                            ? `${Lyr.points?.length || 0} 3D knots · ${Lyr.splineMode}`
-                            : (Lyr.falloff?.mode === 'none' ? 'Falloff: NONE (Cliff)' : `Falloff: ${Lyr.falloff?.mode} (${Math.round(Lyr.falloff?.distance || 260)}m)`);
+                        const LGlyph = MakeEl('span', 'row-glyph', ConstructGlyph(IconName));
+                        LGlyph.style.color = Accent;
                         LSel.append(LGlyph, MakeEl('span', 'row-copy', [
                             MakeEl('div', 'row-name', Lyr.name),
                             MakeEl('div', 'row-meta', FallTag)
@@ -1954,9 +2132,16 @@ class TerrainWorldStudioApp
                         {
                             this.activeRegionId = R.id;
                             this.activeLayerId = Lyr.id;
-                            if (Lyr.type === 'spline')
+                            if (Lyr.type === 'landform')
+                            {
+                                this.view3D.activeLandformLayerId = Lyr.id;
+                                this.view3D.activeSplineLayerId = null;
+                                this.inspectorTab = 'landforms';
+                            }
+                            else if (Lyr.type === 'spline')
                             {
                                 this.view3D.activeSplineLayerId = Lyr.id;
+                                this.view3D.activeLandformLayerId = null;
                                 this.inspectorTab = 'spline';
                             }
                             else
@@ -2090,6 +2275,7 @@ class TerrainWorldStudioApp
         const Content = document.getElementById('InspectorContent');
         Content.innerHTML = '';
         this._activeKnotYSlider = null;
+        this._lfLiveSliders = null;
 
         if (this.workspaceMode === 'rock2' || this.inspectorTab === 'rock2')
         {
@@ -2109,6 +2295,8 @@ class TerrainWorldStudioApp
         // Top KPI Trio (#eff4cf highlight card just like 3D Clay Studio!)
         const PeakM = Math.round(Region.runtime?.maxHeight ?? 0);
         const AreaKm = (Region.runtime?.landAreaKm2 ?? 0).toFixed(2);
+        const LfCount = Region.stack.filter(L => L.type === 'landform').length;
+        const SpCount = Region.stack.filter(L => L.type === 'spline').length;
         const Trio = MakeEl('div', 'kpi-trio', [
             MakeEl('div', 'kpi-card highlight', [
                 MakeEl('span', 'kpi-label', 'Peak Relief'),
@@ -2121,9 +2309,9 @@ class TerrainWorldStudioApp
                 MakeEl('span', 'kpi-sub', 'Zero deep waste')
             ]),
             MakeEl('div', 'kpi-card', [
-                MakeEl('span', 'kpi-label', 'Layer Stack'),
+                MakeEl('span', 'kpi-label', 'Landform Stack'),
                 MakeEl('strong', 'kpi-val', String(Region.stack.length)),
-                MakeEl('span', 'kpi-sub', `${Region.stack.filter(L => L.type === 'spline').length} 3D spline(s)`)
+                MakeEl('span', 'kpi-sub', `${LfCount} landform · ${SpCount} spline`)
             ])
         ]);
         Content.appendChild(Trio);
@@ -2150,7 +2338,11 @@ class TerrainWorldStudioApp
         );
         Content.appendChild(Switches);
 
-        if (this.inspectorTab === 'spline')
+        if (this.inspectorTab === 'landforms')
+        {
+            this._buildLandformsInspectorTab(Content, Region);
+        }
+        else if (this.inspectorTab === 'spline')
         {
             this._buildSplineInspectorTab(Content, Region);
         }
@@ -2177,6 +2369,492 @@ class TerrainWorldStudioApp
     }
 
     /*--------------------------------------------------------------------------------------------------------------------------------------
+                                     TAB 0: BASIC LANDFORM GENERATORS — ZERO-DEAD-CONTROL INSPECTOR
+    --------------------------------------------------------------------------------------------------------------------------------------*/
+    _buildLandformsInspectorTab(Content, Region)
+    {
+        const Landforms = Region.stack.filter(L => L.type === 'landform');
+        let ActiveLf = Landforms.find(L => L.id === this.activeLayerId)
+                    || Landforms.find(L => L.id === this.view3D?.activeLandformLayerId)
+                    || Landforms[Landforms.length - 1]
+                    || null;
+
+        if (ActiveLf)
+        {
+            this.activeLayerId = ActiveLf.id;
+            this.view3D.activeLandformLayerId = ActiveLf.id;
+            this.view3D.activeSplineLayerId = null;
+        }
+
+        const TriggerRebuild = (FullChrome = false) =>
+        {
+            Region.dirty = true;
+            EvaluateTerrainRegion(this.world, Region, ActiveLf?.id || null);
+            StitchAdjacentRegionBorders(this.world);
+            Region.meshDirty = true;
+            this.map2D.invalidateRegionPreview(Region.id);
+            this.map2D.requestRedraw();
+            if (FullChrome)
+            {
+                this.refreshChrome();
+                this.rebuildInspector();
+            }
+            this._scheduleAutosave();
+        };
+
+        // 1. Landform Stack on Active Region + Quick-Add Archetype Picker
+        const ListGrp = MakePropertyGroup('Region Landform Generators', 'Mountain', `${Landforms.length} ACTIVE`, true,
+            'Compose any landscape by stacking Pure-SDF peaks, volcanoes, mesas, canyons, dunes, faults & coasts. Drag handles directly in 3D.');
+
+        const AddRow = MakeEl('div', 'studio-btn-row');
+        const QuickSel = document.createElement('select');
+        QuickSel.className = 'studio-select';
+        QuickSel.style.cssText = 'flex:1;min-width:0;';
+        for (const Fam of LANDFORM_FAMILIES)
+        {
+            const Og = document.createElement('optgroup');
+            Og.label = Fam.label;
+            for (const Spec of LANDFORM_CATALOG.filter(S => S.family === Fam.id))
+            {
+                const Opt = document.createElement('option');
+                Opt.value = Spec.id;
+                Opt.textContent = `${Spec.name}${Spec.hasVolumetric3D ? ' (3D Overhang)' : ''}`;
+                Og.appendChild(Opt);
+            }
+            QuickSel.appendChild(Og);
+        }
+        if (ActiveLf) QuickSel.value = ActiveLf.archetype;
+
+        const AddBtn = MakeEl('button', 'button export-button', '+ Add');
+        AddBtn.type = 'button';
+        AddBtn.addEventListener('click', () => this.addLandformLayer(QuickSel.value));
+        AddRow.append(QuickSel, AddBtn);
+        ListGrp.Body.appendChild(AddRow);
+
+        if (Landforms.length === 0)
+        {
+            const EmptyNote = MakeEl('p', 'group-summary',
+                'No Basic Landform Generator on this region yet. Choose any of the 20 geological archetypes above (or click any card in the left library) to add one with an interactive 3D gizmo.');
+            EmptyNote.style.marginTop = '8px';
+            ListGrp.Body.appendChild(EmptyNote);
+            Content.appendChild(ListGrp.Group);
+            return;
+        }
+
+        const ListWrap = MakeEl('div');
+        ListWrap.style.marginTop = '8px';
+        for (let I = Landforms.length - 1; I >= 0; --I)
+        {
+            const Lf = Landforms[I];
+            const Spec = GetLandformSpec(Lf.archetype);
+            const Fam = GetLandformFamily(Spec.family);
+            const IsActive = Lf.id === ActiveLf.id;
+
+            const Row = MakeEl('div', 'lf-layer-row' + (IsActive ? ' active' : ''));
+            if (!Lf.enabled) Row.style.opacity = '0.48';
+
+            const Bar = MakeEl('span', 'lf-layer-accent');
+            Bar.style.background = Fam.accent || '#e8c27a';
+
+            const PlaceTag = Lf.placementMode && Lf.placementMode !== 'single' ? ` · ${Lf.placementMode} ×${Lf.instanceCount}` : '';
+            const Copy = MakeEl('div', 'lf-layer-copy', [
+                MakeEl('strong', '', `${Lf.name}${Spec.hasVolumetric3D ? ' [3D]' : ''}`),
+                MakeEl('small', '', `${Spec.badge}${PlaceTag} · H ${Math.round(Lf.height)}m · R ${Math.round(Lf.radius)}m · ${Lf.combine}`)
+            ]);
+
+            const EyeBtn = MakeEl('button', 'row-mini-btn' + (Lf.enabled ? ' eye-on' : ''), ConstructGlyph(Lf.enabled ? 'Eye' : 'EyeOff'));
+            EyeBtn.type = 'button';
+            EyeBtn.title = 'Toggle Landform Layer ON / OFF';
+            EyeBtn.addEventListener('click', E =>
+            {
+                E.stopPropagation();
+                this.pushUndoSnapshot();
+                Lf.enabled = !Lf.enabled;
+                TriggerRebuild(true);
+            });
+
+            const DupBtn = MakeEl('button', 'row-mini-btn', ConstructGlyph('Copy'));
+            DupBtn.type = 'button';
+            DupBtn.title = 'Duplicate Landform Layer';
+            DupBtn.addEventListener('click', E =>
+            {
+                E.stopPropagation();
+                this.pushUndoSnapshot();
+                const Clone = CreateLandformLayer(Lf.archetype, {
+                    ...JSON.parse(JSON.stringify(Lf)),
+                    id: undefined,
+                    name: `${Lf.name} Copy`,
+                    centerX: Math.round((Lf.centerX || 0) + Math.min(260, (Lf.radius || 200) * 0.55)),
+                    centerZ: Math.round((Lf.centerZ || 0) + Math.min(220, (Lf.radius || 200) * 0.45)),
+                    seed: (Lf.seed || 1000) + 137
+                });
+                Region.stack.push(Clone);
+                this.activeLayerId = Clone.id;
+                this.view3D.activeLandformLayerId = Clone.id;
+                TriggerRebuild(true);
+            });
+
+            const DelBtn = MakeEl('button', 'row-mini-btn', ConstructGlyph('Trash'));
+            DelBtn.type = 'button';
+            DelBtn.title = 'Delete Landform Layer';
+            DelBtn.addEventListener('click', E =>
+            {
+                E.stopPropagation();
+                this.pushUndoSnapshot();
+                const Idx = Region.stack.indexOf(Lf);
+                if (Idx >= 0) Region.stack.splice(Idx, 1);
+                const NextLf = Region.stack.find(L => L.type === 'landform');
+                this.activeLayerId = NextLf?.id || Region.stack[Region.stack.length - 1]?.id || null;
+                this.view3D.activeLandformLayerId = NextLf?.id || null;
+                TriggerRebuild(true);
+            });
+
+            Row.addEventListener('click', () =>
+            {
+                this.activeLayerId = Lf.id;
+                this.view3D.activeLandformLayerId = Lf.id;
+                this.view3D.activeSplineLayerId = null;
+                this.refreshChrome();
+                this.rebuildInspector();
+            });
+
+            Row.append(Bar, Copy, EyeBtn, DupBtn, DelBtn);
+            ListWrap.appendChild(Row);
+        }
+        ListGrp.Body.appendChild(ListWrap);
+        Content.appendChild(ListGrp.Group);
+
+        // 2. Archetype & CSG Composition Group
+        const Spec = GetLandformSpec(ActiveLf.archetype);
+        const Fam = GetLandformFamily(Spec.family);
+
+        const ArchGrp = MakePropertyGroup('Archetype & CSG Combine', Fam.glyph || 'Mountain', Spec.badge, true, Spec.desc);
+
+        if (Spec.hasVolumetric3D)
+        {
+            const VolBanner = MakeEl('div', 'lf-volumetric-banner', [
+                ConstructGlyph('Arch'),
+                MakeEl('span', '', 'True-3D Volumetric SDF Active — Dual-Surface-Nets brick mesher extracts genuine undercut overhangs & vertical shafts.')
+            ]);
+            ArchGrp.Body.appendChild(VolBanner);
+        }
+
+        // Grouped Archetype Switcher
+        const ArchSelRow = MakeEl('div', 'property-row');
+        ArchSelRow.appendChild(MakeEl('label', 'property-label', `Geological Archetype (${Fam.shortLabel})`));
+        const ArchSelect = MakeEl('select', 'studio-select');
+        for (const F of LANDFORM_FAMILIES)
+        {
+            const Og = document.createElement('optgroup');
+            Og.label = F.label;
+            for (const S of LANDFORM_CATALOG.filter(X => X.family === F.id))
+            {
+                const Opt = document.createElement('option');
+                Opt.value = S.id;
+                Opt.textContent = `${S.name}${S.hasVolumetric3D ? ' · 3D Overhang' : ''}`;
+                Og.appendChild(Opt);
+            }
+            ArchSelect.appendChild(Og);
+        }
+        ArchSelect.value = ActiveLf.archetype;
+        ArchSelect.addEventListener('change', () =>
+        {
+            this.pushUndoSnapshot();
+            const NewSpec = GetLandformSpec(ArchSelect.value);
+            ActiveLf.archetype = NewSpec.id;
+            ActiveLf.name = NewSpec.name;
+            ActiveLf.combine = NewSpec.defaultCombine || 'smooth_union';
+            ActiveLf.radius = NewSpec.defaultRadius;
+            ActiveLf.length = NewSpec.defaultLength;
+            ActiveLf.height = NewSpec.defaultHeight;
+            ActiveLf.params = { ...NewSpec.defaultParams };
+            TriggerRebuild(true);
+        });
+        ArchSelRow.appendChild(ArchSelect);
+        ArchGrp.Body.appendChild(ArchSelRow);
+
+        // Combine Mode Select
+        ArchGrp.Body.appendChild(MakeSelectRow(
+            'SDF Combine Mode',
+            LANDFORM_COMBINE_MODES,
+            ActiveLf.combine || 'smooth_union',
+            V =>
+            {
+                this.pushUndoSnapshot();
+                ActiveLf.combine = V;
+                TriggerRebuild(true);
+            }
+        ));
+
+        // Zero-Dead-Control: Smooth Blend K ONLY when smooth_union or smooth_sub!
+        if (ActiveLf.combine === 'smooth_union' || ActiveLf.combine === 'smooth_sub')
+        {
+            ArchGrp.Body.appendChild(MakeSliderPillRow(
+                'Smooth Blend Radius (k)', 2, 95, 1, ActiveLf.smoothK ?? 22, 0, 'm',
+                V => { ActiveLf.smoothK = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+        }
+
+        ArchGrp.Body.appendChild(MakeSliderPillRow(
+            'Layer Strength / Weight', 0.05, 1.5, 0.02, ActiveLf.opacity ?? 1.0, 2, 'w',
+            V => { ActiveLf.opacity = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        ));
+
+        Content.appendChild(ArchGrp.Group);
+
+        // 3. Generator / Placement Mode Group (Zero-Dead-Control: extra sliders only when placementMode !== 'single')
+        const PlaceMode = ActiveLf.placementMode || 'single';
+        const PlaceGrp = MakePropertyGroup('Placement & Array Mode', 'Boxes', PlaceMode.toUpperCase(), PlaceMode !== 'single',
+            'Generate a single hero landform, a curved mountain range chain, a geological cluster, or a deterministic scatter field.');
+
+        PlaceGrp.Body.appendChild(MakeSelectRow(
+            'Placement Pattern',
+            LANDFORM_PLACEMENT_MODES,
+            PlaceMode,
+            V =>
+            {
+                this.pushUndoSnapshot();
+                ActiveLf.placementMode = V;
+                if (V !== 'single' && (!ActiveLf.instanceCount || ActiveLf.instanceCount < 2))
+                {
+                    ActiveLf.instanceCount = V === 'field' ? 8 : (V === 'range' ? 5 : 4);
+                }
+                TriggerRebuild(true);
+            }
+        ));
+
+        const LiveSliders = {};
+        if (PlaceMode !== 'single')
+        {
+            PlaceGrp.Body.appendChild(MakeSliderPillRow(
+                'Instance Count', 2, 18, 1, ActiveLf.instanceCount ?? 5, 0, '×',
+                V => { ActiveLf.instanceCount = Math.round(V); TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+
+            const SpreadCtrl = MakeSliderPillRow(
+                PlaceMode === 'range' ? 'Range Chain Span' : 'Field / Cluster Spread',
+                140, 2400, 20, ActiveLf.spread ?? 680, 0, 'm',
+                V => { ActiveLf.spread = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            );
+            LiveSliders.spread = SpreadCtrl;
+            PlaceGrp.Body.appendChild(SpreadCtrl);
+
+            if (PlaceMode === 'range')
+            {
+                PlaceGrp.Body.appendChild(MakeSliderPillRow(
+                    'Range Arc Curvature', -0.9, 0.9, 0.02, ActiveLf.rangeCurvature ?? 0.25, 2, 'k',
+                    V => { ActiveLf.rangeCurvature = V; TriggerRebuild(false); },
+                    () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+                ));
+            }
+
+            if (PlaceMode === 'range' || PlaceMode === 'cluster')
+            {
+                PlaceGrp.Body.appendChild(MakeSliderPillRow(
+                    'End / Rim Scale Taper', 0.0, 0.85, 0.02, ActiveLf.scaleTaper ?? 0.45, 2, 'w',
+                    V => { ActiveLf.scaleTaper = V; TriggerRebuild(false); },
+                    () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+                ));
+            }
+
+            PlaceGrp.Body.appendChild(MakeSliderPillRow(
+                'Organic Jitter', 0.0, 1.0, 0.02, ActiveLf.jitter ?? 0.28, 2, 'j',
+                V => { ActiveLf.jitter = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+        }
+        Content.appendChild(PlaceGrp.Group);
+
+        // 4. Spatial Footprint & 3D Gizmo Transform Group
+        const B = Region.bounds;
+        const XfGrp = MakePropertyGroup('3D Footprint & Gizmo Transform', 'Gizmo', `${Math.round(ActiveLf.height)}m`, true,
+            'Drag handles in the 3D viewport (◇ Move · Green H ↕ · Cyan R · Amber AZ/WIND) or fine-tune numerically here.');
+
+        const HeightLabel = (ActiveLf.combine === 'sub' || ActiveLf.combine === 'smooth_sub') ? 'Carve Depth (H)' : 'Peak / Relief Height (H)';
+        const HCtrl = MakeSliderPillRow(
+            HeightLabel, 8, 560, 2, ActiveLf.height ?? Spec.defaultHeight, 0, 'm',
+            V => { ActiveLf.height = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        );
+        LiveSliders.height = HCtrl;
+        XfGrp.Body.appendChild(HCtrl);
+
+        const RadCtrl = MakeSliderPillRow(
+            Spec.hasLength ? 'Corridor Half-Width (R)' : 'Footprint Radius (R)',
+            30, 1400, 5, ActiveLf.radius ?? Spec.defaultRadius, 0, 'm',
+            V => { ActiveLf.radius = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        );
+        LiveSliders.radius = RadCtrl;
+        XfGrp.Body.appendChild(RadCtrl);
+
+        if (Spec.hasLength)
+        {
+            const LenCtrl = MakeSliderPillRow(
+                'Strike / Corridor Length', 80, 2400, 10, ActiveLf.length ?? Spec.defaultLength, 0, 'm',
+                V => { ActiveLf.length = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            );
+            LiveSliders.length = LenCtrl;
+            XfGrp.Body.appendChild(LenCtrl);
+        }
+        else
+        {
+            XfGrp.Body.appendChild(MakeSliderPillRow(
+                'Footprint Aspect Ratio', 0.4, 2.5, 0.05, ActiveLf.aspectRatio ?? 1.0, 2, '×',
+                V => { ActiveLf.aspectRatio = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+        }
+
+        const AzCtrl = MakeSliderPillRow(
+            Spec.family === 'aeolian_karst' ? 'Wind / Dune Azimuth' : 'Strike / Orientation Azimuth',
+            0, 360, 1, ActiveLf.azimuth ?? 0, 0, '°',
+            V => { ActiveLf.azimuth = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        );
+        LiveSliders.azimuth = AzCtrl;
+        XfGrp.Body.appendChild(AzCtrl);
+
+        const CxCtrl = MakeSliderPillRow(
+            'Center X (World m)',
+            Math.round(B.x - B.width * 0.2), Math.round(B.x + B.width * 1.2), 10,
+            ActiveLf.centerX ?? Math.round(B.x + B.width * 0.5), 0, 'm',
+            V => { ActiveLf.centerX = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        );
+        LiveSliders.cx = CxCtrl;
+        XfGrp.Body.appendChild(CxCtrl);
+
+        const CzCtrl = MakeSliderPillRow(
+            'Center Z (World m)',
+            Math.round(B.z - B.depth * 0.2), Math.round(B.z + B.depth * 1.2), 10,
+            ActiveLf.centerZ ?? Math.round(B.z + B.depth * 0.5), 0, 'm',
+            V => { ActiveLf.centerZ = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        );
+        LiveSliders.cz = CzCtrl;
+        XfGrp.Body.appendChild(CzCtrl);
+
+        XfGrp.Body.appendChild(MakeSliderPillRow(
+            'Surface Rock Micro-Detail', 0.0, 1.0, 0.02, ActiveLf.rockDetail ?? 0.32, 2, 'd',
+            V => { ActiveLf.rockDetail = V; TriggerRebuild(false); },
+            () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+        ));
+
+        const SeedRow = MakeEl('div', 'studio-btn-row');
+        const RandBtn = MakeEl('button', 'button', `Randomize Seed (#${ActiveLf.seed || 1000})`);
+        RandBtn.type = 'button';
+        RandBtn.addEventListener('click', () =>
+        {
+            this.pushUndoSnapshot();
+            ActiveLf.seed = Math.floor(1000 + Math.random() * 89000);
+            TriggerRebuild(true);
+        });
+        const FocusLfBtn = MakeEl('button', 'button', 'Focus Camera');
+        FocusLfBtn.type = 'button';
+        FocusLfBtn.addEventListener('click', () =>
+        {
+            const Wy = this.view3D.sampleTerrainSurfaceY(Region, ActiveLf.centerX || 0, ActiveLf.centerZ || 0);
+            this.view3D.target = [ActiveLf.centerX || 0, Wy + (ActiveLf.height || 100) * 0.25, ActiveLf.centerZ || 0];
+            this.view3D.distance = Clamp(Math.max(ActiveLf.radius || 300, ActiveLf.length || 0) * 2.4, 380, 4800);
+        });
+        SeedRow.append(RandBtn, FocusLfBtn);
+        XfGrp.Body.appendChild(SeedRow);
+
+        this._lfLiveSliders = LiveSliders;
+        Content.appendChild(XfGrp.Group);
+
+        // 5. Contextual Archetype-Specific Geological Controls (strictly from Spec.controls — ZERO dead controls!)
+        if (Spec.controls && Spec.controls.length > 0)
+        {
+            const GeoGrp = MakePropertyGroup(`${Spec.name} · Morphology`, 'Sliders', `${Spec.controls.length} PARAMS`, true,
+                'Every slider below directly drives the analytic Pure-SDF formula for this specific geological archetype.');
+
+            if (!ActiveLf.params) ActiveLf.params = { ...Spec.defaultParams };
+            for (const Ctrl of Spec.controls)
+            {
+                const CurVal = ActiveLf.params[Ctrl.key] !== undefined ? ActiveLf.params[Ctrl.key] : Spec.defaultParams[Ctrl.key];
+                GeoGrp.Body.appendChild(MakeSliderPillRow(
+                    Ctrl.label,
+                    Ctrl.min, Ctrl.max, Ctrl.step, CurVal,
+                    Ctrl.dec ?? 2, Ctrl.unit || '·',
+                    V =>
+                    {
+                        ActiveLf.params[Ctrl.key] = V;
+                        TriggerRebuild(false);
+                    },
+                    () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+                ));
+            }
+            Content.appendChild(GeoGrp.Group);
+        }
+
+        // 6. Boundary Falloff & Elevation Masking Group
+        const MaskGrp = MakePropertyGroup('Boundary Falloff & Elevation Mask', 'Scan', (ActiveLf.falloff?.mode || 'soft').toUpperCase(), false,
+            'Control how this landform interacts with the 2D painted landmass edge and existing elevation bands.');
+
+        if (!ActiveLf.falloff) ActiveLf.falloff = { mode: 'soft', distance: 200, edgeFloor: 0.0 };
+        MaskGrp.Body.appendChild(MakeSelectRow(
+            '2D Mask Boundary Falloff',
+            BOUNDARY_FALLOFF_MODES,
+            ActiveLf.falloff.mode || 'soft',
+            V =>
+            {
+                this.pushUndoSnapshot();
+                ActiveLf.falloff.mode = V;
+                TriggerRebuild(true);
+            }
+        ));
+
+        if (ActiveLf.falloff.mode !== 'none')
+        {
+            MaskGrp.Body.appendChild(MakeSliderPillRow(
+                'Falloff Margin Distance', 20, 900, 10, ActiveLf.falloff.distance ?? 200, 0, 'm',
+                V => { ActiveLf.falloff.distance = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+        }
+
+        if (!ActiveLf.heightMask) ActiveLf.heightMask = { enabled: false, minH: 0, maxH: 400, feather: 25 };
+        const HmToggleRow = MakeEl('div', 'property-row');
+        const HmLabelWrap = MakeEl('label', 'property-label');
+        HmLabelWrap.style.cssText = 'display:flex;align-items:center;justify-content:space-between;cursor:pointer;';
+        const HmCheck = document.createElement('input');
+        HmCheck.type = 'checkbox';
+        HmCheck.checked = Boolean(ActiveLf.heightMask.enabled);
+        HmCheck.addEventListener('change', () =>
+        {
+            this.pushUndoSnapshot();
+            ActiveLf.heightMask.enabled = HmCheck.checked;
+            TriggerRebuild(true);
+        });
+        HmLabelWrap.append(document.createTextNode('Constrain to Elevation Band'), HmCheck);
+        HmToggleRow.appendChild(HmLabelWrap);
+        MaskGrp.Body.appendChild(HmToggleRow);
+
+        if (ActiveLf.heightMask.enabled)
+        {
+            MaskGrp.Body.appendChild(MakeSliderPillRow(
+                'Min Elevation', -40, 500, 5, ActiveLf.heightMask.minH ?? 0, 0, 'm',
+                V => { ActiveLf.heightMask.minH = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+            MaskGrp.Body.appendChild(MakeSliderPillRow(
+                'Max Elevation', 10, 700, 5, ActiveLf.heightMask.maxH ?? 400, 0, 'm',
+                V => { ActiveLf.heightMask.maxH = V; TriggerRebuild(false); },
+                () => { this.pushUndoSnapshot(); TriggerRebuild(true); }
+            ));
+        }
+
+        Content.appendChild(MaskGrp.Group);
+    }
+
+    /*--------------------------------------------------------------------------------------------------------------------------------------
                                               TAB 1: LAYERS & PER-LAYER BOUNDARY FALLOFF
     --------------------------------------------------------------------------------------------------------------------------------------*/
     _buildLayersAndFalloffTab(Content, Region)
@@ -2185,9 +2863,13 @@ class TerrainWorldStudioApp
 
         // Quick Add Bar at top of Layers tab
         const StackGroup = MakePropertyGroup('Composable Layer Stack', 'Layers', `${Region.stack.length} LAYERS`, true,
-            'Click any layer in the Outliner or add a procedural generator / 3D spline below.');
+            'Click any layer in the Outliner or add a Basic Landform, procedural noise, or 3D spline below.');
         const BtnRow = MakeEl('div', 'studio-btn-row');
-        const BtnAddSp = MakeEl('button', 'button export-button', '+ Add 3D Spline (Gizmo)');
+        const BtnAddLf = MakeEl('button', 'button export-button', '+ Basic Landform');
+        BtnAddLf.type = 'button';
+        BtnAddLf.addEventListener('click', () => this.addLandformLayer('alpine_peak'));
+
+        const BtnAddSp = MakeEl('button', 'button', '+ 3D Spline');
         BtnAddSp.type = 'button';
         BtnAddSp.addEventListener('click', () => this.addNew3DSplineLayer('grade', '3D Graded Spline Ramp'));
 
@@ -2199,7 +2881,7 @@ class TerrainWorldStudioApp
         BtnAddVor.type = 'button';
         BtnAddVor.addEventListener('click', () => this.addProceduralLayer('voronoi'));
 
-        BtnRow.append(BtnAddSp, BtnAddFrac, BtnAddVor);
+        BtnRow.append(BtnAddLf, BtnAddSp, BtnAddFrac, BtnAddVor);
         StackGroup.Body.appendChild(BtnRow);
         Content.appendChild(StackGroup.Group);
 
@@ -2303,6 +2985,22 @@ class TerrainWorldStudioApp
             GenGroup.Body.appendChild(MakeSliderPillRow('Stratigraphic Beds', 2, 24, 1, ActiveLayer.bedCount, 0, 'bed', V => { ActiveLayer.bedCount = V; TriggerLive(); }, TriggerCommit));
             GenGroup.Body.appendChild(MakeSliderPillRow('Bench Flatness', 0.1, 0.98, 0.01, ActiveLayer.strength, 2, 'w', V => { ActiveLayer.strength = V; TriggerLive(); }, TriggerCommit));
             GenGroup.Body.appendChild(MakeSliderPillRow('Bedding Dip Angle', 0, 25, 0.5, ActiveLayer.dipDeg, 1, '°', V => { ActiveLayer.dipDeg = V; TriggerLive(); }, TriggerCommit));
+        }
+        else if (ActiveLayer.type === 'landform')
+        {
+            const JumpLfBtn = MakeEl('button', 'button export-button', 'Open Basic Landform Generator Controls ↗');
+            JumpLfBtn.type = 'button';
+            JumpLfBtn.style.width = '100%';
+            JumpLfBtn.style.justifyContent = 'center';
+            JumpLfBtn.addEventListener('click', () =>
+            {
+                this.view3D.activeLandformLayerId = ActiveLayer.id;
+                this.view3D.activeSplineLayerId = null;
+                this.inspectorTab = 'landforms';
+                this._syncInspectorTabButtons();
+                this.rebuildInspector();
+            });
+            GenGroup.Body.appendChild(JumpLfBtn);
         }
         else if (ActiveLayer.type === 'spline')
         {

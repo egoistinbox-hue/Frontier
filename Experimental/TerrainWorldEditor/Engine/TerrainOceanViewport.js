@@ -13,7 +13,10 @@ import {
     ApplyTerrainSculptDab,
     Clamp,
     SampleCatmullRomPolyline,
-    CreateTerrainLayer
+    CreateTerrainLayer,
+    GetLandformSpec,
+    GetLandformFamily,
+    ResolveLandformInstances
 } from './TerrainLayerStack.js';
 
 /*==========================================================================================================================================
@@ -612,11 +615,14 @@ export class TerrainOceanViewport
         this.sculptStrength = 0.62;
         this.hoverHit = null;
 
-        // Active 3D Spline + Gizmo State
+        // Active 3D Spline + Landform Gizmo State
         this.activeSplineLayerId = null;
+        this.activeLandformLayerId = null;
         this.selectedKnotIndex = 0;
         this.hoverGizmoAxis = null; // 'x' | 'y' | 'z' | 'xz' | null
         this.hoverKnotIndex = -1;
+        this.hoverLandformHandle = null; // 'move' | 'height' | 'radius' | 'azimuth' | 'length' | 'select' | null
+        this.hoverLandformLayerId = null;
         this._lastViewProj = null;
 
         // GPU Programs & Mesh Caches
@@ -748,10 +754,30 @@ export class TerrainOceanViewport
         const Reg = this.world.getRegion(this.activeRegionId);
         if (!Reg || !Reg.enabled) return null;
         let Lyr = Reg.stack.find(L => L.id === this.activeSplineLayerId && L.type === 'spline');
-        if (!Lyr) Lyr = Reg.stack.find(L => L.type === 'spline' && L.enabled !== false);
+        if (!Lyr && !this.activeLandformLayerId) Lyr = Reg.stack.find(L => L.type === 'spline' && L.enabled !== false);
         if (!Lyr || !Lyr.points || Lyr.points.length === 0) return null;
         this.selectedKnotIndex = Clamp(this.selectedKnotIndex | 0, 0, Lyr.points.length - 1);
         return { region: Reg, layer: Lyr };
+    }
+
+    getActiveLandformContext()
+    {
+        const Reg = this.world.getRegion(this.activeRegionId);
+        if (!Reg || !Reg.enabled) return null;
+        let Lyr = Reg.stack.find(L => L.id === this.activeLandformLayerId && L.type === 'landform' && L.enabled !== false);
+        if (!Lyr && !this.activeSplineLayerId)
+        {
+            for (let I = Reg.stack.length - 1; I >= 0; --I)
+            {
+                if (Reg.stack[I]?.type === 'landform' && Reg.stack[I].enabled !== false)
+                {
+                    Lyr = Reg.stack[I];
+                    break;
+                }
+            }
+        }
+        if (!Lyr) return null;
+        return { region: Reg, layer: Lyr, spec: GetLandformSpec(Lyr.archetype) };
     }
 
     sampleTerrainSurfaceY(Region, Wx, Wz)
@@ -967,6 +993,122 @@ export class TerrainOceanViewport
     }
 
     /*======================================================================================================================================
+                           3D BASIC LANDFORM GIZMO GEOMETRY & HIT-TESTING (MOVE · HEIGHT · RADIUS · AZIMUTH · LENGTH)
+    ======================================================================================================================================*/
+    _computeLandformGizmoGeometry(Ctx, Width, Height)
+    {
+        if (!this.showGizmo || !this._lastViewProj || !Ctx) return null;
+        const { region: Reg, layer: Lyr, spec: Spec } = Ctx;
+        const Cx = Number(Lyr.centerX) || 0.0;
+        const Cz = Number(Lyr.centerZ) || 0.0;
+        const R = Math.max(24.0, Number(Lyr.radius) || Spec.defaultRadius);
+        const L = Spec.hasLength ? Math.max(40.0, Number(Lyr.length) || Spec.defaultLength) : R;
+        const H = Math.max(4.0, Number(Lyr.height) || Spec.defaultHeight);
+        const AzRad = ((Number(Lyr.azimuth) || 0.0) * Math.PI) / 180.0;
+        const CosA = Math.cos(AzRad), SinA = Math.sin(AzRad);
+        const IsRange = Lyr.placementMode === 'range';
+        const ShowLenHandle = Spec.hasLength || IsRange;
+        const LenHalf = IsRange ? Math.max(80.0, (Number(Lyr.spread) || 680.0) * 0.5) : L * 0.5;
+
+        const GroundY = this.sampleTerrainSurfaceY(Reg, Cx, Cz);
+        const Origin = [Cx, GroundY + 8.0, Cz];
+
+        const { eye: Eye } = this.getCameraBasis();
+        const CamDist = Math.hypot(Eye[0] - Origin[0], Eye[1] - Origin[1], Eye[2] - Origin[2]);
+        const VertLen = Clamp(CamDist * 0.125, 42.0, 320.0);
+
+        const AzDist = ShowLenHandle ? Math.max(R * 0.92, LenHalf) : R * 1.16;
+        const RadWorldX = Cx - SinA * R;
+        const RadWorldZ = Cz + CosA * R;
+        const RadY = this.sampleTerrainSurfaceY(Reg, RadWorldX, RadWorldZ) + 10.0;
+
+        const AzWorldX = Cx + CosA * AzDist;
+        const AzWorldZ = Cz + SinA * AzDist;
+        const AzY = this.sampleTerrainSurfaceY(Reg, AzWorldX, AzWorldZ) + 12.0;
+
+        const LenWorldX = Cx - CosA * LenHalf;
+        const LenWorldZ = Cz - SinA * LenHalf;
+        const LenY = this.sampleTerrainSurfaceY(Reg, LenWorldX, LenWorldZ) + 12.0;
+
+        const P0 = ProjectWorldToScreen(this._lastViewProj, Origin, Width, Height);
+        if (!P0) return null;
+
+        const PyUp = ProjectWorldToScreen(this._lastViewProj, [Cx, Origin[1] + VertLen, Cz], Width, Height);
+        const PyDn = ProjectWorldToScreen(this._lastViewProj, [Cx, Origin[1] - VertLen * 0.36, Cz], Width, Height);
+        const PRad = ProjectWorldToScreen(this._lastViewProj, [RadWorldX, RadY, RadWorldZ], Width, Height);
+        const PAz = ProjectWorldToScreen(this._lastViewProj, [AzWorldX, AzY, AzWorldZ], Width, Height);
+        const PLen = ShowLenHandle ? ProjectWorldToScreen(this._lastViewProj, [LenWorldX, LenY, LenWorldZ], Width, Height) : null;
+
+        return {
+            origin: Origin,
+            cx: Cx, cz: Cz, radius: R, length: L, height: H, azRad: AzRad, cosA: CosA, sinA: SinA,
+            isRange: IsRange, showLenHandle: ShowLenHandle, lenHalf: LenHalf,
+            p0: P0, pyUp: PyUp, pyDn: PyDn, pRad: PRad, pAz: PAz, pLen: PLen
+        };
+    }
+
+    _hitTestLandformGizmo(Sx, Sy, Width, Height)
+    {
+        if (!this.showGizmo || !this._lastViewProj) return null;
+        const Ctx = this.getActiveLandformContext();
+        if (Ctx)
+        {
+            const Giz = this._computeLandformGizmoGeometry(Ctx, Width, Height);
+            if (Giz)
+            {
+                // 1. Center XZ Move Diamond (highest precision around origin)
+                if (Math.hypot(Sx - Giz.p0[0], Sy - Giz.p0[1]) <= 13.0)
+                {
+                    return { kind: 'landform-handle', handle: 'move', ...Ctx, giz: Giz };
+                }
+                // 2. Green Vertical Height/Depth Arrow
+                if (Giz.pyUp)
+                {
+                    const EndDn = Giz.pyDn || Giz.p0;
+                    if (DistPointToSegment2D(Sx, Sy, EndDn[0], EndDn[1], Giz.pyUp[0], Giz.pyUp[1]) <= 12.0)
+                    {
+                        return { kind: 'landform-handle', handle: 'height', ...Ctx, giz: Giz };
+                    }
+                }
+                // 3. Cyan Footprint Radius Handle
+                if (Giz.pRad && Math.hypot(Sx - Giz.pRad[0], Sy - Giz.pRad[1]) <= 14.0)
+                {
+                    return { kind: 'landform-handle', handle: 'radius', ...Ctx, giz: Giz };
+                }
+                // 4. Amber Azimuth / Wind / Strike Arrow Handle
+                if (Giz.pAz && Math.hypot(Sx - Giz.pAz[0], Sy - Giz.pAz[1]) <= 14.0)
+                {
+                    return { kind: 'landform-handle', handle: 'azimuth', ...Ctx, giz: Giz };
+                }
+                // 5. Violet Length / Range Span Handle
+                if (Giz.pLen && Math.hypot(Sx - Giz.pLen[0], Sy - Giz.pLen[1]) <= 14.0)
+                {
+                    return { kind: 'landform-handle', handle: 'length', ...Ctx, giz: Giz };
+                }
+            }
+        }
+
+        // Test clicking center marker of ANY other enabled landform layer on the active region to switch to it!
+        const Reg = this.world.getRegion(this.activeRegionId);
+        if (Reg && Reg.enabled)
+        {
+            for (let I = Reg.stack.length - 1; I >= 0; --I)
+            {
+                const Lyr = Reg.stack[I];
+                if (!Lyr || !Lyr.enabled || Lyr.type !== 'landform') continue;
+                const Cx = Number(Lyr.centerX) || 0.0, Cz = Number(Lyr.centerZ) || 0.0;
+                const Gy = this.sampleTerrainSurfaceY(Reg, Cx, Cz) + 8.0;
+                const Scr = ProjectWorldToScreen(this._lastViewProj, [Cx, Gy, Cz], Width, Height);
+                if (Scr && Math.hypot(Sx - Scr[0], Sy - Scr[1]) <= 13.5)
+                {
+                    return { kind: 'landform-select', region: Reg, layer: Lyr, spec: GetLandformSpec(Lyr.archetype) };
+                }
+            }
+        }
+        return null;
+    }
+
+    /*======================================================================================================================================
                                                 3D VIEWPORT POINTER INTERACTION
     ======================================================================================================================================*/
     _bindEvents()
@@ -987,14 +1129,65 @@ export class TerrainOceanViewport
                 return;
             }
 
-            // 1. Check 3D Spline Gizmo & Knot Handles on Left-Click (whenever Gizmo is visible and Alt is not held)
+            // 1. Check 3D Basic Landform Gizmo & 3D Spline Gizmo Handles on Left-Click (whenever Gizmo is visible and Alt is not held)
             if (E.button === 0 && !E.altKey && this.showGizmo)
             {
+                const LfHit = this._hitTestLandformGizmo(Sx, Sy, Rect.width, Rect.height);
+                if (LfHit)
+                {
+                    if (LfHit.kind === 'landform-select')
+                    {
+                        this.activeLandformLayerId = LfHit.layer.id;
+                        this.activeSplineLayerId = null;
+                        this.cb.onLandformSelectedIn3D?.(LfHit.region, LfHit.layer);
+                        return;
+                    }
+                    El.setPointerCapture(E.pointerId);
+                    this.activeLandformLayerId = LfHit.layer.id;
+                    this.activeSplineLayerId = null;
+                    this.cb.onBeforeLandformGizmoEdit?.(LfHit.region, LfHit.layer);
+
+                    const Giz = LfHit.giz;
+                    const Ray = this.screenRay(E.clientX, E.clientY);
+                    const StartParamY = ClosestAxisParamToRay(Giz.origin, [0, 1, 0], Ray.origin, Ray.dir);
+                    let StartPlaneXZ = [Giz.cx, Giz.cz];
+                    if (Math.abs(Ray.dir[1]) > 1e-4)
+                    {
+                        const TPlane = (Giz.origin[1] - Ray.origin[1]) / Ray.dir[1];
+                        if (TPlane > 0 && TPlane < 40000)
+                        {
+                            StartPlaneXZ = [Ray.origin[0] + Ray.dir[0] * TPlane, Ray.origin[2] + Ray.dir[2] * TPlane];
+                        }
+                    }
+
+                    this.dragState = {
+                        kind: 'landform-drag',
+                        pointerId: E.pointerId,
+                        handle: LfHit.handle,
+                        region: LfHit.region,
+                        layer: LfHit.layer,
+                        spec: LfHit.spec,
+                        gizmoOrigin: Giz.origin,
+                        origCx: Giz.cx,
+                        origCz: Giz.cz,
+                        origHeight: Giz.height,
+                        origRadius: Giz.radius,
+                        origLength: Giz.length,
+                        origSpread: Number(LfHit.layer.spread) || 680.0,
+                        origAzimuth: Number(LfHit.layer.azimuth) || 0.0,
+                        isRange: Giz.isRange,
+                        startParamY: StartParamY,
+                        startPlaneXZ: StartPlaneXZ
+                    };
+                    return;
+                }
+
                 const GizHit = this._hitTestSplineGizmoAndKnots(Sx, Sy, Rect.width, Rect.height);
                 if (GizHit)
                 {
                     El.setPointerCapture(E.pointerId);
                     this.activeSplineLayerId = GizHit.layer.id;
+                    this.activeLandformLayerId = null;
                     if (GizHit.kind === 'knot')
                     {
                         this.selectedKnotIndex = GizHit.knotIndex;
@@ -1113,11 +1306,15 @@ export class TerrainOceanViewport
 
             if (!this.dragState)
             {
-                // Hover feedback for 3D Gizmo axes & knots
-                const GizHit = this.showGizmo ? this._hitTestSplineGizmoAndKnots(Sx, Sy, Rect.width, Rect.height) : null;
+                // Hover feedback for 3D Landform Gizmo & 3D Spline Gizmo
+                const LfHit = this.showGizmo ? this._hitTestLandformGizmo(Sx, Sy, Rect.width, Rect.height) : null;
+                this.hoverLandformHandle = LfHit?.kind === 'landform-handle' ? LfHit.handle : (LfHit?.kind === 'landform-select' ? 'select' : null);
+                this.hoverLandformLayerId = LfHit?.layer?.id || null;
+
+                const GizHit = (!LfHit && this.showGizmo) ? this._hitTestSplineGizmoAndKnots(Sx, Sy, Rect.width, Rect.height) : null;
                 this.hoverGizmoAxis = GizHit?.kind === 'gizmo' ? GizHit.axis : null;
                 this.hoverKnotIndex = GizHit?.kind === 'knot' ? GizHit.knotIndex : -1;
-                El.style.cursor = GizHit ? 'grab' : (this.tool3D === 'spline-add' ? 'crosshair' : 'default');
+                El.style.cursor = (LfHit || GizHit) ? 'grab' : (this.tool3D === 'spline-add' ? 'crosshair' : 'default');
 
                 if (IsSculptBrush || this.tool3D === 'spline-add')
                 {
@@ -1131,6 +1328,55 @@ export class TerrainOceanViewport
             }
 
             const D = this.dragState;
+            if (D.kind === 'landform-drag')
+            {
+                El.style.cursor = 'grabbing';
+                const Ray = this.screenRay(E.clientX, E.clientY);
+                const Lyr = D.layer;
+
+                if (D.handle === 'height')
+                {
+                    const CurY = ClosestAxisParamToRay(D.gizmoOrigin, [0, 1, 0], Ray.origin, Ray.dir);
+                    const DeltaY = CurY - D.startParamY;
+                    Lyr.height = Math.round(Clamp(D.origHeight + DeltaY, 8.0, 620.0));
+                }
+                else if (Math.abs(Ray.dir[1]) > 1e-4)
+                {
+                    const TPlane = (D.gizmoOrigin[1] - Ray.origin[1]) / Ray.dir[1];
+                    if (TPlane > 0 && TPlane < 40000)
+                    {
+                        const CurX = Ray.origin[0] + Ray.dir[0] * TPlane;
+                        const CurZ = Ray.origin[2] + Ray.dir[2] * TPlane;
+                        if (D.handle === 'move')
+                        {
+                            Lyr.centerX = Math.round(D.origCx + (CurX - D.startPlaneXZ[0]));
+                            Lyr.centerZ = Math.round(D.origCz + (CurZ - D.startPlaneXZ[1]));
+                        }
+                        else if (D.handle === 'radius')
+                        {
+                            const DistR = Math.hypot(CurX - D.origCx, CurZ - D.origCz);
+                            Lyr.radius = Math.round(Clamp(DistR, 30.0, 1400.0));
+                        }
+                        else if (D.handle === 'azimuth')
+                        {
+                            const AngDeg = (Math.atan2(CurZ - D.origCz, CurX - D.origCx) * 180.0) / Math.PI;
+                            Lyr.azimuth = Math.round(((AngDeg % 360) + 360) % 360);
+                        }
+                        else if (D.handle === 'length')
+                        {
+                            const DistL = Math.hypot(CurX - D.origCx, CurZ - D.origCz) * 2.0;
+                            if (D.isRange) Lyr.spread = Math.round(Clamp(DistL, 140.0, 2600.0));
+                            else Lyr.length = Math.round(Clamp(DistL, 80.0, 2400.0));
+                        }
+                    }
+                }
+
+                D.region.dirty = true;
+                D.region.meshDirty = true;
+                this.cb.onLandformGizmoLive?.(D.region, Lyr, D.handle);
+                return;
+            }
+
             if (D.kind === 'gizmo-drag')
             {
                 El.style.cursor = 'grabbing';
@@ -1230,7 +1476,11 @@ export class TerrainOceanViewport
             El.style.cursor = 'default';
             if (El.hasPointerCapture?.(E.pointerId)) El.releasePointerCapture(E.pointerId);
 
-            if (D.kind === 'gizmo-drag')
+            if (D.kind === 'landform-drag')
+            {
+                this.cb.onLandformGizmoFinished?.(D.region, D.layer, D.handle);
+            }
+            else if (D.kind === 'gizmo-drag')
             {
                 this.cb.onSplineGizmoFinished?.(D.region, D.layer, D.knotIndex);
             }
@@ -1247,7 +1497,7 @@ export class TerrainOceanViewport
 
         El.addEventListener('pointerup', EndDrag);
         El.addEventListener('pointercancel', EndDrag);
-        El.addEventListener('pointerleave', () => { this.hoverHit = null; this.hoverGizmoAxis = null; });
+        El.addEventListener('pointerleave', () => { this.hoverHit = null; this.hoverGizmoAxis = null; this.hoverLandformHandle = null; this.hoverLandformLayerId = null; });
 
         El.addEventListener('wheel', E =>
         {
@@ -1644,6 +1894,9 @@ export class TerrainOceanViewport
             return;
         }
 
+        // Render Interactive 3D Basic Landform Footprint Rings & Handles!
+        this._renderLandformGizmoOverlay(Ctx, Width, Height, ViewProj);
+
         const SplineCtx = this.getActiveSplineContext();
         if (!SplineCtx)
         {
@@ -1817,5 +2070,273 @@ export class TerrainOceanViewport
         }
 
         Ctx.restore();
+    }
+
+    /*======================================================================================================================================
+                     2D OVERLAY CANVAS: 3D BASIC LANDFORM FOOTPRINT RINGS, INSTANCE FIELD & INTERACTIVE HANDLES
+    ======================================================================================================================================*/
+    _renderLandformGizmoOverlay(Ctx, Width, Height, ViewProj)
+    {
+        const Reg = this.world.getRegion(this.activeRegionId);
+        if (!Reg || !Reg.enabled) return;
+
+        const ActiveCtx = this.getActiveLandformContext();
+        const ActiveId = ActiveCtx?.layer?.id || null;
+
+        const DrawFootprintRing = (Cx, Cz, Rx, Rz, CosA, SinA, IsCorridor, Color, LineWidth, Dashed = false) =>
+        {
+            const Segs = 40;
+            Ctx.save();
+            if (Dashed) Ctx.setLineDash([5, 4]);
+            Ctx.strokeStyle = Color;
+            Ctx.lineWidth = LineWidth;
+            Ctx.beginPath();
+            let Started = false;
+            for (let I = 0; I <= Segs; ++I)
+            {
+                const T = (I / Segs) * Math.PI * 2.0;
+                let Lu, Lv;
+                if (IsCorridor)
+                {
+                    // Rounded stadium outline for linear corridors (canyons, faults, fold belts, cuestas, headlands)
+                    const C = Math.cos(T), S = Math.sin(T);
+                    Lu = Math.sign(C) * Math.pow(Math.abs(C), 0.45) * Rx;
+                    Lv = Math.sign(S) * Math.pow(Math.abs(S), 0.72) * Rz;
+                }
+                else
+                {
+                    Lu = Math.cos(T) * Rx;
+                    Lv = Math.sin(T) * Rz;
+                }
+                const Wx = Cx + Lu * CosA - Lv * SinA;
+                const Wz = Cz + Lu * SinA + Lv * CosA;
+                const Wy = this.sampleTerrainSurfaceY(Reg, Wx, Wz) + 4.5;
+                const Scr = ProjectWorldToScreen(ViewProj, [Wx, Wy, Wz], Width, Height);
+                if (!Scr) { Started = false; continue; }
+                if (!Started) { Ctx.moveTo(Scr[0], Scr[1]); Started = true; }
+                else Ctx.lineTo(Scr[0], Scr[1]);
+            }
+            Ctx.stroke();
+            Ctx.restore();
+        };
+
+        // 1. Subtle clickable markers for all non-active enabled landforms on the active region
+        for (const Layer of Reg.stack)
+        {
+            if (!Layer || !Layer.enabled || Layer.type !== 'landform' || Layer.id === ActiveId) continue;
+            const Spec = GetLandformSpec(Layer.archetype);
+            const Fam = GetLandformFamily(Spec.family);
+            const Cx = Number(Layer.centerX) || 0.0, Cz = Number(Layer.centerZ) || 0.0;
+            const Gy = this.sampleTerrainSurfaceY(Reg, Cx, Cz) + 8.0;
+            const Scr = ProjectWorldToScreen(ViewProj, [Cx, Gy, Cz], Width, Height);
+            if (!Scr) continue;
+
+            const IsHover = this.hoverLandformLayerId === Layer.id;
+            Ctx.beginPath();
+            Ctx.arc(Scr[0], Scr[1], IsHover ? 7.5 : 5.5, 0, Math.PI * 2);
+            Ctx.fillStyle = IsHover ? '#eff4cf' : 'rgba(18, 20, 24, 0.86)';
+            Ctx.fill();
+            Ctx.lineWidth = 1.8;
+            Ctx.strokeStyle = Fam.accent || '#e8c27a';
+            Ctx.stroke();
+
+            if (IsHover)
+            {
+                Ctx.font = '600 10.5px "DM Sans", sans-serif';
+                const Tag = `${Spec.badge} · ${Layer.name}`;
+                const Tw = Ctx.measureText(Tag).width;
+                Ctx.fillStyle = 'rgba(14, 15, 17, 0.90)';
+                Ctx.beginPath();
+                Ctx.roundRect(Scr[0] + 11, Scr[1] - 10, Tw + 12, 20, 999);
+                Ctx.fill();
+                Ctx.fillStyle = '#eff4cf';
+                Ctx.textAlign = 'left';
+                Ctx.textBaseline = 'middle';
+                Ctx.fillText(Tag, Scr[0] + 17, Scr[1]);
+            }
+        }
+
+        if (!ActiveCtx) return;
+        const { layer: Lyr, spec: Spec } = ActiveCtx;
+        const Fam = GetLandformFamily(Spec.family);
+        const Giz = this._computeLandformGizmoGeometry(ActiveCtx, Width, Height);
+        if (!Giz) return;
+
+        const ActiveHandle = this.dragState?.kind === 'landform-drag' ? this.dragState.handle : this.hoverLandformHandle;
+        const Aspect = Clamp(Number(Lyr.aspectRatio) || 1.0, 0.35, 3.0);
+
+        // 2. Project active footprint rings onto live 3D terrain surface!
+        if (Lyr.placementMode && Lyr.placementMode !== 'single')
+        {
+            const Resolved = ResolveLandformInstances(Lyr);
+            for (let I = 0; I < Resolved.instances.length; ++I)
+            {
+                const Inst = Resolved.instances[I];
+                const Rx = Spec.hasLength ? Inst.length * 0.5 : Inst.radius;
+                const Rz = Spec.hasLength ? Inst.radius : Inst.radius * Inst.aspect;
+                DrawFootprintRing(Inst.cx, Inst.cz, Rx, Rz, Inst.cosA, Inst.sinA, Spec.hasLength,
+                    I === 0 ? 'rgba(239, 244, 207, 0.72)' : 'rgba(239, 244, 207, 0.34)', I === 0 ? 2.0 : 1.3, I > 0);
+            }
+            // For 'range' placement, connect instance centers with a crisp mountain-chain spine guide
+            if (Lyr.placementMode === 'range' && Resolved.instances.length >= 2)
+            {
+                Ctx.save();
+                Ctx.setLineDash([4, 4]);
+                Ctx.strokeStyle = 'rgba(240, 147, 91, 0.72)';
+                Ctx.lineWidth = 1.8;
+                Ctx.beginPath();
+                let Started = false;
+                for (const Inst of Resolved.instances)
+                {
+                    const Wy = this.sampleTerrainSurfaceY(Reg, Inst.cx, Inst.cz) + 12.0;
+                    const S = ProjectWorldToScreen(ViewProj, [Inst.cx, Wy, Inst.cz], Width, Height);
+                    if (!S) { Started = false; continue; }
+                    if (!Started) { Ctx.moveTo(S[0], S[1]); Started = true; }
+                    else Ctx.lineTo(S[0], S[1]);
+                }
+                Ctx.stroke();
+                Ctx.restore();
+            }
+        }
+        else
+        {
+            const Rx = Spec.hasLength ? Giz.length * 0.5 : Giz.radius;
+            const Rz = Spec.hasLength ? Giz.radius : Giz.radius * Aspect;
+            DrawFootprintRing(Giz.cx, Giz.cz, Rx, Rz, Giz.cosA, Giz.sinA, Spec.hasLength, Fam.accent || '#eff4cf', 2.2, false);
+        }
+
+        // Helper for directional arrows
+        const DrawGizmoArrow = (From, To, Color, Highlighted, Label) =>
+        {
+            if (!From || !To) return;
+            const Dx = To[0] - From[0], Dy = To[1] - From[1];
+            const Len = Math.hypot(Dx, Dy);
+            if (Len < 4) return;
+            const Ux = Dx / Len, Uy = Dy / Len;
+            const Px = -Uy, Py = Ux;
+            const Col = Highlighted ? '#fff7b2' : Color;
+            Ctx.strokeStyle = Col;
+            Ctx.fillStyle = Col;
+            Ctx.lineWidth = Highlighted ? 3.5 : 2.5;
+            Ctx.beginPath();
+            Ctx.moveTo(From[0], From[1]);
+            Ctx.lineTo(To[0] - Ux * 10, To[1] - Uy * 10);
+            Ctx.stroke();
+            Ctx.beginPath();
+            Ctx.moveTo(To[0], To[1]);
+            Ctx.lineTo(To[0] - Ux * 12 + Px * 5.2, To[1] - Uy * 12 + Py * 5.2);
+            Ctx.lineTo(To[0] - Ux * 12 - Px * 5.2, To[1] - Uy * 12 - Py * 5.2);
+            Ctx.closePath();
+            Ctx.fill();
+            if (Label)
+            {
+                Ctx.font = '700 10.5px "DM Sans", sans-serif';
+                Ctx.fillStyle = Col;
+                Ctx.textAlign = 'center';
+                Ctx.textBaseline = 'middle';
+                Ctx.fillText(Label, To[0] + Ux * 13, To[1] + Uy * 13);
+            }
+        };
+
+        // 3. Cyan Radius spoke & circular rim handle
+        if (Giz.pRad)
+        {
+            const Hi = ActiveHandle === 'radius';
+            Ctx.save();
+            Ctx.setLineDash([3, 3]);
+            Ctx.strokeStyle = Hi ? '#fff7b2' : 'rgba(90, 200, 250, 0.85)';
+            Ctx.lineWidth = Hi ? 2.4 : 1.6;
+            Ctx.beginPath();
+            Ctx.moveTo(Giz.p0[0], Giz.p0[1]);
+            Ctx.lineTo(Giz.pRad[0], Giz.pRad[1]);
+            Ctx.stroke();
+            Ctx.restore();
+
+            Ctx.beginPath();
+            Ctx.arc(Giz.pRad[0], Giz.pRad[1], Hi ? 8.0 : 6.6, 0, Math.PI * 2);
+            Ctx.fillStyle = Hi ? '#fff7b2' : '#5ac8fa';
+            Ctx.fill();
+            Ctx.lineWidth = 2;
+            Ctx.strokeStyle = '#101418';
+            Ctx.stroke();
+
+            Ctx.font = '700 10px "DM Sans", sans-serif';
+            Ctx.fillStyle = Hi ? '#fff7b2' : '#5ac8fa';
+            Ctx.textAlign = 'center';
+            Ctx.fillText('R', Giz.pRad[0], Giz.pRad[1] - 12);
+        }
+
+        // 4. Amber Azimuth / Wind / Strike Arrow Handle
+        if (Giz.pAz)
+        {
+            const AzLbl = Spec.family === 'aeolian_karst' ? 'WIND' : 'AZ';
+            DrawGizmoArrow(Giz.p0, Giz.pAz, '#f3b758', ActiveHandle === 'azimuth', AzLbl);
+        }
+
+        // 5. Violet Length / Range Span Handle (on linear landforms & range arrays!)
+        if (Giz.pLen)
+        {
+            const Hi = ActiveHandle === 'length';
+            Ctx.save();
+            Ctx.setLineDash([3, 3]);
+            Ctx.strokeStyle = Hi ? '#fff7b2' : 'rgba(214, 162, 232, 0.85)';
+            Ctx.lineWidth = Hi ? 2.4 : 1.6;
+            Ctx.beginPath();
+            Ctx.moveTo(Giz.p0[0], Giz.p0[1]);
+            Ctx.lineTo(Giz.pLen[0], Giz.pLen[1]);
+            Ctx.stroke();
+            Ctx.restore();
+
+            Ctx.beginPath();
+            Ctx.arc(Giz.pLen[0], Giz.pLen[1], Hi ? 8.0 : 6.4, 0, Math.PI * 2);
+            Ctx.fillStyle = Hi ? '#fff7b2' : '#d6a2e8';
+            Ctx.fill();
+            Ctx.lineWidth = 2;
+            Ctx.strokeStyle = '#14101a';
+            Ctx.stroke();
+
+            Ctx.font = '700 10px "DM Sans", sans-serif';
+            Ctx.fillStyle = Hi ? '#fff7b2' : '#d6a2e8';
+            Ctx.textAlign = 'center';
+            Ctx.fillText(Giz.isRange ? 'SPAN' : 'LEN', Giz.pLen[0], Giz.pLen[1] - 12);
+        }
+
+        // 6. Green Vertical Height / Depth Arrow (H ↕)
+        if (Giz.pyDn) DrawGizmoArrow(Giz.p0, Giz.pyDn, '#3ec46d', ActiveHandle === 'height', '');
+        DrawGizmoArrow(Giz.p0, Giz.pyUp, '#49e67c', ActiveHandle === 'height', 'H ↕');
+
+        // 7. Gold Center Move XZ Diamond Handle
+        const MoveHi = ActiveHandle === 'move';
+        const Dm = MoveHi ? 9.0 : 7.5;
+        Ctx.beginPath();
+        Ctx.moveTo(Giz.p0[0], Giz.p0[1] - Dm);
+        Ctx.lineTo(Giz.p0[0] + Dm, Giz.p0[1]);
+        Ctx.lineTo(Giz.p0[0], Giz.p0[1] + Dm);
+        Ctx.lineTo(Giz.p0[0] - Dm, Giz.p0[1]);
+        Ctx.closePath();
+        Ctx.fillStyle = MoveHi ? '#fff7b2' : '#eff4cf';
+        Ctx.fill();
+        Ctx.lineWidth = 2.0;
+        Ctx.strokeStyle = '#14160c';
+        Ctx.stroke();
+
+        // 8. Live Landform Telemetry Pill
+        const IsCarve = Lyr.combine === 'sub' || Lyr.combine === 'smooth_sub';
+        const ModeTag = Lyr.placementMode && Lyr.placementMode !== 'single' ? ` · ${Lyr.placementMode.toUpperCase()} ×${Lyr.instanceCount}` : '';
+        const PillText = `${Spec.name}${ModeTag} · ${IsCarve ? 'Depth' : 'H'} ${Math.round(Giz.height)}m · R ${Math.round(Giz.radius)}m · ${Math.round(Lyr.azimuth || 0)}°`;
+        Ctx.font = '500 11px "DM Sans", sans-serif';
+        const Tw = Ctx.measureText(PillText).width;
+        const Bx = Giz.p0[0] + 15, By = Giz.p0[1] - 26;
+        Ctx.fillStyle = 'rgba(14, 15, 17, 0.90)';
+        Ctx.strokeStyle = ActiveHandle ? '#fff7b2' : (Fam.accent || 'rgba(239, 244, 207, 0.42)');
+        Ctx.lineWidth = 1.1;
+        Ctx.beginPath();
+        Ctx.roundRect(Bx, By, Tw + 14, 22, 999);
+        Ctx.fill();
+        Ctx.stroke();
+        Ctx.fillStyle = '#eff4cf';
+        Ctx.textAlign = 'left';
+        Ctx.textBaseline = 'middle';
+        Ctx.fillText(PillText, Bx + 7, By + 11);
     }
 }

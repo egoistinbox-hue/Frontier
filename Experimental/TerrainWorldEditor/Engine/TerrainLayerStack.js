@@ -908,7 +908,12 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                         const Cov = RockStampFootprintCoverage(Layer, Wx, Wz);
                         if (Cov > 0.001)
                         {
-                            const Bedrock = Math.max(CurH, CurH + (Number(Layer.worldScaleM) || 180.0) * 0.055 * Cov * (Number(Layer.embedDepthM) || 8.0) * 0.25);
+                            // Analytic bedrock pedestal: a rooted skirt that rises smoothly from the footprint rim to the
+                            // stamp centre, scaled by the stamp footprint and its embed depth (always >= 0, never a pit).
+                            const FootprintM = Math.max(8.0, Number(Layer.worldScaleM) || 180.0);
+                            const EmbedM = Math.max(0.0, Number(Layer.embedDepthM) || 8.0);
+                            const Pedestal = FootprintM * 0.09 * (0.3 + 0.7 * Cov) + EmbedM * 0.35 * Cov;
+                            const Bedrock = CurH + Math.max(0.0, Pedestal);
                             Heights[Idx] = Math.max(SlabBottom + 0.5, Mix(CurH, Bedrock, Clamp(Cov * MaskW, 0.0, 1.0)));
                         }
                     }

@@ -655,6 +655,32 @@ Suite('47. Phase L4: scattered outcrop meshes fuse into the terrain heightfield 
     assert.ok(RockStampFootprintCoverage(StampLayer, 500, 500) > 0.9, 'Stamp centre must be fully covered');
     assert.ok(RockStampFootprintCoverage(StampLayer, 500 + 9000, 500) === 0, 'Stamp coverage must vanish far away');
 
+    // Bedrock fusion must visibly lift the heightfield under a hero stamp (a real, measurable pedestal).
+    const StampWorld = new WorldMask2D();
+    const SM = StampWorld.addMaskLayer({ name: 'L' });
+    StampWorld.paintCapsuleMeters(SM, [-3000, -3000], [9000, 9000], 6000, 'paint', 1.0, 0.0, 4029);
+    const FlatStack = () => [CreateTerrainLayer('multifractal', { amplitude: 40, falloff: { mode: 'none' } })];
+    const BareRegion = StampWorld.addTerrainRegion({ name: 'Bare', bounds: { x: 0, z: 0, width: 800, depth: 800 }, resolution: 64, stack: FlatStack() });
+    EvaluateTerrainRegion(StampWorld, BareRegion);
+    const FusedStack = FlatStack();
+    FusedStack.push(CreateTerrainLayer('rock2_stamp', {
+        worldX: 400, worldZ: 400, worldScaleM: 220, embedDepthM: 12, rock2Resolution: 24, falloff: { mode: 'none' }
+    }));
+    const FusedRegion = StampWorld.addTerrainRegion({ name: 'Fused', bounds: { x: 0, z: 0, width: 800, depth: 800 }, resolution: 64, stack: FusedStack });
+    EvaluateTerrainRegion(StampWorld, FusedRegion);
+    const CentreIdx = Math.round(FusedRegion.runtime.nz / 2) * FusedRegion.runtime.nx + Math.round(FusedRegion.runtime.nx / 2);
+    const BareCentre = BareRegion.runtime.heights[CentreIdx];
+    const FusedCentre = FusedRegion.runtime.heights[CentreIdx];
+    assert.ok(FusedCentre - BareCentre > 8.0,
+        `Hero stamp must lift the bedrock under its footprint (bare ${BareCentre.toFixed(1)} -> fused ${FusedCentre.toFixed(1)})`);
+    // Embed depth must drive the pedestal height (zero dead controls).
+    FusedStack[1].embedDepthM = 40;
+    FusedRegion.dirty = true;
+    EvaluateTerrainRegion(StampWorld, FusedRegion);
+    const DeeperCentre = FusedRegion.runtime.heights[CentreIdx];
+    assert.ok(DeeperCentre > FusedCentre + 1.0,
+        `Deeper embed depth must raise the bedrock pedestal (${FusedCentre.toFixed(1)} -> ${DeeperCentre.toFixed(1)})`);
+
     // JSON round-trip keeps the scatter configuration intact.
     const Saved = JSON.parse(JSON.stringify(World.toJSON()));
     const Restored = new WorldMask2D();

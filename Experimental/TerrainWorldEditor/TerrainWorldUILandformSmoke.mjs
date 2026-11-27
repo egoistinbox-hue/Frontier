@@ -109,7 +109,13 @@ class Element
     set id(V) { this._id = V; this._attrs.set('id', V); }
     get className() { return this.classList.value; }
     set className(V) { this.classList = new ClassList(this); for (const C of String(V).split(/\s+/).filter(Boolean)) this.classList.add(C); }
-    get textContent() { return this._text; }
+    get textContent()
+    {
+        if (this.children.length === 0) return this._text;
+        let Out = this._text || '';
+        for (const C of this.children) Out += (C && C.textContent) || '';
+        return Out;
+    }
     set textContent(V) { this._text = String(V); this.children.length = 0; }
     get firstChild() { return this.children[0] || null; }
     get lastChild() { return this.children[this.children.length - 1] || null; }
@@ -361,6 +367,12 @@ console.log('Running Frontier Landform Studio headless UI smoke test...\n');
 
 const Mod = await import('./TerrainWorldEditor.js');
 const LandformMod = await import('./Engine/Landforms/TerrainLandformPrimitives.js');
+const RockStampMod = await import('./Engine/Landforms/TerrainRockStampEngine.js');
+const StackMod = await import('./Engine/TerrainLayerStack.js');
+const WorldMaskMod = await import('./Engine/WorldMask2D.js');
+const ExtractRegionTriangleMesh = StackMod.ExtractRegionTriangleMesh;
+const EvaluateTerrainRegion = StackMod.EvaluateTerrainRegion;
+const WorldMask2D = WorldMaskMod.WorldMask2D;
 let App = null;
 
 Check('45. TerrainWorldEditor boots headlessly with the landform quick-add library & inspector tab wired', () =>
@@ -511,13 +523,117 @@ Check('48. Landform layers survive editor undo/redo snapshots & workspace switch
     assert.ok(DocumentStub.getElementById('InspectorContent').children.length > 0, 'Landform inspector must render after workspace switching');
 });
 
+
+Check('49. Phase L4 RockScatter tab: hero RockFormation 2.0 stamps & procedural scatter stamp onto the terrain from the UI', () =>
+{
+    assert.ok(App, 'Editor must be booted');
+    const Reg = App.getActiveRegion();
+    Reg.stack = Reg.stack.filter(L => L.type !== 'rock2_stamp' && L.type !== 'rock2_scatter');
+    Reg.dirty = true;
+    App._evaluateDirtyRegionsNow();
+
+    App.workspaceMode = 'split';
+    App.inspectorTab = 'rockstamp';
+    App.rebuildInspector();
+    let Inspector = DocumentStub.getElementById('InspectorContent');
+    assert.ok(Inspector.children.length > 0, 'Rock Scatter inspector must render its create cards even with no rock layers');
+
+    for (const [Label, StarterId] of RockStampMod.ROCK2_TERRAIN_STAMP_STARTERS)
+    {
+        const Layer = App.addRock2StampLayer(StarterId);
+        assert.ok(Layer && Layer.type === 'rock2_stamp', `addRock2StampLayer("${StarterId}") must return a rock2_stamp layer`);
+        assert.equal(Layer.rock2StarterId, StarterId);
+        assert.ok(Number.isFinite(Reg.runtime.maxHeight), `Region must stay finite after stamping "${Label}"`);
+        App.activeLayerId = Layer.id;
+        App.inspectorTab = 'rockstamp';
+        App.rebuildInspector();
+        Inspector = DocumentStub.getElementById('InspectorContent');
+        assert.ok(Inspector.children.length > 0, `Rock Scatter inspector must render for "${StarterId}"`);
+    }
+
+    const Scatter = App.addRock2ScatterLayer();
+    assert.ok(Scatter && Scatter.type === 'rock2_scatter', 'addRock2ScatterLayer must return a rock2_scatter layer');
+    for (const Rule of RockStampMod.ROCK_SCATTER_PLACEMENTS)
+    {
+        Scatter.scatterPlacement = Rule;
+        Reg.dirty = true;
+        App._evaluateDirtyRegionsNow();
+        App.activeLayerId = Scatter.id;
+        App.inspectorTab = 'rockstamp';
+        App.rebuildInspector();
+        assert.ok(DocumentStub.getElementById('InspectorContent').children.length > 0, `Inspector must render the "${Rule}" scatter rule`);
+        assert.ok(Number.isFinite(Reg.runtime.maxHeight), `Region must stay finite for the "${Rule}" scatter rule`);
+    }
+
+    // The quick-add library must expose both Phase L4 cards.
+    const Library = DocumentStub.getElementById('quick-add-list');
+    const Cards = QueryAll(Library, '.quick-add-card');
+    const Titles = Cards.map(C => (C.textContent || '')).join(' | ');
+    assert.ok(/Rock2\.0 Hero Stamp/.test(Titles), 'Quick-add library must expose the Rock2.0 Hero Stamp card');
+    assert.ok(/Rock2\.0 Scatter/.test(Titles), 'Quick-add library must expose the Rock2.0 Scatter card');
+});
+
+Check('50. Phase L4 rock layers produce terrain triangles, honor layer toggle & survive undo/redo + JSON round-trip', () =>
+{
+    assert.ok(App, 'Editor must be booted');
+    const Reg = App.getActiveRegion();
+    Reg.stack = Reg.stack.filter(L => L.type !== 'rock2_stamp' && L.type !== 'rock2_scatter' && L.type !== 'landform_primitive');
+    Reg.dirty = true;
+    App._evaluateDirtyRegionsNow();
+
+    App.pushUndoSnapshot();
+    const Stamp = App.addRock2StampLayer('stack-basalt-colonnade');
+    const Scatter = App.addRock2ScatterLayer();
+    assert.ok(Reg.stack.some(L => L.id === Stamp.id) && Reg.stack.some(L => L.id === Scatter.id), 'Both rock layers must be on the stack');
+
+    // Rock layers must add real geometry to the terrain mesh (not a no-op layer).
+    const MeshWith = ExtractRegionTriangleMesh(App.world, Reg);
+    let WithRock = 0;
+    for (const L of Reg.stack) if (L.type === 'rock2_stamp' || L.type === 'rock2_scatter') WithRock++;
+    assert.equal(WithRock, 2, 'Two rock layers must be active');
+    assert.ok(MeshWith.triangleCount > 0, 'Terrain mesh with rock stamps must contain triangles');
+    let NonFinite = 0;
+    for (const V of MeshWith.positions) if (!Number.isFinite(V)) NonFinite++;
+    assert.equal(NonFinite, 0, 'Rock-stamped terrain mesh must have zero NaN positions');
+
+    // Toggling the hero stamp off must reduce the rock geometry.
+    Stamp.enabled = false;
+    Reg.meshDirty = true;
+    const MeshOff = ExtractRegionTriangleMesh(App.world, Reg);
+    assert.ok(MeshOff.triangleCount < MeshWith.triangleCount, 'Disabling the hero stamp must remove its rock triangles');
+    Stamp.enabled = true;
+    Reg.meshDirty = true;
+
+    // Undo must peel the layers back off one snapshot at a time; redo restores them.
+    const RockCount = () => App.getActiveRegion().stack.filter(L => L.type === 'rock2_stamp' || L.type === 'rock2_scatter').length;
+    App.undo();
+    assert.equal(RockCount(), 1, 'First undo must remove the scatter layer');
+    App.undo();
+    assert.equal(RockCount(), 0, 'Second undo must remove the hero stamp layer');
+    App.redo();
+    App.redo();
+    assert.equal(RockCount(), 2, 'Redo must restore both stamped rock layers');
+
+    // JSON round-trip keeps the RockFormation 2.0 terrain layers intact.
+    const Saved = JSON.parse(JSON.stringify(App.world.toJSON()));
+    const Restored = new WorldMask2D();
+    Restored.loadFromJSON(Saved);
+    const RestoredReg = Restored.regions.find(R => R.stack.some(L => L.type === 'rock2_stamp'));
+    assert.ok(RestoredReg, 'Exported world JSON must keep the Rock2.0 hero stamp layer');
+    const RL = RestoredReg.stack.find(L => L.type === 'rock2_stamp');
+    assert.equal(RL.rock2StarterId, 'stack-basalt-colonnade', 'Restored hero stamp must keep its starter id');
+    assert.ok(RestoredReg.stack.some(L => L.type === 'rock2_scatter'), 'Exported world JSON must keep the scatter layer');
+    EvaluateTerrainRegion(Restored, RestoredReg);
+    assert.ok(Number.isFinite(RestoredReg.runtime.maxHeight), 'Restored rock-stamped terrain must evaluate cleanly');
+});
+
 console.log('');
 if (Failures.length > 0)
 {
-    console.error(`${Failures.length} landform UI smoke check(s) FAILED (${Passed}/4 passed).`);
+    console.error(`${Failures.length} landform UI smoke check(s) FAILED (${Passed}/6 passed).`);
     for (const F of Failures) console.error(`\n--- ${F.Name}\n${F.Err.stack || F.Err.message}`);
     process.exit(1);
 }
-console.log(`All ${Passed}/4 Landform Studio UI smoke checks passed!`);
+console.log(`All ${Passed}/6 Landform + RockFormation 2.0 Terrain Studio UI smoke checks passed!`);
 // The studio keeps a requestAnimationFrame render loop alive; exit explicitly once the checks are done.
 process.exit(0);

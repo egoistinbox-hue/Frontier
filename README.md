@@ -16,6 +16,15 @@ General Purpose Editor — Experimental Studios.
   sea notches feed the existing sparse 3D brick Dual-Surface-Nets mesher.
 - Zero dead controls, enforced by Suite 39.
 
+**Phase L4 shipped: RockFormation 2.0 hero stamps & procedural rock scatter fused into the terrain.**
+
+- `rock2_stamp` layers stamp a live RockFormation 2.0 stack (crystals, colonnades, dikes, fins) onto the
+  landscape; `rock2_scatter` grows deterministic seeded outcrop fields gated by slope, ridge, coastline or
+  altitude band.
+- Rocks are anchored by their own baked QEF bounds, carry analytic talus skirts, and lift the underlying
+  heightfield through footprint coverage, so nothing floats. Still `0 Mesh → SDF` end to end.
+- Dedicated **Rock Scatter** inspector tab + quick-add cards; deep link `?ws=rockscatter`.
+
 ### Run
 
 Serve the `Experimental` folder over HTTP and open `TerrainWorldEditor/?ws=landform`.
@@ -28,8 +37,8 @@ cd Experimental && python3 -m http.server 8080
 
 ```
 node Experimental/TerrainWorldEditor/TerrainWorldValidation.mjs            # 36/36 legacy suites
-node Experimental/TerrainWorldEditor/TerrainWorldLandformValidation.mjs   # 8/8 Phase L1 suites
-node Experimental/TerrainWorldEditor/TerrainWorldUILandformSmoke.mjs      # 4/4 studio UI smoke checks
+node Experimental/TerrainWorldEditor/TerrainWorldLandformValidation.mjs   # 11/11 Phase L1 + L4 suites
+node Experimental/TerrainWorldEditor/TerrainWorldUILandformSmoke.mjs      # 6/6 studio UI smoke checks
 ```
 
 Architecture & roadmap: `Documentation/Plans/Phase-L1-UniversalLandformPrimitives.md`.

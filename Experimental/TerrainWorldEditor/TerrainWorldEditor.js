@@ -37,6 +37,12 @@ import {
     DescribeLandformLayer
 } from './Engine/Landforms/TerrainLandformPrimitives.js';
 import {
+    ROCK2_TERRAIN_STAMP_STARTERS,
+    ROCK_SCATTER_ARCHETYPES,
+    ROCK_SCATTER_PLACEMENTS,
+    CompileTerrainRockStamp
+} from './Engine/Landforms/TerrainRockStampEngine.js';
+import {
     CreateClimateGroup, CreateErosionState, StepErosionDay, BakeErosionYears,
     ApplyErosionToRegion, ErosionStateSummary, SampleClimate, AdvanceClimateDay,
     CLIMATE_REGIMES, EROSION_DEFAULTS
@@ -143,6 +149,13 @@ class TerrainWorldStudioApp
         {
             this.workspaceMode = 'split';
             this.inspectorTab = 'landform';
+        }
+        // Phase L4 deep links: ?ws=rockscatter (or ?tab=rockstamp) jumps straight into RockFormation 2.0 terrain stamps.
+        this._requestedRockStampTab = (ReqWs === 'rockscatter' || ReqWs === 'rockstamp' || UrlParams.get('tab') === 'rockstamp');
+        if (this._requestedRockStampTab)
+        {
+            this.workspaceMode = 'split';
+            this.inspectorTab = 'rockstamp';
         }
         this.outlinerFilter = 'all';  // 'all' | 'terrains' | 'splines' | 'masks'
         this.outlinerSearch = '';
@@ -704,6 +717,25 @@ class TerrainWorldStudioApp
             };
         });
 
+        const RockStampItems = [
+            {
+                title: '+ Rock2.0 Hero Stamp',
+                desc: 'Stamp a live RockFormation 2.0 stack (crystals, colonnades, fins) onto the terrain',
+                glyph: 'Crystal',
+                badge: 'ROCK2',
+                featured: false,
+                action: () => this.addRock2StampLayer('stack-crystal-cluster')
+            },
+            {
+                title: '+ Rock2.0 Scatter',
+                desc: 'Procedural boulder / hoodoo scatter on steep cliffs, ridges, coasts or altitude bands',
+                glyph: 'Boxes',
+                badge: 'SCATTER',
+                featured: false,
+                action: () => this.addRock2ScatterLayer()
+            }
+        ];
+
         const QuickItems = [
             {
                 title: '+ 3D Graded Spline (Gizmo)',
@@ -769,7 +801,8 @@ class TerrainWorldStudioApp
                 featured: false,
                 action: () => this.addProceduralLayer('terrace')
             },
-            ...LandformItems
+            ...LandformItems,
+            ...RockStampItems
         ];
         if (CountEl) CountEl.textContent = String(QuickItems.length);
 
@@ -998,6 +1031,60 @@ class TerrainWorldStudioApp
         this.map2D.invalidateRegionPreview(Reg.id);
 
         this.inspectorTab = 'landform';
+        this._syncInspectorTabButtons();
+        this.refreshChrome();
+        this.rebuildInspector();
+        return Layer;
+    }
+
+    /*======================================================================================================================================
+                         PHASE L4 · ROCKFORMATION 2.0 HERO STAMP & PROCEDURAL SCATTER LAYERS ON TERRAIN
+    ======================================================================================================================================*/
+    addRock2StampLayer(StarterId = 'stack-cliff-outcrop')
+    {
+        const Reg = this.getActiveRegion();
+        if (!Reg) return null;
+        this.pushUndoSnapshot();
+        const B = Reg.bounds;
+        const Layer = CreateTerrainLayer('rock2_stamp', {
+            name: `Rock2 Hero Stamp · ${(ROCK2_TERRAIN_STAMP_STARTERS.find(S => S[1] === StarterId) || ['Custom'])[0]}`,
+            rock2StarterId: StarterId,
+            worldX: Math.round(B.x + B.width * 0.5),
+            worldZ: Math.round(B.z + B.depth * 0.5),
+            worldScaleM: 180,
+            embedDepthM: 8,
+            falloff: { mode: 'none', distance: 200, edgeFloor: 1.0 }
+        });
+        Reg.stack.push(Layer);
+        this.activeLayerId = Layer.id;
+        EvaluateTerrainRegion(this.world, Reg, Layer.id);
+        Reg.meshDirty = true;
+        this.map2D.invalidateRegionPreview(Reg.id);
+        this.inspectorTab = 'rockstamp';
+        this._syncInspectorTabButtons();
+        this.refreshChrome();
+        this.rebuildInspector();
+        return Layer;
+    }
+
+    addRock2ScatterLayer()
+    {
+        const Reg = this.getActiveRegion();
+        if (!Reg) return null;
+        this.pushUndoSnapshot();
+        const Layer = CreateTerrainLayer('rock2_scatter', {
+            name: 'Rock2 Procedural Scatter',
+            scatterPlacement: 'cliffs',
+            scatterCount: 18,
+            worldScaleM: 64,
+            falloff: { mode: 'none', distance: 200, edgeFloor: 1.0 }
+        });
+        Reg.stack.push(Layer);
+        this.activeLayerId = Layer.id;
+        EvaluateTerrainRegion(this.world, Reg, Layer.id);
+        Reg.meshDirty = true;
+        this.map2D.invalidateRegionPreview(Reg.id);
+        this.inspectorTab = 'rockstamp';
         this._syncInspectorTabButtons();
         this.refreshChrome();
         this.rebuildInspector();
@@ -1306,7 +1393,7 @@ class TerrainWorldStudioApp
         {
             StudioTitle.textContent = Mode === 'rock2'
                 ? 'RockFormation 2.0 Studio — Frontier Experimental Remastered'
-                : 'SDF Terrain Studio — Landform Primitives · Frontier Experimental Remastered';
+                : 'SDF Terrain Studio — Landforms + RockFormation 2.0 · Frontier Experimental Remastered';
         }
 
         const ImpBtn = document.getElementById('import-btn');
@@ -1329,6 +1416,15 @@ class TerrainWorldStudioApp
         {
             this.inspectorTab = 'layers';
             this._syncInspectorTabButtons();
+        }
+        else if (Mode === 'split' || Mode === '3d' || Mode === '2d')
+        {
+            // Returning to a terrain workspace while on a mode-specific tab falls back to the terrain tabs.
+            if (this.inspectorTab === 'rock2' || this.inspectorTab === 'fracture')
+            {
+                this.inspectorTab = 'layers';
+                this._syncInspectorTabButtons();
+            }
         }
 
         this._buildQuickAddLibrary();
@@ -1394,6 +1490,14 @@ class TerrainWorldStudioApp
         for (const Btn of document.querySelectorAll('#inspector-tabs button'))
         {
             Btn.classList.toggle('active', Btn.dataset.itab === this.inspectorTab);
+        }
+        // Phase L4: the Rock Scatter tab is only meaningful while a RockFormation 2.0 terrain layer exists,
+        // but it must stay reachable so users can CREATE the first one from it.
+        const RockTab = document.querySelector('#inspector-tabs button[data-itab="rockstamp"]');
+        if (RockTab && !RockTab.dataset.p4Bound)
+        {
+            RockTab.dataset.p4Bound = '1';
+            RockTab.title = 'Phase L4 · Stamp live RockFormation 2.0 stacks & procedural rock scatter onto the terrain';
         }
     }
 
@@ -2081,7 +2185,9 @@ class TerrainWorldStudioApp
                         const IsSelLyr = R.id === this.activeRegionId && Lyr.id === this.activeLayerId;
                         const LRow = MakeEl('div', 'tree-row child-layer' + (IsSelLyr ? ' selected' : '') + (!Lyr.enabled ? ' is-off' : ''));
                         const Meta = LAYER_TYPE_META[Lyr.type] || LAYER_TYPE_META.multifractal;
-                        LRow.style.setProperty('--row-accent', Lyr.type === 'spline' ? '#eff4cf' : (Lyr.type === 'landform_primitive' ? '#66d9c8' : Meta.accent));
+                        LRow.style.setProperty('--row-accent', Lyr.type === 'spline' ? '#eff4cf'
+                            : (Lyr.type === 'landform_primitive' ? '#66d9c8'
+                            : (Lyr.type === 'rock2_stamp' || Lyr.type === 'rock2_scatter' ? '#e8c27a' : Meta.accent)));
 
                         const LSel = MakeEl('button', 'row-select');
                         LSel.type = 'button';
@@ -2111,6 +2217,10 @@ class TerrainWorldStudioApp
                                 this.view3D.activeLandformLayerId = Lyr.id;
                                 this.activeLandformLayerId = Lyr.id;
                                 this.inspectorTab = 'landform';
+                            }
+                            else if (Lyr.type === 'rock2_stamp' || Lyr.type === 'rock2_scatter')
+                            {
+                                this.inspectorTab = 'rockstamp';
                             }
                             else
                             {
@@ -2333,6 +2443,10 @@ class TerrainWorldStudioApp
         else if (this.inspectorTab === 'landform')
         {
             this._buildLandformInspectorTab(Content, Region);
+        }
+        else if (this.inspectorTab === 'rockstamp')
+        {
+            this._buildRockStampInspectorTab(Content, Region);
         }
         else
         {
@@ -3047,6 +3161,137 @@ class TerrainWorldStudioApp
             DetailGroup.Body.appendChild(ToggleRow);
         }
         Content.appendChild(DetailGroup.Group);
+    }
+
+    /*--------------------------------------------------------------------------------------------------------------------------------------
+                    TAB: PHASE L4 · ROCKFORMATION 2.0 HERO STAMP & PROCEDURAL SCATTER ON TERRAIN
+    --------------------------------------------------------------------------------------------------------------------------------------*/
+    _buildRockStampInspectorTab(Content, Region)
+    {
+        const TriggerLive = () => { Region.dirty = true; this._scheduleDirtyRegionsEvaluation(); };
+        const TriggerCommit = () =>
+        {
+            this._evaluateDirtyRegionsNow();
+            Region.meshDirty = true;
+            this.map2D.invalidateRegionPreview(Region.id);
+            this.refreshChrome();
+        };
+
+        // ---- Create cards ----------------------------------------------------------------------------
+        const CreateCard = MakePropertyGroup('RockFormation 2.0 → Terrain', 'Crystal', 'PHASE L4', true,
+            'Stamp live RockFormation 2.0 stacks onto the terrain (auto bedrock skirt fusion) or procedurally scatter outcrops across steep cliffs, ridges and coasts. 0 Mesh → SDF.');
+        const StampRow = MakeEl('div', 'studio-btn-row');
+        for (const [Label, StarterId] of ROCK2_TERRAIN_STAMP_STARTERS)
+        {
+            const B = MakeEl('button', 'button' + (StarterId === 'stack-cliff-outcrop' ? ' export-button' : ''), `+ ${Label}`);
+            B.type = 'button';
+            B.addEventListener('click', () => this.addRock2StampLayer(StarterId));
+            StampRow.appendChild(B);
+        }
+        CreateCard.Body.appendChild(StampRow);
+        const ScatterRow = MakeEl('div', 'studio-btn-row');
+        const AddScatter = MakeEl('button', 'button export-button', '+ Procedural Cliff Scatter');
+        AddScatter.type = 'button';
+        AddScatter.addEventListener('click', () => this.addRock2ScatterLayer());
+        ScatterRow.appendChild(AddScatter);
+        CreateCard.Body.appendChild(ScatterRow);
+        Content.appendChild(CreateCard.Group);
+
+        // ---- Active layer ---------------------------------------------------------------------------
+        const Layer = Region.stack.find(L => L.id === this.activeLayerId && (L.type === 'rock2_stamp' || L.type === 'rock2_scatter'))
+                   || Region.stack.find(L => L.type === 'rock2_stamp' || L.type === 'rock2_scatter');
+        if (!Layer) return;
+        this.activeLayerId = Layer.id;
+        const IsStamp = Layer.type === 'rock2_stamp';
+
+        const IdGroup = MakePropertyGroup(`${Layer.name}`, IsStamp ? 'Crystal' : 'Boxes', IsStamp ? 'HERO STAMP' : 'SCATTER', true,
+            IsStamp
+                ? 'One authored RockFormation 2.0 stack stamped on the terrain, rooted via a pure-SDF talus skirt.'
+                : 'Deterministic seeded rock field gated by slope / altitude / coastline placement rules.');
+
+        if (IsStamp)
+        {
+            IdGroup.Body.appendChild(MakeSelectRow('RockFormation 2.0 Stack', ROCK2_TERRAIN_STAMP_STARTERS, Layer.rock2StarterId || 'stack-cliff-outcrop', Val =>
+            {
+                this.pushUndoSnapshot();
+                Layer.rock2StarterId = Val;
+                Layer.rock2Doc = null;
+                TriggerLive();
+                TriggerCommit();
+                this.rebuildInspector();
+            }));
+        }
+        else
+        {
+            IdGroup.Body.appendChild(MakeSelectRow('Scatter Rock Archetype', ROCK_SCATTER_ARCHETYPES, Layer.scatterArchetype || 'big_boulder', Val =>
+            {
+                this.pushUndoSnapshot();
+                Layer.scatterArchetype = Val;
+                TriggerLive();
+                TriggerCommit();
+            }));
+            IdGroup.Body.appendChild(MakeSelectRow('Scatter Placement Rule', ROCK_SCATTER_PLACEMENTS, Layer.scatterPlacement || 'cliffs', Val =>
+            {
+                this.pushUndoSnapshot();
+                Layer.scatterPlacement = Val;
+                TriggerLive();
+                TriggerCommit();
+                this.rebuildInspector();
+            }));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Scatter Count', 0, 160, 1, Layer.scatterCount ?? 18, 0, 'n',
+                V => { Layer.scatterCount = V; TriggerLive(); }, TriggerCommit));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Slope Gate (steep cliffs)', 8, 88, 1, Layer.scatterSlopeDeg ?? 46, 0, '°',
+                V => { Layer.scatterSlopeDeg = V; TriggerLive(); }, TriggerCommit));
+            if (Layer.scatterPlacement === 'altitude')
+            {
+                IdGroup.Body.appendChild(MakeSliderPillRow('Min Altitude', -50, 1200, 5, Layer.scatterAltMinM ?? 0, 0, 'm',
+                    V => { Layer.scatterAltMinM = V; TriggerLive(); }, TriggerCommit));
+                IdGroup.Body.appendChild(MakeSliderPillRow('Max Altitude', 0, 1600, 5, Layer.scatterAltMaxM ?? 4000, 0, 'm',
+                    V => { Layer.scatterAltMaxM = V; TriggerLive(); }, TriggerCommit));
+            }
+            IdGroup.Body.appendChild(MakeSliderPillRow('Scatter Size Jitter', 0.0, 0.9, 0.01, Layer.scatterScaleJitter ?? 0.45, 2, 'w',
+                V => { Layer.scatterScaleJitter = V; TriggerLive(); }, TriggerCommit));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Rock Archetype Size', 8, 240, 2, Layer.worldScaleM ?? 64, 0, 'm',
+                V => { Layer.worldScaleM = V; TriggerLive(); }, TriggerCommit));
+        }
+
+        if (IsStamp)
+        {
+            const B = Region.bounds;
+            IdGroup.Body.appendChild(MakeSliderPillRow('Stamp World Scale', 20, 800, 5, Layer.worldScaleM ?? 180, 0, 'm',
+                V => { Layer.worldScaleM = V; TriggerLive(); }, TriggerCommit));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Stamp World X', Math.round(B.x), Math.round(B.x + B.width), 5, Layer.worldX ?? (B.x + B.width * 0.5), 0, 'm',
+                V => { Layer.worldX = V; TriggerLive(); }, TriggerCommit));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Stamp World Z', Math.round(B.z), Math.round(B.z + B.depth), 5, Layer.worldZ ?? (B.z + B.depth * 0.5), 0, 'm',
+                V => { Layer.worldZ = V; TriggerLive(); }, TriggerCommit));
+            IdGroup.Body.appendChild(MakeSliderPillRow('Stamp Yaw', 0, 360, 2, Layer.yawDeg ?? 0, 0, '°',
+                V => { Layer.yawDeg = V; TriggerLive(); }, TriggerCommit));
+        }
+
+        IdGroup.Body.appendChild(MakeSliderPillRow('Bedrock Embed Depth', 0, 60, 1, Layer.embedDepthM ?? 8, 0, 'm',
+            V => { Layer.embedDepthM = V; TriggerLive(); }, TriggerCommit));
+        IdGroup.Body.appendChild(MakeSliderPillRow('Talus Skirt Width', 0.0, 1.4, 0.02, Layer.talusWidth ?? 0.45, 2, 'w',
+            V => { Layer.talusWidth = V; TriggerLive(); }, TriggerCommit));
+        IdGroup.Body.appendChild(MakeSliderPillRow('Stamp Resolution (QEF)', 16, 64, 2, Layer.rock2Resolution ?? (IsStamp ? 40 : 32), 0, 'res',
+            V => { Layer.rock2Resolution = V; TriggerLive(); }, TriggerCommit));
+        IdGroup.Body.appendChild(MakeSliderPillRow('Layer Blend Opacity', 0.0, 1.0, 0.01, Layer.opacity ?? 1.0, 2, 'w',
+            V => { Layer.opacity = V; TriggerLive(); }, TriggerCommit));
+
+        // Compilation telemetry so users can see the live RockFormation 2.0 doc driving the terrain stamp.
+        const Info = MakeEl('div', 'landform-falloff-note');
+        try
+        {
+            const Cached = CompileTerrainRockStamp(Layer);
+            const Prims = Cached?.compiled?.primitives?.length ?? 0;
+            Info.appendChild(MakeEl('p', 'property-hint',
+                `Live RockFormation 2.0 compile: ${Prims} Pure-SDF primitives · stack extent ${Cached.extentX.toFixed(1)} × ${Cached.extentY.toFixed(1)} × ${Cached.extentZ.toFixed(1)} · QEF ${Cached.resolution}³ · 0 Mesh → SDF`));
+        }
+        catch (Err)
+        {
+            Info.appendChild(MakeEl('p', 'property-hint', `RockFormation 2.0 compile: ${Err.message}`));
+        }
+        IdGroup.Body.appendChild(Info);
+        Content.appendChild(IdGroup.Group);
     }
 
     /*--------------------------------------------------------------------------------------------------------------------------------------

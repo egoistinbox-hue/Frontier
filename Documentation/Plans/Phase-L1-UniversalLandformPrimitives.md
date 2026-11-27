@@ -1,7 +1,8 @@
 # Phase L1 · Universal SDF Basic Landform Primitives — Architecture & Status
 
-> Status: **Shipped** on `arena/87cceed7-frontier`.
-> Headless QA: `36/36` legacy terrain + rock suites, `8/8` landform engine suites, `4/4` studio UI smoke checks.
+> Status: **L1 shipped · L4 shipped** on `arena/87cceed7-frontier`.
+> Headless QA: `36/36` legacy terrain + rock suites, `11/11` landform + RockFormation 2.0 engine suites,
+> `6/6` studio UI smoke checks.
 
 Phase L1 is the foundation of the 5-phase plan to finish the 3D SDF Landscape Studio. Noise layers alone cannot
 author real-world landforms; every noise mountain looks like noise unless it sits on top of controllable geometric
@@ -72,8 +73,28 @@ Family/archetype catalog:
 | Command | Coverage |
 |---|---|
 | `node Experimental/TerrainWorldEditor/TerrainWorldValidation.mjs` | 36/36 legacy suites (no regressions) |
-| `node Experimental/TerrainWorldEditor/TerrainWorldLandformValidation.mjs` | Suites 37–44: catalog, all archetypes build, **zero dead controls**, 4 placement modes, A → B gizmo paths & undercut, terrain stamp / mesh / JSON round-trip, hydrology compatibility |
-| `node Experimental/TerrainWorldEditor/TerrainWorldUILandformSmoke.mjs` | Boots the real studio in a DOM shim, stamps all 29 archetypes from the UI, drives every gizmo handle, undo/redo & workspace switching |
+| `node Experimental/TerrainWorldEditor/TerrainWorldLandformValidation.mjs` | Suites 37–44: catalog, all archetypes build, **zero dead controls**, 4 placement modes, A → B gizmo paths & undercut, terrain stamp / mesh / JSON round-trip, hydrology compatibility. Suites 45–47: RockFormation 2.0 hero stamp instancing + QEF 0-Mesh→SDF proof, scatter placement gates (slope / ridge / coast / altitude) + determinism + talus rings, scatter grounding & bedrock fusion & JSON round-trip |
+| `node Experimental/TerrainWorldEditor/TerrainWorldUILandformSmoke.mjs` | Boots the real studio in a DOM shim, stamps all 29 archetypes from the UI, drives every gizmo handle, undo/redo & workspace switching. Suites 49–50: Rock Scatter tab + quick-add cards, all hero stamp starters & scatter rules through the UI, layer toggle, undo/redo and JSON round-trip |
+
+---
+
+### 1f · Phase L4 · RockFormation 2.0 hero stamps & procedural scatter on terrain (shipped)
+
+`Engine/Landforms/TerrainRockStampEngine.js` turns the whole RockFormation 2.0 stack authoring model into a terrain
+layer type — the rock stacks authored in the `rock2` workspace can now be stamped **into** the landscape.
+
+| Piece | Detail |
+|---|---|
+| `type: 'rock2_stamp'` | One authored RockFormation 2.0 document (`rock2StarterId` or a full `rock2Doc`) stamped at `worldX/worldZ`, `yawDeg`, `worldScaleM`. The stack is compiled once (`CompileTerrainRockStamp` → `compileRock2Stack`) and baked by `bakeRock2StackQefMesh`, then instanced through `BuildTerrainRockStampInstances`. |
+| `type: 'rock2_scatter'` | Deterministic seeded rock field. Placement rules `cliffs · ridges · coast · altitude · even` gate each candidate by local slope (`scatterSlopeDeg`), ridge curvature, shoreline SDF band or altitude window; archetypes come from `ROCK_SCATTER_ARCHETYPES`. |
+| Anchoring | The transform is derived from the **baked mesh AABB** (`MeshBounds`), so every rock's lowest vertex lands on `surfaceY − embedDepthM` — no floating outcrops, no sinks. |
+| Talus skirt fusion | `BuildRockTalusSkirt` emits a world-space debris ring per scattered rock (tagged `kind: 'skirt'`), fused straight into the terrain volume. |
+| Bedrock fusion | `RockStampFootprintCoverage` lifts the heightfield under a hero stamp so the rock is rooted in the terrain slab, blended by the layer mask. |
+| 0 Mesh → SDF | Asserted in suites 45 & 47: `bakeRock2StackQefMesh(...).sdfStats.meshToSdfCount === 0` for both stamp and scatter archetypes. |
+
+Authoring UX: quick-add cards **Rock2.0 Hero Stamp** / **Rock2.0 Scatter**, a dedicated **Rock Scatter** inspector tab
+(`?ws=rockscatter` / `?tab=rockstamp` deep links) with starter chips, placement rules, slope/altitude gates, size
+jitter, world placement, embed depth, talus width, QEF resolution and live compile telemetry.
 
 ---
 
@@ -92,7 +113,10 @@ The **true-3D tier** already exists for caves/tunnels/overhangs — this port st
 
 - **L3** · Terrain sculpt/erase polish on top of landforms (raise / lower / flatten / terrace / erode brushes already
   work over landforms; true-3D tunnel/overhang brushes exist — needs a dedicated landform-aware brush pass).
-- **L4** · Live **RockFormation 2.0** stamp & scatter layer on terrain (`type: 'rock_formation'` still points at the
-  legacy 1.0 preset object), with `smin` bedrock skirt fusion and slope/altitude procedural rock scatter.
+- **L4** · ✅ **Shipped** — live RockFormation 2.0 hero stamp (`rock2_stamp`) & procedural scatter (`rock2_scatter`)
+  terrain layers with analytic talus skirt + bedrock footprint fusion and slope / ridge / coast / altitude gates
+  (`Engine/Landforms/TerrainRockStampEngine.js`). Remaining polish: per-stack gizmo handles in the 3D viewport and
+  streaming the full `rock2` document JSON in/out of the terrain project. The legacy `type: 'rock_formation'`
+  (Rock Formation 1.0 presets) is untouched and still supported.
 - **L5** · Hydrology/erosion coupling polish per landform family (crater lakes, hogback water gaps, talus below mesas),
   triplanar strata shading, and multi-tile `.GLB` / `.OBJ` / `.STL` + 16-bit heightmap + splat/flow/AO export.

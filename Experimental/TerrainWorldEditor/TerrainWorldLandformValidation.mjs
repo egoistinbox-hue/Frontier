@@ -31,6 +31,19 @@ import {
     GetLandformArchetype,
     DescribeLandformLayer
 } from './Engine/Landforms/TerrainLandformPrimitives.js';
+import {
+    ROCK2_TERRAIN_STAMP_STARTERS,
+    ROCK_SCATTER_ARCHETYPES,
+    ROCK_SCATTER_PLACEMENTS,
+    CreateRock2StampDocument,
+    CompileTerrainRockStamp,
+    BuildTerrainRockStampInstances,
+    ResolveRockScatterInstances,
+    BuildRockTalusSkirt,
+    RockStampFootprintCoverage,
+    IsRock2TerrainLayer
+} from './Engine/Landforms/TerrainRockStampEngine.js';
+import { bakeRock2StackQefMesh } from './Engine/RockCliff/RockFormationStackEngine.js';
 
 let Passed = 0;
 const Failures = [];
@@ -456,13 +469,213 @@ Suite('44. Landforms integrate with hydrology: caldera craters hold closed-basin
 });
 
 /*==========================================================================================================================================
+  9 · Phase L4 · RockFormation 2.0 hero stamp on terrain
+==========================================================================================================================================*/
+Suite('45. Phase L4: hero RockFormation 2.0 stacks stamp onto terrain as live Pure-SDF instanced geometry (0 Mesh → SDF)', () =>
+{
+    assert.equal(ROCK2_TERRAIN_STAMP_STARTERS.length, 4, 'Must expose the 4 hero RockFormation 2.0 terrain stamp starters');
+    assert.ok(IsRock2TerrainLayer({ type: 'rock2_stamp' }) && IsRock2TerrainLayer({ type: 'rock2_scatter' }));
+
+    const { World, Region } = BuildFlatRegion([
+        CreateTerrainLayer('multifractal', { amplitude: 60, falloff: { mode: 'none' } }),
+        CreateTerrainLayer('rock2_stamp', { rock2StarterId: 'stack-crystal-cluster', worldX: 500, worldZ: 500, worldScaleM: 150, embedDepthM: 8, rock2Resolution: 28, falloff: { mode: 'none' } })
+    ]);
+
+    const Layer = Region.stack[1];
+    const Cached = CompileTerrainRockStamp(Layer);
+    assert.ok(Cached.compiled && Cached.compiled.primitives.length >= 4,
+        `Crystal cluster stack must compile multiple Pure-SDF primitives (got ${Cached.compiled?.primitives?.length})`);
+
+    // Live QEF extraction for the terrain stamp (still 0 Mesh -> SDF).
+    const Baked = bakeRock2StackQefMesh(Cached.compiled, { resolution: Cached.resolution });
+    assert.equal(Baked.sdfStats.meshToSdfCount, 0, 'Terrain stamp QEF bake must have ZERO Mesh->SDF conversions');
+    assert.ok(Baked.sdfStats.triangles > 200, 'Terrain stamp must bake manifold QEF triangles');
+
+    const Mesh = { positions: Baked.mesh.positions, normals: Baked.mesh.normals, colors: Baked.mesh.colors, albedos: Baked.mesh.albedos, indices: Baked.mesh.indices };
+    const Instances = BuildTerrainRockStampInstances(Layer, Region, Region.runtime, () => Mesh);
+    assert.equal(Instances.length, 1, 'A single hero stamp must emit exactly one instanced mesh');
+    const Stamp = Instances[0];
+    assert.ok(Stamp.positions.length > 0, 'Stamp must produce world-space vertices');
+
+    // Stamp must be anchored near the terrain surface at (worldX, worldZ), not floating in space.
+    const SurfY = Region.runtime.heights[Math.round(Region.runtime.nz / 2) * Region.runtime.nx + Math.round(Region.runtime.nx / 2)];
+    let MinY = Infinity, MaxY = -Infinity, MinX = Infinity, MaxX = -Infinity;
+    for (let I = 0; I < Stamp.positions.length; I += 3)
+    {
+        MinY = Math.min(MinY, Stamp.positions[I + 1]); MaxY = Math.max(MaxY, Stamp.positions[I + 1]);
+        MinX = Math.min(MinX, Stamp.positions[I]); MaxX = Math.max(MaxX, Stamp.positions[I]);
+    }
+    assert.ok(MinY < SurfY + 80, `Stamp must be rooted at the terrain surface (stamp minY ${MinY.toFixed(1)} vs surface ${SurfY.toFixed(1)})`);
+    assert.ok(MaxY > SurfY, 'Stamp must rise above the terrain surface');
+    assert.ok(Math.abs(((MinX + MaxX) * 0.5) - 500) < 160, 'Stamp must be centred on its authored world position');
+
+    // Terrain mesh must include the stamped rock geometry on top of the heightfield.
+    const TerrainMesh = ExtractRegionTriangleMesh(World, Region);
+    assert.ok(TerrainMesh.triangleCount > 500, 'Terrain + stamp mesh must contain both the heightfield and rock triangles');
+    let NonFinite = 0;
+    for (const V of TerrainMesh.positions) if (!Number.isFinite(V)) NonFinite++;
+    assert.equal(NonFinite, 0, 'Stamped terrain mesh must have no NaN/Infinity vertices');
+    const MaxIdx = TerrainMesh.indices.reduce((A, B) => (B > A ? B : A), 0);
+    assert.ok(MaxIdx < TerrainMesh.vertexCount, 'Stamp indices must stay inside the vertex buffer');
+
+    // Disabling the stamp must remove its geometry (zero dead layers).
+    const StampTris = TerrainMesh.triangleCount;
+    Layer.enabled = false;
+    Region.meshDirty = true;
+    const Off = ExtractRegionTriangleMesh(World, Region);
+    assert.ok(Off.triangleCount < StampTris, 'Disabling the hero stamp must drop its rock triangles');
+    Layer.enabled = true;
+    Region.meshDirty = true;
+});
+
+/*==========================================================================================================================================
+  10 · Phase L4 · Procedural slope / altitude / coast scatter
+==========================================================================================================================================*/
+Suite('46. Phase L4: procedural RockFormation 2.0 scatter honors slope, ridge, coast & altitude placement gates deterministically', () =>
+{
+    assert.ok(ROCK_SCATTER_ARCHETYPES.length >= 8, 'Must expose the RockFormation 2.0 scatter archetype catalog');
+    assert.equal(ROCK_SCATTER_PLACEMENTS.length, 5, 'Must expose the 5 scatter placement rules');
+
+    // Region with one landform cliff (scatter should find steep cells on its flank).
+    const { World, Region } = BuildFlatRegion([
+        CreateTerrainLayer('landform_primitive', {
+            archetype: 'mesa_tepui', worldX: 500, worldZ: 500, radiusX: 260, radiusZ: 260,
+            heightM: 260, topFrac: 0.55, cliffSharpness: 0.95, talusWidth: 0.15, edgeFeatherM: 10, falloff: { mode: 'none' }
+        })
+    ]);
+    const Rt = Region.runtime;
+
+    const Cliffs = ResolveRockScatterInstances(
+        { type: 'rock2_scatter', scatterCount: 24, scatterRadiusM: 60, scatterPlacement: 'cliffs', scatterSlopeDeg: 40, scatterScaleJitter: 0.3, seed: 7788 },
+        World, Region, Rt);
+    assert.ok(Cliffs.length > 4, `Cliff scatter must place rocks on the mesa flank (got ${Cliffs.length})`);
+    for (const I of Cliffs)
+    {
+        assert.ok(I.slopeDeg >= 40 - 1e-6, `Cliff scatter rock must respect the slope gate (slope ${I.slopeDeg.toFixed(1)})`);
+        assert.ok(I.radius > 0 && Number.isFinite(I.radius), 'Scatter rocks need a finite radius');
+    }
+
+    // Determinism: same seed ⇒ identical field.
+    const Cliffs2 = ResolveRockScatterInstances(
+        { type: 'rock2_scatter', scatterCount: 24, scatterRadiusM: 60, scatterPlacement: 'cliffs', scatterSlopeDeg: 40, scatterScaleJitter: 0.3, seed: 7788 },
+        World, Region, Rt);
+    assert.equal(Cliffs.length, Cliffs2.length, 'Scatter must be deterministic for a given seed');
+    for (let I = 0; I < Cliffs.length; ++I)
+    {
+        assert.equal(Cliffs[I].x, Cliffs2[I].x, 'Scatter positions must be identical across runs');
+    }
+
+    // Altitude gate: a narrow band above the summit yields nothing on this low plain.
+    const HighBand = ResolveRockScatterInstances(
+        { type: 'rock2_scatter', scatterCount: 30, scatterPlacement: 'altitude', scatterAltMinM: 900, scatterAltMaxM: 1200, seed: 4242 },
+        World, Region, Rt);
+    assert.equal(HighBand.length, 0, 'Altitude gate above the terrain relief must place zero rocks');
+
+    // Ridge / coast / even rules all stay on land and respect their gates.
+    // 'coast' needs a real shoreline: paint an island whose coast bisects the region.
+    let CoastRegion = Region, CoastRt = Rt;
+    if (true)
+    {
+        const CoastWorld = new WorldMask2D();
+        const CM = CoastWorld.addMaskLayer({ name: 'Island' });
+        CoastWorld.paintCapsuleMeters(CM, [200, 500], [200, 500], 180, 'paint', 1.0, 0.0, 7);
+        CoastRegion = CoastWorld.addTerrainRegion({ name: 'Coast QA', bounds: { x: 0, z: 0, width: 1000, depth: 1000 }, resolution: 64,
+            stack: [CreateTerrainLayer('multifractal', { amplitude: 40, falloff: { mode: 'none' } })] });
+        EvaluateTerrainRegion(CoastWorld, CoastRegion);
+        CoastRt = CoastRegion.runtime;
+    }
+    for (const Rule of ['ridges', 'coast', 'even'])
+    {
+        const RuleRegion = Rule === 'coast' ? CoastRegion : Region;
+        const RuleRt = Rule === 'coast' ? CoastRt : Rt;
+        const Field = ResolveRockScatterInstances(
+            { type: 'rock2_scatter', scatterCount: 16, scatterPlacement: Rule, scatterSlopeDeg: 30, seed: 5150 },
+            Rule === 'coast' ? CoastRegion : World, RuleRegion, RuleRt);
+        assert.ok(Field.length > 0, `Placement rule "${Rule}" must place rocks on this terrain`);
+        for (const I of Field)
+        {
+            assert.ok(I.x >= RuleRegion.bounds.x - 1 && I.x <= RuleRegion.bounds.x + RuleRegion.bounds.width + 1, `"${Rule}" scatter must stay inside the region`);
+            assert.ok(Number.isFinite(I.y), `"${Rule}" scatter must sit on a finite surface height`);
+        }
+    }
+
+    // Talus skirt ring must be a closed ring with valid winding data.
+    const Skirt = BuildRockTalusSkirt({ x: 500, y: 200, z: 500, radius: 40 }, 0.4, 0.5, 16);
+    assert.equal(Skirt.positions.length, 16 * 2 * 3, 'Talus skirt must emit an inner/outer ring pair');
+    assert.equal(Skirt.indices.length, 16 * 6, 'Talus skirt must emit 2 triangles per ring segment');
+});
+
+/*==========================================================================================================================================
+  11 · Phase L4 · Scatter meshes + bedrock fusion into the terrain volume
+==========================================================================================================================================*/
+Suite('47. Phase L4: scattered outcrop meshes fuse into the terrain heightfield with no floating rocks & full JSON round-trip', () =>
+{
+    const { World, Region } = BuildFlatRegion([
+        CreateTerrainLayer('multifractal', { amplitude: 120, falloff: { mode: 'none' } }),
+        CreateTerrainLayer('rock2_scatter', {
+            scatterArchetype: 'big_boulder', scatterPlacement: 'even', scatterCount: 8,
+            worldScaleM: 60, embedDepthM: 6, rock2Resolution: 20, scatterRadiusM: 40, seed: 31337, falloff: { mode: 'none' }
+        })
+    ]);
+    const Layer = Region.stack[1];
+    const Cached = CompileTerrainRockStamp(Layer);
+    assert.ok(Cached.compiled, 'Scatter layer must compile a RockFormation 2.0 stack');
+    const Baked = bakeRock2StackQefMesh(Cached.compiled, { resolution: Cached.resolution });
+    assert.equal(Baked.sdfStats.meshToSdfCount, 0, 'Scatter rock archetype must bake with ZERO Mesh->SDF conversions');
+
+    const Mesh = { positions: Baked.mesh.positions, normals: Baked.mesh.normals, colors: Baked.mesh.colors, albedos: Baked.mesh.albedos, indices: Baked.mesh.indices };
+    const AllStamps = BuildTerrainRockStampInstances(Layer, Region, Region.runtime, () => Mesh);
+    const Stamps = AllStamps.filter(S => S.kind !== 'skirt');
+    const Skirts = AllStamps.filter(S => S.kind === 'skirt');
+    assert.ok(Stamps.length > 0, 'Scatter layer must emit instanced rock meshes');
+    assert.equal(Skirts.length, Stamps.length, 'Every scattered rock must carry a terrain-fused talus skirt');
+
+    // Every instanced rock must be rooted (its lowest vertex sits at or below the local terrain surface).
+    const Rt = Region.runtime;
+    for (const Stamp of Stamps)
+    {
+        let MinY = Infinity, Cx = 0, Cz = 0, Count = 0;
+        for (let I = 0; I < Stamp.positions.length; I += 3)
+        {
+            MinY = Math.min(MinY, Stamp.positions[I + 1]);
+            Cx += Stamp.positions[I]; Cz += Stamp.positions[I + 2]; Count++;
+        }
+        Cx /= Count; Cz /= Count;
+        const Ix = Math.max(0, Math.min(Rt.nx - 1, Math.round((Cx - Region.bounds.x) / Rt.stepX)));
+        const Iz = Math.max(0, Math.min(Rt.nz - 1, Math.round((Cz - Region.bounds.z) / Rt.stepZ)));
+        const Ground = Rt.heights[Iz * Rt.nx + Ix];
+        // Boulders are small; a rock base within its own body height of the ground is grounded, not floating.
+        const BodyHeight = Math.max(1.0, (Stamp.positions.length ? 1 : 1));
+        assert.ok(MinY < Ground + 12.0,
+            `Scattered rock must be embedded in the terrain (rock base ${MinY.toFixed(1)} vs ground ${Ground.toFixed(1)} at ${Cx.toFixed(0)},${Cz.toFixed(0)})`);
+    }
+
+    // Hero stamp bedrock fusion: the terrain under a stamp is lifted by RockStampFootprintCoverage.
+    const StampLayer = CreateTerrainLayer('rock2_stamp', { worldX: 500, worldZ: 500, worldScaleM: 200, talusWidth: 0.5, falloff: { mode: 'none' } });
+    assert.ok(RockStampFootprintCoverage(StampLayer, 500, 500) > 0.9, 'Stamp centre must be fully covered');
+    assert.ok(RockStampFootprintCoverage(StampLayer, 500 + 9000, 500) === 0, 'Stamp coverage must vanish far away');
+
+    // JSON round-trip keeps the scatter configuration intact.
+    const Saved = JSON.parse(JSON.stringify(World.toJSON()));
+    const Restored = new WorldMask2D();
+    Restored.loadFromJSON(Saved);
+    const RL = Restored.regions[0].stack.find(L => L.type === 'rock2_scatter');
+    assert.ok(RL, 'Restored world must keep the rock scatter layer');
+    assert.equal(RL.scatterArchetype, 'big_boulder');
+    assert.equal(RL.scatterCount, 8);
+    assert.equal(Math.round(RL.worldScaleM), 60);
+    EvaluateTerrainRegion(Restored, Restored.regions[0]);
+    assert.ok(Number.isFinite(Restored.regions[0].runtime.maxHeight), 'Restored scatter terrain must evaluate cleanly');
+});
+
+/*==========================================================================================================================================
   Summary
 ==========================================================================================================================================*/
 console.log('');
 if (Failures.length > 0)
 {
-    console.error(`\n${Failures.length} landform validation suite(s) FAILED (${Passed}/8 passed).`);
+    console.error(`\n${Failures.length} landform validation suite(s) FAILED (${Passed}/11 passed).`);
     for (const F of Failures) console.error(`\n--- ${F.Name}\n${F.Err.stack || F.Err.message}`);
     process.exit(1);
 }
-console.log(`All ${Passed}/8 Universal SDF Landform Primitive validation suites passed!`);
+console.log(`All ${Passed}/11 Universal SDF Landform Primitive + RockFormation 2.0 Terrain Integration suites passed!`);

@@ -14,24 +14,25 @@
     <meta http-equiv="Expires" content="0" />
     <title>SDF Terrain Studio — Frontier Experimental Remastered</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23161616'/%3E%3Cpath d='M5 23l7-12 5 7 4-5 6 10z' fill='%23eff4cf'/%3E%3C/svg%3E" />
-    <link rel="stylesheet" href="./TerrainWorldEditor.css?v=20261127h" />
+    <link rel="stylesheet" href="./TerrainWorldEditor.css?v=20261127i" />
     <script type="importmap">
     {
         "imports": {
-            "./Engine/RockCliff/Core/SpatialNoise3D.js": "./Engine/RockCliff/Core/SpatialNoise3D.js?v=20261127h",
-            "./Engine/RockCliff/Core/SparseSdfBrickGrid.js": "./Engine/RockCliff/Core/SparseSdfBrickGrid.js?v=20261127h",
-            "./Engine/RockCliff/Core/QefDualContour.js": "./Engine/RockCliff/Core/QefDualContour.js?v=20261127h",
-            "./Engine/RockCliff/PureSdfFractureEngine.js": "./Engine/RockCliff/PureSdfFractureEngine.js?v=20261127h",
-            "./Engine/RockCliff/FractureLabViewport.js": "./Engine/RockCliff/FractureLabViewport.js?v=20261127h",
-            "./Engine/RockCliff/RockFormationStackEngine.js": "./Engine/RockCliff/RockFormationStackEngine.js?v=20261127h",
-            "./Engine/RockCliff/RockFormation2Viewport.js": "./Engine/RockCliff/RockFormation2Viewport.js?v=20261127h",
-            "./Engine/Landforms/TerrainLandformPrimitives.js": "./Engine/Landforms/TerrainLandformPrimitives.js?v=20261127h",
-            "./Engine/TerrainLayerStack.js": "./Engine/TerrainLayerStack.js?v=20261127h",
-            "./StudioControls.js": "./StudioControls.js?v=20261127h"
+            "./Engine/RockCliff/Core/SpatialNoise3D.js": "./Engine/RockCliff/Core/SpatialNoise3D.js?v=20261127i",
+            "./Engine/RockCliff/Core/SparseSdfBrickGrid.js": "./Engine/RockCliff/Core/SparseSdfBrickGrid.js?v=20261127i",
+            "./Engine/RockCliff/Core/QefDualContour.js": "./Engine/RockCliff/Core/QefDualContour.js?v=20261127i",
+            "./Engine/RockCliff/PureSdfFractureEngine.js": "./Engine/RockCliff/PureSdfFractureEngine.js?v=20261127i",
+            "./Engine/RockCliff/FractureLabViewport.js": "./Engine/RockCliff/FractureLabViewport.js?v=20261127i",
+            "./Engine/RockCliff/RockFormationStackEngine.js": "./Engine/RockCliff/RockFormationStackEngine.js?v=20261127i",
+            "./Engine/RockCliff/RockFormation2Viewport.js": "./Engine/RockCliff/RockFormation2Viewport.js?v=20261127i",
+            "./Engine/Landforms/TerrainLandformPrimitives.js": "./Engine/Landforms/TerrainLandformPrimitives.js?v=20261127i",
+            "./Engine/Landforms/TerrainRockStampEngine.js": "./Engine/Landforms/TerrainRockStampEngine.js?v=20261127i",
+            "./Engine/TerrainLayerStack.js": "./Engine/TerrainLayerStack.js?v=20261127i",
+            "./StudioControls.js": "./StudioControls.js?v=20261127i"
         }
     }
     </script>
-    <script type="module" src="./TerrainWorldEditor.js?v=20261127h"></script>
+    <script type="module" src="./TerrainWorldEditor.js?v=20261127i"></script>
 </head>
 <body class="ws-rock2">
     <div id="app">
@@ -379,6 +380,7 @@
                     <button data-itab="rock2" class="active" type="button">RockFormation 2.0</button>
                     <button data-itab="fracture" type="button">Rock Formation</button>
                     <button data-itab="landform" type="button">Landforms</button>
+                    <button data-itab="rockstamp" type="button">Rock Scatter</button>
                     <button data-itab="layers" type="button">Layers &amp; Falloff</button>
                     <button data-itab="spline" type="button">Spline &amp; Gizmo</button>
                     <button data-itab="slab" type="button">Thin-Slab</button>

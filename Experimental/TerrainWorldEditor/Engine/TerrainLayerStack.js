@@ -6,6 +6,9 @@
 
 import { ComputeRegionMaskSdf2D, MakeTerrainUid } from './WorldMask2D.js';
 import {
+    bakeRock2StackQefMesh
+} from './RockCliff/RockFormationStackEngine.js';
+import {
     createDefaultFractureParams,
     buildFracturedFormation,
     bakeFracturedFormationQefMesh
@@ -30,6 +33,19 @@ import {
     DescribeLandformLayer,
     LfSignedPathDistance
 } from './Landforms/TerrainLandformPrimitives.js';
+import {
+    ROCK2_TERRAIN_LAYER_TYPES,
+    ROCK2_TERRAIN_STAMP_STARTERS,
+    ROCK_SCATTER_ARCHETYPES,
+    ROCK_SCATTER_PLACEMENTS,
+    IsRock2TerrainLayer,
+    CreateRock2StampDocument,
+    CompileTerrainRockStamp,
+    BuildTerrainRockStampInstances,
+    ResolveRockScatterInstances,
+    BuildRockTalusSkirt,
+    RockStampFootprintCoverage
+} from './Landforms/TerrainRockStampEngine.js';
 
 const RockFormationQefCache = new WeakMap();
 
@@ -314,7 +330,9 @@ export const LAYER_TYPE_META = {
     spline:         { label: 'Spline Landform', badge: 'SPLINE', glyph: 'Spline', accent: '#3ec46d' },
     sculpt:         { label: 'SDF Sculpt Layer', badge: 'SCULPT', glyph: 'Brush', accent: '#ff7b7b' },
     rock_formation: { label: 'Pure-SDF Fractured Rock', badge: 'SDF ROCK', glyph: 'Boxes', accent: '#eff4cf' },
-    landform_primitive: { label: 'SDF Landform Primitive', badge: 'LANDFORM', glyph: 'Mountain', accent: '#66d9c8' }
+    landform_primitive: { label: 'SDF Landform Primitive', badge: 'LANDFORM', glyph: 'Mountain', accent: '#66d9c8' },
+    rock2_stamp:   { label: 'RockFormation 2.0 Hero Stamp', badge: 'ROCK2 STAMP', glyph: 'Crystal', accent: '#e8c27a' },
+    rock2_scatter: { label: 'RockFormation 2.0 Rock Scatter', badge: 'ROCK2 SCATTER', glyph: 'Boxes', accent: '#c9a86a' }
 };
 
 export function CreateTerrainLayer(Type = 'multifractal', Overrides = {})
@@ -437,6 +455,42 @@ export function CreateTerrainLayer(Type = 'multifractal', Overrides = {})
             ...Params,
             archetype: Archetype,
             seed: Params.seed ?? Overrides.seed ?? 4029
+        };
+    }
+    if (Type === 'rock2_stamp')
+    {
+        return {
+            ...Base,
+            worldX: Overrides.worldX ?? 0.0,
+            worldZ: Overrides.worldZ ?? 0.0,
+            yawDeg: Overrides.yawDeg ?? 0.0,
+            worldScaleM: Overrides.worldScaleM ?? 180.0,
+            embedDepthM: Overrides.embedDepthM ?? 8.0,
+            talusWidth: Overrides.talusWidth ?? 0.42,
+            talusSkirt: Overrides.talusSkirt !== false,
+            rock2Resolution: Overrides.rock2Resolution ?? 40,
+            rock2StarterId: Overrides.rock2StarterId || 'stack-cliff-outcrop',
+            rock2Doc: Overrides.rock2Doc || null,
+            stampInstances: Array.isArray(Overrides.stampInstances) ? Overrides.stampInstances : []
+        };
+    }
+    if (Type === 'rock2_scatter')
+    {
+        return {
+            ...Base,
+            scatterArchetype: Overrides.scatterArchetype || 'big_boulder',
+            scatterPlacement: Overrides.scatterPlacement || 'cliffs',
+            scatterCount: Overrides.scatterCount ?? 18,
+            scatterRadiusM: Overrides.scatterRadiusM ?? 70.0,
+            scatterSlopeDeg: Overrides.scatterSlopeDeg ?? 46.0,
+            scatterAltMinM: Overrides.scatterAltMinM ?? 0.0,
+            scatterAltMaxM: Overrides.scatterAltMaxM ?? 4000.0,
+            scatterScaleJitter: Overrides.scatterScaleJitter ?? 0.45,
+            worldScaleM: Overrides.worldScaleM ?? 70.0,
+            embedDepthM: Overrides.embedDepthM ?? 5.0,
+            talusWidth: Overrides.talusWidth ?? 0.5,
+            talusSkirt: Overrides.talusSkirt !== false,
+            rock2Resolution: Overrides.rock2Resolution ?? 32
         };
     }
     // 'sculpt'
@@ -845,6 +899,22 @@ export function EvaluateTerrainRegion(World, Region, PreviewLayerIdForFalloff = 
                     continue;
                 }
 
+                if (Type === 'rock2_stamp' || Type === 'rock2_scatter')
+                {
+                    // Phase L4 · RockFormation 2.0 bedrock fusion: lift the ground under a hero stamp so the rock is
+                    // rooted in the terrain volume (zero floating outcrops). Scatter rocks sit directly on the surface.
+                    if (Type === 'rock2_stamp')
+                    {
+                        const Cov = RockStampFootprintCoverage(Layer, Wx, Wz);
+                        if (Cov > 0.001)
+                        {
+                            const Bedrock = Math.max(CurH, CurH + (Number(Layer.worldScaleM) || 180.0) * 0.055 * Cov * (Number(Layer.embedDepthM) || 8.0) * 0.25);
+                            Heights[Idx] = Math.max(SlabBottom + 0.5, Mix(CurH, Bedrock, Clamp(Cov * MaskW, 0.0, 1.0)));
+                        }
+                    }
+                    continue;
+                }
+
                 if (Type === 'landform_primitive')
                 {
                     if (!Landform || !LfBounds) continue;
@@ -1022,6 +1092,12 @@ export function ComputeRegionBaseSignature(World, Region)
     {
         if (!Lyr || Lyr.name === 'Erosion Baked Surface') continue;
         MixStr(`|l:${Lyr.id}:${Lyr.type}:${Lyr.enabled ? 1 : 0}:${Lyr.opacity ?? 1}:${Lyr.combine || 'add'}:${Lyr.amplitude ?? 0}:${Lyr.scale ?? 0}:${Lyr.seed ?? 0}:${Lyr.octaves ?? 0}:${Lyr.gain ?? 0}:${Lyr.warp ?? 0}:${Lyr.sharpness ?? 0}:${Lyr.azimuth ?? 0}:${Lyr.variant ?? 0}:${Lyr.bedCount ?? 0}:${Lyr.strength ?? 0}:${Lyr.dipDeg ?? 0}:${Lyr.splineMode || ''}:${Lyr.width ?? 0}:${Lyr.amount ?? 0}:${Lyr.strokeCount ?? 0}:${Lyr.falloff?.mode || ''}:${Lyr.falloff?.distance ?? 0}:${Lyr.falloff?.edgeFloor ?? 0}`);
+        if (Lyr.type === 'rock2_stamp' || Lyr.type === 'rock2_scatter')
+        {
+            MixStr(`|r2:${Lyr.type}:${Lyr.rock2StarterId || ''}:${Lyr.scatterArchetype || ''}:${Lyr.scatterPlacement || ''}:${Lyr.scatterCount ?? 0}:${Lyr.scatterRadiusM ?? 0}:${Lyr.worldScaleM ?? 0}:${Lyr.embedDepthM ?? 0}:${Lyr.yawDeg ?? 0}`);
+            if (Array.isArray(Lyr.stampInstances)) for (const P of Lyr.stampInstances) MixStr(`p(${P.x},${P.z},${P.scale ?? 1},${P.yawDeg ?? 0})`);
+            if (Lyr.rock2Doc) MixStr(`doc:${JSON.stringify(Lyr.rock2Doc).length}:${JSON.stringify(Lyr.rock2Doc).slice(0, 96)}`);
+        }
         if (Lyr.type === 'landform_primitive')
         {
             // Every landform control must invalidate downstream erosion bakes (zero silent staleness).
@@ -1476,6 +1552,9 @@ export function ExtractRegionTriangleMesh(World, Region, Options = {})
     // Extract Pure-SDF Fractured Rock & Cliff Formations ('rock_formation' layers via QEF Dual Contouring!)
     AppendPureSdfRockFormationLayers(Region, Rt, PosList, NormList, ColList, AuxList, IdxList);
 
+    // Phase L4 · RockFormation 2.0 hero stamps & slope/altitude-scattered outcrops (0 Mesh -> SDF)
+    AppendRock2TerrainStampLayers(Region, Rt, PosList, NormList, ColList, AuxList, IdxList);
+
     return {
         positions: new Float32Array(PosList),
         normals: new Float32Array(NormList),
@@ -1552,6 +1631,90 @@ function AppendPureSdfRockFormationLayers(Region, Rt, PosList, NormList, ColList
         for (let I = 0; I < M.indices.length; ++I)
         {
             IdxList.push(BaseVert + M.indices[I]);
+        }
+    }
+}
+
+/*==========================================================================================================================================
+                        PHASE L4 · ROCKFORMATION 2.0 HERO STAMP & SCATTER TERRAIN MESHER
+==========================================================================================================================================*/
+const RockStampMeshCache = new WeakMap();
+
+function AppendRock2TerrainStampLayers(Region, Rt, PosList, NormList, ColList, AuxList, IdxList)
+{
+    if (!Region || !Array.isArray(Region.stack) || !Rt) return;
+    let Any = false;
+    for (const Layer of Region.stack)
+    {
+        if (IsRock2TerrainLayer(Layer) && Layer.enabled !== false) { Any = true; break; }
+    }
+    if (!Any) return;
+
+    const B = Region.bounds;
+    const MeshSampler = (Cached) =>
+    {
+        let Entry = RockStampMeshCache.get(Cached.compiled);
+        if (Entry && Entry.res === Cached.resolution) return Entry.mesh;
+        let Mesh = null;
+        try
+        {
+            const Baked = bakeRock2StackQefMesh(Cached.compiled, { resolution: Cached.resolution });
+            Mesh = Baked?.mesh || null;
+        }
+        catch (Err)
+        {
+            Mesh = null;
+        }
+        RockStampMeshCache.set(Cached.compiled, { res: Cached.resolution, mesh: Mesh });
+        return Mesh;
+    };
+
+    for (const Layer of Region.stack)
+    {
+        if (!IsRock2TerrainLayer(Layer) || Layer.enabled === false) continue;
+        const Opacity = Clamp(Number(Layer.opacity) ?? 1.0, 0.0, 1.0);
+        if (Opacity <= 1e-4) continue;
+
+        let Stamps = [];
+        try
+        {
+            Stamps = BuildTerrainRockStampInstances(Layer, Region, Rt, MeshSampler);
+        }
+        catch (Err)
+        {
+            Stamps = [];
+        }
+
+        for (const Stamp of Stamps)
+        {
+            const BaseVert = PosList.length / 3;
+            const N = Stamp.positions.length / 3;
+            const DryRock = ComputeFlatLithologyColor(
+                (Stamp.positions[1] + Stamp.positions[Stamp.positions.length - 2]) * 0.5,
+                (Region.runtime && Region.runtime.baseTop) || 0.0,
+                62.0, 0.0, -200.0, Rt.slabBottom ?? 0.0
+            );
+            for (let I = 0; I < N; ++I)
+            {
+                const P3 = I * 3;
+                PosList.push(Stamp.positions[P3], Stamp.positions[P3 + 1], Stamp.positions[P3 + 2]);
+                const Nx = Stamp.normals[P3], Ny = Stamp.normals[P3 + 1], Nz = Stamp.normals[P3 + 2];
+                const Len = Math.hypot(Nx, Ny, Nz) || 1.0;
+                NormList.push(Nx / Len, Ny / Len, Nz / Len);
+
+                // Rock albedo blended over a dry lithology base so stamps read as bedrock, not painted props.
+                const CR = Mix(DryRock[0], Stamp.colors[P3], 0.72) * (0.55 + 0.45 * Opacity);
+                const CG = Mix(DryRock[1], Stamp.colors[P3 + 1], 0.72) * (0.55 + 0.45 * Opacity);
+                const CB = Mix(DryRock[2], Stamp.colors[P3 + 2], 0.72) * (0.55 + 0.45 * Opacity);
+                ColList.push(CR, CG, CB);
+
+                const SlopeDeg = Math.acos(Clamp(Ny / Len, -1.0, 1.0)) * 57.2957795;
+                AuxList.push(Opacity, Clamp(SlopeDeg / 90.0, 0.0, 1.0), 0.0, 0.0);
+            }
+            for (let I = 0; I < Stamp.indices.length; ++I)
+            {
+                IdxList.push(BaseVert + Stamp.indices[I]);
+            }
         }
     }
 }

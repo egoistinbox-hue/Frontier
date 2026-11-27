@@ -89,6 +89,12 @@ struct BlendOutcome
     AuditReport                   Audit         = {};                                        // [-] - Audit of the new body
 };
 
+struct VertexBlendSettings
+{
+    double Size                = 0.1;                                                        // [len] - Setback distance along each incident edge from the vertex
+    bool   ClampOverlapEnabled = true;                                                       // [-]   - Clamp/refuse if adjacent vertex cuts overlap
+};
+
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    PUBLIC FUNCTIONS
 //------------------------------------------------------------------------------------------------------------------------
@@ -109,6 +115,12 @@ struct BlendOutcome
 //    ④ blueprint: trimmed faces (+ cap edges), blend faces, corner faces, SP-curves fitted with chart anchors;
 //    ⑤ AssembleBody, then AuditBody — an unsound result or a changed genus is refused.
 [[nodiscard]] BlendOutcome BlendEdges(ModelPartition& Partition, BodyToken Body, const std::vector<EdgeToken>& Edges, const BlendSettings& Settings);
+
+// 💡 Blender-style Vertex Bevel (Affect: Vertices): truncates each picked solid vertex at distance Settings.Size along all
+//    k incident edges, creating a k-gon corner face (3 edges → triangle, 4 → quad, 5 → pentagon, …) with
+//    BlendFaceOrigin::Vertex provenance. Vertices with 1 or 2 incident edges are denied.
+[[nodiscard]] BlendOutcome BevelVertices(ModelPartition& Partition, BodyToken Body, const std::vector<VertexToken>& Vertices,
+                                         const VertexBlendSettings& Settings);
 
 [[nodiscard]] const char* VertexBlendCategoryLabel(VertexBlendCategory Category) noexcept;
 [[nodiscard]] const char* BlendFaceOriginLabel(BlendFaceOrigin Origin) noexcept;

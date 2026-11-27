@@ -209,6 +209,7 @@ struct SketcherBlendRequest
     bool                   ReversedCondition = false;                                        // [-]   - Anchor at each edge's end vertex
     std::vector<std::pair<std::string, double>> VertexSizes = {};                            // [len] - Handles: size per persistent vertex name (unlisted: Size)
     bool                   ClampOverlapEnabled = true;                                       // [-]   - Clamp & merge at blocking vertices while other side continues beveling
+    bool                   VertexCondition   = false;                                        // [-]   - True: Blender-style Vertex Bevel (n-gon corner at each vertex)
 };
 
 // 📝 Pre-blend snapshot & current parameters of an already-committed Blend feature step (powers persistent post-bevel
@@ -222,6 +223,7 @@ struct SketcherBlendHandle
     GeometrySpace::Parametric::Vector3  Direction = {};                                             // [-]   - Unit outward bisector
     int                          Edges     = 0;                                              // [-]   - Picked edges meeting there
     double                       Spread    = 0.0;                                            // [-]   - Mean Direction · face normal (cos of half the turn)
+    bool                         VertexCondition = false;                                    // [-]   - True: vertex-bevel handle (DepthRate = Spread)
 };
 
 // 📝 What the picked edges allow: Span is the shortest length that bounds a blend on them (each open edge's length,
@@ -251,6 +253,7 @@ struct SketcherBlendStepControls
     bool                                    VariableEnabled     = false;                     // [-]   - End-to-end variable enabled
     double                                  EndSize             = 0.0;                       // [len] - Far-end size (when VariableEnabled)
     bool                                    ClampOverlapEnabled = true;                      // [-]   - Blocking-vertex clamp & merge enabled
+    bool                                    VertexCondition     = false;                     // [-]   - True: Blender-style Vertex Bevel step
     std::vector<SketcherBlendHandle>        Handles             = {};                        // [-]   - [0] blue uniform handle, [1..] white corner handles
     std::vector<double>                     CornerSizes         = {};                        // [len] - Per-handle overrides (0: follows Size)
     SketcherBlendFit                        Fit                 = {};                        // [len] - Reaches and merge distances
@@ -436,6 +439,9 @@ struct VehicleCurveFile;
 [[nodiscard]] std::vector<std::string> ResolveSketcherVertexBlendEdges(const SketcherDocument& Document, const std::vector<std::string>& Vertices);
 [[nodiscard]] std::vector<SketcherBlendHandle> MeasureSketcherBlendHandles(const SketcherDocument& Document, const std::vector<std::string>& Edges);
 [[nodiscard]] SketcherBlendFit MeasureSketcherBlendFit(const SketcherDocument& Document, const std::vector<std::string>& Edges);
+// Blender-style Vertex Bevel (Affect: Vertices): handle & fit measurements (denies vertices with 1 or 2 incident edges).
+[[nodiscard]] std::vector<SketcherBlendHandle> MeasureSketcherVertexBlendHandles(const SketcherDocument& Document, const std::vector<std::string>& Vertices);
+[[nodiscard]] SketcherBlendFit MeasureSketcherVertexBlendFit(const SketcherDocument& Document, const std::vector<std::string>& Vertices);
 // Persistent post-bevel editing: locate owning Blend step from a bevel face, measure its pre-blend blue/white handles,
 // and update its parameters in place (supporting live variable bevel adjustment and reversible vertex merge/unmerge).
 [[nodiscard]] std::string FindSketcherBlendStepForFace(const SketcherDocument& Document, const std::string& FaceName);

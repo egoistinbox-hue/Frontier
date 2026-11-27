@@ -18,6 +18,7 @@
 #include "Engine/GeometrySpace/Parametric/Intersection/IntersectionCurve.h"
 #include "Engine/GeometrySpace/Parametric/Intersection/SurfaceIntersection.h"
 #include "Engine/GeometrySpace/Parametric/Local/FaceChange.h"
+#include "Engine/GeometrySpace/Parametric/Surfacing/CurveFitting.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2527,6 +2528,611 @@ BlendOutcome BlendEdges(ModelPartition& Partition, BodyToken Body, const std::ve
     FRONTIER_TRACE_SCOPE("Blend", std::string(Settings.Profile == BlendProfile::Fillet ? "Fillet" : "Chamfer") + " · " + std::to_string(Edges.size()) +
                                   " edge(s) · size " + TraceNumber(Settings.Size) + (Settings.EndSize ? " → " + TraceNumber(*Settings.EndSize) : std::string()));
     BlendOutcome Outcome = BlendEdgesUntraced(Partition, Body, Edges, Settings);
+    FRONTIER_TRACE("Blend", Outcome.Refusal.empty() ? std::string("built · ") + std::to_string(Outcome.Audit.Findings.size()) + " audit finding(s)"
+                                                    : "refused: " + Outcome.Refusal);
+    return Outcome;
+}
+
+namespace
+{
+    [[nodiscard]] double MeasureCurveIntervalLength(const CurveGeometry& Curve, double Low, double High) noexcept
+    {
+        if (const auto* Line = std::get_if<StraightLine>(&Curve))
+            return std::abs(High - Low) * Length(Line->Direction);
+        constexpr int Steps = 64;
+        double Total = 0.0;
+        Vector3 Prev = EvaluateCurve(Curve, Low).Position;
+        for (int Step = 1; Step <= Steps; ++Step)
+        {
+            const double Param = Low + (High - Low) * (static_cast<double>(Step) / Steps);
+            const Vector3 Cur  = EvaluateCurve(Curve, Param).Position;
+            Total += Distance(Prev, Cur);
+            Prev = Cur;
+        }
+        return Total;
+    }
+
+    // Arc-length step `Offset` (> 0) along `Curve` starting from `FromStart ? Low : High` towards the other end.
+    [[nodiscard]] bool StepAlongCurveByArcLength(const CurveGeometry& Curve, double Low, double High, bool FromStart, double Offset,
+                                                 double& OutParam, Vector3& OutPoint) noexcept
+    {
+        if (const auto* Line = std::get_if<StraightLine>(&Curve))
+        {
+            const double Speed = Length(Line->Direction);
+            if (!(Speed > 1.0e-12)) return false;
+            const double Span = High - Low;
+            const double Delta = Offset / Speed;
+            if (!(Delta > 0.0) || !(Delta < Span)) return false;
+            OutParam = FromStart ? (Low + Delta) : (High - Delta);
+            OutPoint = EvaluateCurve(Curve, OutParam).Position;
+            return true;
+        }
+        constexpr int Samples = 128;
+        const double A = FromStart ? Low : High;
+        const double B = FromStart ? High : Low;
+        double Accum = 0.0;
+        Vector3 Prev = EvaluateCurve(Curve, A).Position;
+        double PrevT = A;
+        for (int Step = 1; Step <= Samples; ++Step)
+        {
+            const double CurT = A + (B - A) * (static_cast<double>(Step) / Samples);
+            const Vector3 Cur = EvaluateCurve(Curve, CurT).Position;
+            const double Seg  = Distance(Prev, Cur);
+            if (Accum + Seg >= Offset)
+            {
+                double LoT = PrevT, HiT = CurT;
+                double LoS = Accum, HiS = Accum + Seg;
+                for (int Iter = 0; Iter < 24; ++Iter)
+                {
+                    const double MidT = 0.5 * (LoT + HiT);
+                    const double MidS = LoS + Distance(EvaluateCurve(Curve, LoT).Position, EvaluateCurve(Curve, MidT).Position);
+                    if (MidS < Offset) { LoT = MidT; LoS = MidS; }
+                    else               { HiT = MidT; HiS = MidS; }
+                    if (std::abs(HiS - LoS) <= 1.0e-12) break;
+                }
+                OutParam = 0.5 * (LoT + HiT);
+                OutPoint = EvaluateCurve(Curve, OutParam).Position;
+                return true;
+            }
+            Accum += Seg;
+            Prev  = Cur;
+            PrevT = CurT;
+        }
+        return false;
+    }
+
+    [[nodiscard]] PlaneSurface ConstructCornerPlane(Vector3 Origin, Vector3 Normal) noexcept
+    {
+        const Vector3 UnitN = Normalize(Normal);
+        const Vector3 Seed  = std::abs(UnitN.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+        const Vector3 XAxis = Normalize(Seed - UnitN * Dot(Seed, UnitN));
+        const Vector3 YAxis = Cross(UnitN, XAxis);
+        return PlaneSurface{ { Origin, XAxis, YAxis, UnitN } };
+    }
+}
+
+static BlendOutcome BevelVerticesUntraced(ModelPartition& Partition, BodyToken Body, const std::vector<VertexToken>& Vertices,
+                                          const VertexBlendSettings& Settings)
+{
+    const auto   Started = std::chrono::steady_clock::now();
+    BlendOutcome Outcome;
+    const auto   Finish  = [&](std::string Refusal)
+    {
+        Outcome.Refusal = Refusal.empty() ? std::string{} : "Blend: " + Refusal;
+        Outcome.Statistics.Milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - Started).count();
+        return Outcome;
+    };
+
+    if (!Body.PresentCondition()) return Finish("no body");
+    if (Partition.Bodies.Resolve(Body).Category != BodyCategory::Solid)
+        return Finish("vertex bevel requires a solid body");
+    if (!(Settings.Size > 1.0e-7))
+        return Finish("vertex bevel size must be positive");
+    if (Vertices.empty())
+        return Finish("pick one or more vertices first");
+
+    const BodyInventory Inventory = Partition.CollectInventory(Body);
+    std::map<uint32_t, int> VertexIndex, EdgeIndex, FaceIndex;
+    BodyBlueprint Blueprint;
+    Blueprint.Category = BodyCategory::Solid;
+
+    Vector3 Low{ 1e300, 1e300, 1e300 }, High{ -1e300, -1e300, -1e300 };
+    for (size_t Index = 0; Index < Inventory.Vertices.size(); ++Index)
+    {
+        const Vector3 Position = Partition.Vertices.Resolve(Inventory.Vertices[Index]).Position;
+        VertexIndex[Inventory.Vertices[Index].Slot] = static_cast<int>(Index);
+        Blueprint.Vertices.push_back({ Position });
+        Low  = { std::min(Low.X, Position.X), std::min(Low.Y, Position.Y), std::min(Low.Z, Position.Z) };
+        High = { std::max(High.X, Position.X), std::max(High.Y, Position.Y), std::max(High.Z, Position.Z) };
+    }
+    const double Scale = std::max(1.0e-9, Distance(Low, High));
+    const double Tol   = 1.0e-6 * Scale;
+
+    for (size_t Index = 0; Index < Inventory.Edges.size(); ++Index)
+    {
+        const EdgeProfile& Profile = Partition.Edges.Resolve(Inventory.Edges[Index]);
+        EdgeIndex[Inventory.Edges[Index].Slot] = static_cast<int>(Index);
+        Blueprint.Edges.push_back({ Partition.Curves.Resolve(Profile.Curve), Profile.IntervalLow, Profile.IntervalHigh,
+                                    VertexIndex.at(Profile.Start.Slot), VertexIndex.at(Profile.End.Slot) });
+    }
+
+    // Fin lookup tables on the original body.
+    std::map<uint32_t, int> FinFaceIdx;
+    std::vector<std::vector<FinToken>> FinsFromVertex(Inventory.Vertices.size());
+    struct OriginalLoopEntry
+    {
+        FinToken       Fin          = {};
+        int            Edge         = -1;
+        Orientation    Sense        = Orientation::Forward;
+        ParameterCurve SurfaceCurve = {};
+    };
+    struct OriginalFaceLoops
+    {
+        SurfaceGeometry                      Surface = PlaneSurface{};
+        Orientation                          Sense   = Orientation::Forward;
+        std::vector<std::vector<OriginalLoopEntry>> Loops = {};
+    };
+    std::vector<OriginalFaceLoops> OrigFaces(Inventory.Faces.size());
+
+    for (size_t FIdx = 0; FIdx < Inventory.Faces.size(); ++FIdx)
+    {
+        const FaceProfile& Profile = Partition.Faces.Resolve(Inventory.Faces[FIdx]);
+        FaceIndex[Inventory.Faces[FIdx].Slot] = static_cast<int>(FIdx);
+        OrigFaces[FIdx].Surface = Partition.Surfaces.Resolve(Profile.Surface);
+        OrigFaces[FIdx].Sense   = Profile.Sense;
+        for (LoopToken Loop : Profile.Loops)
+        {
+            std::vector<OriginalLoopEntry> Entries;
+            std::string MissingSP;
+            Partition.EnumerateLoopFins(Loop, [&](FinToken Fin)
+            {
+                const FinProfile& FinRec = Partition.Fins.Resolve(Fin);
+                if (!FinRec.SurfaceCurve) { MissingSP = "fin without an SP-curve"; return; }
+                const int EIdx = EdgeIndex.at(FinRec.Edge.Slot);
+                const EdgeProfile& EdgeRec = Partition.Edges.Resolve(FinRec.Edge);
+                const VertexToken StartV = (FinRec.Sense == Orientation::Forward) ? EdgeRec.Start : EdgeRec.End;
+                FinsFromVertex[VertexIndex.at(StartV.Slot)].push_back(Fin);
+                FinFaceIdx[Fin.Slot] = static_cast<int>(FIdx);
+                Entries.push_back({ Fin, EIdx, FinRec.Sense, *FinRec.SurfaceCurve });
+            });
+            if (!MissingSP.empty()) return Finish(MissingSP);
+            OrigFaces[FIdx].Loops.push_back(std::move(Entries));
+        }
+    }
+
+    // Deduplicate picked vertices and verify every vertex belongs to Body.
+    std::vector<VertexToken> UniqueVertices;
+    std::set<int> PickedVertexSet;
+    for (VertexToken V : Vertices)
+    {
+        const auto It = VertexIndex.find(V.Slot);
+        if (It == VertexIndex.end())
+            return Finish(LabelToken("V", V) + " is not a vertex of the body");
+        if (PickedVertexSet.insert(It->second).second)
+            UniqueVertices.push_back(V);
+    }
+
+    // ① Walk the cyclic fin umbrella around each picked vertex and enforce degree >= 3 (1 or 2 edges denied).
+    struct VertexSpoke
+    {
+        int      EdgeIdx   = -1;
+        FinToken FinOut    = {};                                                             // Starts at V on FaceIdx
+        FinToken FinIn     = {};                                                             // Predecessor of FinOut on FaceIdx (ends at V)
+        int      FaceIdx   = -1;
+        bool     FromStart = true;
+        int      NewVert   = -1;                                                             // Cut vertex index in Blueprint.Vertices
+    };
+    struct VertexPlan
+    {
+        VertexToken              Token     = {};
+        int                      OrigIndex = -1;
+        std::vector<VertexSpoke> Spokes    = {};                                             // Ordered CCW around outward corner
+    };
+    std::vector<VertexPlan> Plans;
+    Plans.reserve(UniqueVertices.size());
+
+    // Track per-edge end usage so we can validate edge lengths before mutating Blueprint.Edges.
+    std::vector<bool> EdgeCutStart(Blueprint.Edges.size(), false);
+    std::vector<bool> EdgeCutEnd(Blueprint.Edges.size(), false);
+
+    for (VertexToken V : UniqueVertices)
+    {
+        const int VIdx = VertexIndex.at(V.Slot);
+        if (FinsFromVertex[VIdx].empty())
+            return Finish(LabelToken("V", V) + " has no incident fins");
+
+        VertexPlan Plan;
+        Plan.Token     = V;
+        Plan.OrigIndex = VIdx;
+
+        const FinToken FirstFin = FinsFromVertex[VIdx].front();
+        FinToken Cur = FirstFin;
+        std::set<uint32_t> VisitedFins;
+        for (int Guard = 0; Guard < 10000; ++Guard)
+        {
+            if (!VisitedFins.insert(Cur.Slot).second)
+                return Finish("non-manifold vertex umbrella at " + LabelToken("V", V));
+            const FinProfile& CurRec = Partition.Fins.Resolve(Cur);
+            const EdgeProfile& EdgeRec = Partition.Edges.Resolve(CurRec.Edge);
+            if (EdgeRec.Start == EdgeRec.End)
+                return Finish("vertex bevel cannot split closed self-loop edge at " + LabelToken("V", V));
+
+            const int EIdx = EdgeIndex.at(CurRec.Edge.Slot);
+            const bool FromStart = (EdgeRec.Start.Slot == V.Slot);
+            const FinToken FinIn = CurRec.Predecessor;
+            if (!FinIn.PresentCondition())
+                return Finish("open boundary fin at " + LabelToken("V", V));
+
+            Plan.Spokes.push_back({ EIdx, Cur, FinIn, FinFaceIdx.at(Cur.Slot), FromStart, -1 });
+
+            const FinToken Next = Partition.RadialMate(FinIn);
+            if (!Next.PresentCondition() || Next == FinIn)
+                return Finish("open sheet edge at " + LabelToken("V", V));
+            Cur = Next;
+            if (Cur == FirstFin) break;
+        }
+        if (Cur != FirstFin || Plan.Spokes.size() != FinsFromVertex[VIdx].size())
+            return Finish("non-manifold vertex at " + LabelToken("V", V));
+
+        if (Plan.Spokes.size() < 3)
+            return Finish("vertex bevel requires at least 3 edges at a vertex (1 or 2 edges cannot form an n-gon)");
+
+        for (const VertexSpoke& Spoke : Plan.Spokes)
+        {
+            if (Spoke.FromStart) EdgeCutStart[Spoke.EdgeIdx] = true;
+            else                 EdgeCutEnd[Spoke.EdgeIdx]   = true;
+        }
+        Plans.push_back(std::move(Plan));
+    }
+
+    // ② Validate edge lengths against setback(s).
+    for (size_t EIdx = 0; EIdx < Blueprint.Edges.size(); ++EIdx)
+    {
+        if (!EdgeCutStart[EIdx] && !EdgeCutEnd[EIdx]) continue;
+        const int Cuts = (EdgeCutStart[EIdx] ? 1 : 0) + (EdgeCutEnd[EIdx] ? 1 : 0);
+        const double Len = MeasureCurveIntervalLength(Blueprint.Edges[EIdx].Curve, Blueprint.Edges[EIdx].Low, Blueprint.Edges[EIdx].High);
+        if (Cuts * Settings.Size >= Len - Tol)
+        {
+            return Finish(Cuts == 2 ? "adjacent vertex bevels overlap along an edge"
+                                    : "vertex bevel size exceeds incident edge length");
+        }
+    }
+
+    // ③ Compute cut vertices along each spoke and shorten the incident Blueprint.Edges.
+    std::vector<bool> EdgeShortened(Blueprint.Edges.size(), false);
+    for (VertexPlan& Plan : Plans)
+    {
+        for (VertexSpoke& Spoke : Plan.Spokes)
+        {
+            BlueprintEdge& Edge = Blueprint.Edges[Spoke.EdgeIdx];
+            double CutParam = 0.0;
+            Vector3 CutPos  = {};
+            if (!StepAlongCurveByArcLength(Edge.Curve, Edge.Low, Edge.High, Spoke.FromStart, Settings.Size, CutParam, CutPos))
+                return Finish("failed to locate cut point along edge at " + LabelToken("V", Plan.Token));
+
+            const int NewVIdx = static_cast<int>(Blueprint.Vertices.size());
+            Blueprint.Vertices.push_back({ CutPos });
+            Spoke.NewVert = NewVIdx;
+            if (Spoke.FromStart)
+            {
+                Edge.Low   = CutParam;
+                Edge.Start = NewVIdx;
+            }
+            else
+            {
+                Edge.High = CutParam;
+                Edge.End  = NewVIdx;
+            }
+            EdgeShortened[Spoke.EdgeIdx] = true;
+        }
+    }
+
+    // ④ Create rim edges across each incident face and record where to splice them into the face loops.
+    //    On Face_i (between Spoke[i] at P_i and Spoke[(i+1)%k] at P_{i+1}):
+    //    FinIn_i arrives along Spoke[i+1] at P_{i+1}, FinOut_i leaves along Spoke[i] from P_i.
+    //    So the new rim edge goes P_{i+1} -> P_i inside Face_i (Forward in Face_i, Reversed in the k-gon corner face).
+    std::map<uint32_t, int> RimEdgeAfterFin;                                                 // FinIn.Slot -> Blueprint.Edges index
+    std::vector<std::vector<int>> PlanRimEdges(Plans.size());                                // Per vertex, edge from P_{i+1} -> P_i
+
+    const auto FitBlueprintUse = [&](const SurfaceGeometry& Surface, int EdgeIdx, Orientation Sense, Vector2 Reference) -> ParameterCurve
+    {
+        const BlueprintEdge& Edge = Blueprint.Edges[EdgeIdx];
+        const Vector3 Middle = EvaluateCurve(Edge.Curve, 0.5 * (Edge.Low + Edge.High)).Position;
+        const Vector2 Anchor = ProjectOntoSurface(Surface, Middle, Reference);
+        ParameterCurve Fitted = FitSurfaceCurve(Surface, Edge.Curve, Edge.Low, Edge.High,
+                                                { Anchor - Vector2{ 1.0, 1.0 }, Anchor + Vector2{ 1.0, 1.0 } }, Anchor);
+        (void)Sense;
+        return Fitted;
+    };
+
+    for (size_t PIdx = 0; PIdx < Plans.size(); ++PIdx)
+    {
+        const VertexPlan& Plan = Plans[PIdx];
+        const size_t K = Plan.Spokes.size();
+        PlanRimEdges[PIdx].resize(K, -1);
+
+        for (size_t I = 0; I < K; ++I)
+        {
+            const VertexSpoke& CurSpoke  = Plan.Spokes[I];
+            const VertexSpoke& NextSpoke = Plan.Spokes[(I + 1) % K];
+            const int VFrom = NextSpoke.NewVert;                                             // P_{i+1}
+            const int VTo   = CurSpoke.NewVert;                                              // P_i
+            const Vector3 PFrom = Blueprint.Vertices[VFrom].Position;
+            const Vector3 PTo   = Blueprint.Vertices[VTo].Position;
+            const double Span   = Distance(PFrom, PTo);
+            if (!(Span > Tol))
+                return Finish("degenerate corner edge at " + LabelToken("V", Plan.Token));
+
+            const SurfaceGeometry& FaceSurf = OrigFaces[CurSpoke.FaceIdx].Surface;
+            CurveGeometry RimCurve;
+            double LowT = 0.0, HighT = Span;
+
+            if (std::holds_alternative<PlaneSurface>(FaceSurf))
+            {
+                RimCurve = StraightLine{ PFrom, (PTo - PFrom) * (1.0 / Span) };
+            }
+            else
+            {
+                // Fit a geodesic-like UV chord on the curved incident face so the rim lies on FaceSurf.
+                const FinProfile& FinInRec = Partition.Fins.Resolve(CurSpoke.FinIn);
+                const FinProfile& FinOutRec = Partition.Fins.Resolve(CurSpoke.FinOut);
+                const BlueprintEdge& EdgeIn  = Blueprint.Edges[NextSpoke.EdgeIdx];
+                const BlueprintEdge& EdgeOut = Blueprint.Edges[CurSpoke.EdgeIdx];
+                const Vector2 RefIn  = FinInRec.SurfaceCurve
+                                     ? EvaluateParameterCurve(*FinInRec.SurfaceCurve, NextSpoke.FromStart ? EdgeIn.Low : EdgeIn.High).Position
+                                     : Vector2{};
+                const Vector2 RefOut = FinOutRec.SurfaceCurve
+                                     ? EvaluateParameterCurve(*FinOutRec.SurfaceCurve, CurSpoke.FromStart ? EdgeOut.Low : EdgeOut.High).Position
+                                     : RefIn;
+                const Vector2 UVFrom = ProjectOntoSurface(FaceSurf, PFrom, RefIn);
+                const Vector2 UVTo   = ProjectOntoSurface(FaceSurf, PTo, UVFrom + (RefOut - RefIn));
+
+                constexpr int Samples = 17;
+                std::vector<Vector3> Points;
+                Points.reserve(Samples);
+                Points.push_back(PFrom);
+                for (int S = 1; S < Samples - 1; ++S)
+                {
+                    const double U = static_cast<double>(S) / (Samples - 1);
+                    const Vector2 UV = UVFrom * (1.0 - U) + UVTo * U;
+                    Points.push_back(EvaluateSurface(FaceSurf, UV).Position);
+                }
+                Points.push_back(PTo);
+
+                CurveFitSettings FitCfg;
+                FitCfg.Tolerance = std::max(1.0e-5 * Scale, 1.0e-7);
+                FitCfg.Degree    = 3;
+                const CurveFitOutcome Fit = FitSpaceCurve(Points, FitCfg);
+                if (Fit.Refusal.empty() && Fit.Curve.Definition)
+                {
+                    RimCurve = Fit.Curve;
+                    LowT  = 0.0;
+                    HighT = 1.0;
+                }
+                else
+                {
+                    RimCurve = StraightLine{ PFrom, (PTo - PFrom) * (1.0 / Span) };
+                }
+            }
+
+            const int NewEdgeIdx = static_cast<int>(Blueprint.Edges.size());
+            Blueprint.Edges.push_back({ RimCurve, LowT, HighT, VFrom, VTo });
+            RimEdgeAfterFin[CurSpoke.FinIn.Slot] = NewEdgeIdx;
+            PlanRimEdges[PIdx][I] = NewEdgeIdx;
+        }
+    }
+
+    // ⑤ Rebuild existing faces: keep untouched SP-curves verbatim, refit shortened edges + new rim edges on their original UV branch.
+    std::vector<BlendFaceHistory> Provenance;
+    Provenance.reserve(OrigFaces.size() + Plans.size());
+    for (size_t FIdx = 0; FIdx < OrigFaces.size(); ++FIdx)
+    {
+        BlueprintFace Rebuilt{ OrigFaces[FIdx].Surface, OrigFaces[FIdx].Sense, {} };
+        for (const std::vector<OriginalLoopEntry>& OrigLoop : OrigFaces[FIdx].Loops)
+        {
+            std::vector<BlueprintUse> NewLoop;
+            NewLoop.reserve(OrigLoop.size() + 4);
+            for (const OriginalLoopEntry& Entry : OrigLoop)
+            {
+                const BlueprintEdge& Edge = Blueprint.Edges[Entry.Edge];
+                ParameterCurve SP = Entry.SurfaceCurve;
+                if (EdgeShortened[Entry.Edge])
+                {
+                    const Vector2 MidRef = EvaluateParameterCurve(Entry.SurfaceCurve, 0.5 * (Edge.Low + Edge.High)).Position;
+                    SP = FitBlueprintUse(Rebuilt.Surface, Entry.Edge, Entry.Sense, MidRef);
+                }
+                NewLoop.push_back({ Entry.Edge, Entry.Sense, SP });
+
+                const auto CutIt = RimEdgeAfterFin.find(Entry.Fin.Slot);
+                if (CutIt != RimEdgeAfterFin.end())
+                {
+                    const double EndParam = (Entry.Sense == Orientation::Forward) ? Edge.High : Edge.Low;
+                    const Vector2 EndRef  = EvaluateParameterCurve(SP, EndParam).Position;
+                    const ParameterCurve CutSP = FitBlueprintUse(Rebuilt.Surface, CutIt->second, Orientation::Forward, EndRef);
+                    NewLoop.push_back({ CutIt->second, Orientation::Forward, CutSP });
+                }
+            }
+            Rebuilt.Loops.push_back(std::move(NewLoop));
+        }
+        Blueprint.Faces.push_back(std::move(Rebuilt));
+        Provenance.push_back({ {}, BlendFaceOrigin::Modified, Inventory.Faces[FIdx], {}, {} });
+    }
+
+    // ⑥ Build the k-gon corner face(s) for each beveled vertex (P_0 -> P_1 -> ... -> P_{k-1} -> P_0).
+    for (size_t PIdx = 0; PIdx < Plans.size(); ++PIdx)
+    {
+        const VertexPlan& Plan = Plans[PIdx];
+        const size_t K = Plan.Spokes.size();
+
+        std::vector<Vector3> RingPts;
+        std::vector<Vector3> DensePts;
+        bool AllStraight = true;
+        RingPts.reserve(K);
+        for (size_t I = 0; I < K; ++I)
+        {
+            RingPts.push_back(Blueprint.Vertices[Plan.Spokes[I].NewVert].Position);
+            const BlueprintEdge& Rim = Blueprint.Edges[PlanRimEdges[PIdx][I]];
+            if (std::holds_alternative<StraightLine>(Rim.Curve))
+            {
+                DensePts.push_back(RingPts.back());
+            }
+            else
+            {
+                AllStraight = false;
+                constexpr int Sub = 6;
+                for (int S = 0; S < Sub; ++S)
+                {
+                    // Rim goes P_{i+1} -> P_i, so traverse reversed (High -> Low) for P_i -> P_{i+1}.
+                    const double T = Rim.High - (Rim.High - Rim.Low) * (static_cast<double>(S) / Sub);
+                    DensePts.push_back(EvaluateCurve(Rim.Curve, T).Position);
+                }
+            }
+        }
+
+        Vector3 Centre{};
+        for (const Vector3& Pt : RingPts) Centre = Centre + Pt;
+        Centre = Centre * (1.0 / static_cast<double>(K));
+
+        Vector3 Newell{};
+        for (size_t I = 0; I < DensePts.size(); ++I)
+            Newell = Newell + Cross(DensePts[I], DensePts[(I + 1) % DensePts.size()]);
+        const double NewellLen = Length(Newell);
+        if (!(NewellLen > 1.0e-12 * Scale * Scale))
+            return Finish("corner face collapsed at " + LabelToken("V", Plan.Token));
+        const Vector3 Normal = Newell * (1.0 / NewellLen);
+
+        double Deviation = 0.0;
+        for (const Vector3& Pt : DensePts)
+            Deviation = std::max(Deviation, std::abs(Dot(Pt - Centre, Normal)));
+
+        if (Deviation <= 1.0e-5 * Scale)
+        {
+            // Single planar k-gon corner face (3 -> triangle, 4 -> quad, 5 -> pentagon, ...).
+            const PlaneSurface CornerSurf = ConstructCornerPlane(Centre, Normal);
+            BlueprintFace CornerFace{ CornerSurf, Orientation::Forward, {} };
+            std::vector<BlueprintUse> Loop;
+            Loop.reserve(K);
+            Vector2 Ref{};
+            for (size_t I = 0; I < K; ++I)
+            {
+                const int RimIdx = PlanRimEdges[PIdx][I];
+                const ParameterCurve SP = FitBlueprintUse(CornerFace.Surface, RimIdx, Orientation::Reversed, Ref);
+                Ref = EvaluateParameterCurve(SP, Blueprint.Edges[RimIdx].Low).Position;
+                Loop.push_back({ RimIdx, Orientation::Reversed, SP });
+            }
+            CornerFace.Loops.push_back(std::move(Loop));
+            Blueprint.Faces.push_back(std::move(CornerFace));
+            Provenance.push_back({ {}, BlendFaceOrigin::Vertex, {}, {}, Plan.Token });
+        }
+        else if (K == 4 && AllStraight)
+        {
+            // Non-planar 4-gon corner: single bilinear 1x1 NURBS quad face.
+            const Vector3 A = RingPts[0], B = RingPts[1], C = RingPts[2], D = RingPts[3];
+            std::optional<NurbsSurface> Patch = ConstructNurbsSurface(
+                1, 1, 2, 2, { 0.0, 0.0, 1.0, 1.0 }, { 0.0, 0.0, 1.0, 1.0 }, { A, D, B, C }, { 1.0, 1.0, 1.0, 1.0 });
+            if (!Patch)
+                return Finish("failed to build bilinear quad corner at " + LabelToken("V", Plan.Token));
+
+            const Vector3 PatchNormal = EvaluateSurfaceNormal(*Patch, { 0.5, 0.5 });
+            BlueprintFace CornerFace{ *Patch, Dot(PatchNormal, Normal) >= 0.0 ? Orientation::Forward : Orientation::Reversed, {} };
+            std::vector<BlueprintUse> Loop;
+            Loop.reserve(4);
+            Vector2 Ref{ 0.5, 0.5 };
+            for (size_t I = 0; I < 4; ++I)
+            {
+                const int RimIdx = PlanRimEdges[PIdx][I];
+                const ParameterCurve SP = FitBlueprintUse(CornerFace.Surface, RimIdx, Orientation::Reversed, Ref);
+                Ref = EvaluateParameterCurve(SP, Blueprint.Edges[RimIdx].Low).Position;
+                Loop.push_back({ RimIdx, Orientation::Reversed, SP });
+            }
+            CornerFace.Loops.push_back(std::move(Loop));
+            Blueprint.Faces.push_back(std::move(CornerFace));
+            Provenance.push_back({ {}, BlendFaceOrigin::Vertex, {}, {}, Plan.Token });
+        }
+        else
+        {
+            // Non-planar k >= 5 (or curved non-planar corner): fan k planar triangles meeting at Centre.
+            const int CentreIdx = static_cast<int>(Blueprint.Vertices.size());
+            Blueprint.Vertices.push_back({ Centre });
+            std::vector<int> Spokes(K, -1);
+            for (size_t I = 0; I < K; ++I)
+            {
+                const Vector3 Dir = RingPts[I] - Centre;
+                const double Len  = Length(Dir);
+                if (!(Len > Tol))
+                    return Finish("degenerate corner spoke at " + LabelToken("V", Plan.Token));
+                Spokes[I] = static_cast<int>(Blueprint.Edges.size());
+                Blueprint.Edges.push_back({ StraightLine{ Centre, Dir * (1.0 / Len) }, 0.0, Len, CentreIdx, Plan.Spokes[I].NewVert });
+            }
+            for (size_t I = 0; I < K; ++I)
+            {
+                const size_t NextI = (I + 1) % K;
+                const Vector3 TriN = Cross(RingPts[I] - Centre, RingPts[NextI] - Centre);
+                if (!(Length(TriN) > 1.0e-12 * Scale * Scale))
+                    return Finish("degenerate corner triangle at " + LabelToken("V", Plan.Token));
+                const PlaneSurface TriSurf = ConstructCornerPlane(Centre, TriN);
+                BlueprintFace TriFace{ TriSurf, Orientation::Forward, {} };
+                std::vector<BlueprintUse> Loop;
+                Loop.push_back({ Spokes[I], Orientation::Forward, FitBlueprintUse(TriFace.Surface, Spokes[I], Orientation::Forward, {}) });
+                Loop.push_back({ PlanRimEdges[PIdx][I], Orientation::Reversed, FitBlueprintUse(TriFace.Surface, PlanRimEdges[PIdx][I], Orientation::Reversed, {}) });
+                Loop.push_back({ Spokes[NextI], Orientation::Reversed, FitBlueprintUse(TriFace.Surface, Spokes[NextI], Orientation::Reversed, {}) });
+                TriFace.Loops.push_back(std::move(Loop));
+                Blueprint.Faces.push_back(std::move(TriFace));
+                Provenance.push_back({ {}, BlendFaceOrigin::Vertex, {}, {}, Plan.Token });
+            }
+        }
+    }
+
+    // ⑦ Drop beveled original vertices (now unreferenced) and compact Blueprint.Vertices / edge indices.
+    {
+        std::vector<int> Remap(Blueprint.Vertices.size(), -1);
+        std::vector<BlueprintVertex> CompactVerts;
+        CompactVerts.reserve(Blueprint.Vertices.size() - PickedVertexSet.size());
+        for (size_t VIdx = 0; VIdx < Blueprint.Vertices.size(); ++VIdx)
+        {
+            if (PickedVertexSet.contains(static_cast<int>(VIdx))) continue;
+            Remap[VIdx] = static_cast<int>(CompactVerts.size());
+            CompactVerts.push_back(Blueprint.Vertices[VIdx]);
+        }
+        for (BlueprintEdge& Edge : Blueprint.Edges)
+        {
+            Edge.Start = Remap[Edge.Start];
+            Edge.End   = Remap[Edge.End];
+            if (Edge.Start < 0 || Edge.End < 0)
+                return Finish("internal error: dangling beveled vertex reference");
+        }
+        Blueprint.Vertices = std::move(CompactVerts);
+    }
+
+    // ⑧ Assemble, audit, check genus, check self-clash, and populate provenance.
+    const ArrangementOutcome Assembly = AssembleBody(Partition, Blueprint, "VertexBevel");
+    if (!Assembly.Refusal.empty()) return Finish(Assembly.Refusal);
+    Outcome.Audit = AuditBody(Partition, Assembly.Body);
+    if (!Outcome.Audit.SoundCondition())
+    {
+        const AuditFinding& First = Outcome.Audit.Findings.front();
+        return Finish("result fails audit " + std::string(First.Code) + " on " + First.Subject + " (" + First.Detail + ")");
+    }
+    const int Genus = AuditBody(Partition, Body, AuditScope::Topology).Genus;
+    if (Outcome.Audit.Genus != Genus)
+        return Finish("genus changed from " + std::to_string(Genus) + " to " + std::to_string(Outcome.Audit.Genus));
+    if (std::string Clash = DetectSelfClash(Partition, Assembly.Body); !Clash.empty())
+        return Finish("neighbouring bevels overlap: " + Clash);
+    for (size_t Index = 0; Index < Assembly.Faces.size(); ++Index)
+    {
+        BlendFaceHistory History = Provenance[Index];
+        History.Result = Assembly.Faces[Index];
+        Outcome.FaceHistories.push_back(History);
+    }
+    Outcome.Body = Assembly.Body;
+    return Finish({});
+}
+
+BlendOutcome BevelVertices(ModelPartition& Partition, BodyToken Body, const std::vector<VertexToken>& Vertices,
+                           const VertexBlendSettings& Settings)
+{
+    FRONTIER_TRACE_SCOPE("Blend", "VertexBevel · " + std::to_string(Vertices.size()) + " vertex(es) · size " + TraceNumber(Settings.Size));
+    BlendOutcome Outcome = BevelVerticesUntraced(Partition, Body, Vertices, Settings);
     FRONTIER_TRACE("Blend", Outcome.Refusal.empty() ? std::string("built · ") + std::to_string(Outcome.Audit.Findings.size()) + " audit finding(s)"
                                                     : "refused: " + Outcome.Refusal);
     return Outcome;

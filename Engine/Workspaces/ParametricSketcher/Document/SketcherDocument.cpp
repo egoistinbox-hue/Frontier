@@ -968,9 +968,48 @@ static SketcherCommandOutcome BlendSketcherEdges(SketcherDocument& Document, con
     });
 }
 
+static SketcherCommandOutcome BlendSketcherVertices(SketcherDocument& Document, const SketcherBlendRequest& Request)
+{
+    const std::string Label = "Vertex Bevel " + FormatAmount(Request.Size) + " on " + std::to_string(Document.Selection.Vertices.size()) + " vertex(es)";
+    return RunCommand(Document, Label, true, [&]() -> std::string
+    {
+        if (Document.Selection.Vertices.empty()) return "select one or more vertices first";
+        if (Request.Size <= 0.0) return "the vertex bevel size must be positive";
+        std::string Owner;
+        if (const std::string Problem = CommonBody(Document, SketcherSelectionCategory::Vertex, Document.Selection.Vertices, Owner); !Problem.empty())
+            return Problem;
+        const RegeneratedBody* Target = FindRegeneratedBody(Document, Owner);
+        if (!Document.Partition || !Target) return "there is no body to bevel";
+
+        const SketcherBlendFit Fit = MeasureSketcherVertexBlendFit(Document, Document.Selection.Vertices);
+        if (!Fit.Refusal.empty()) return Fit.Refusal;
+
+        const std::string Caption   = NextCaption(Document, "VertexBevel");
+        const std::string StepLabel = "Blend#" + std::to_string(NextStepOrdinal(Document.Tree));
+        const double      Bound     = std::max(1.0, 4.0 * Request.Size);
+        Document.Tree.Parameters.push_back({ Caption + ".Size", Request.Size, 0.0, Bound, "vertex bevel setback" });
+
+        FeatureStep Step;
+        Step.Kind  = FeatureStepCategory::Blend;
+        Step.Label = StepLabel;
+        Step.Shape  = BlendProfile::Chamfer;
+        Step.Size   = ParameterValue(Caption + ".Size");
+        Step.Target = Owner;
+        Step.ClampOverlapEnabled = Request.ClampOverlapEnabled;
+        for (const std::string& Name : Document.Selection.Vertices)
+            Step.References.push_back({ ReferenceCategory::Vertex, Name, {} });
+        Document.Tree.Steps.push_back(std::move(Step));
+        Document.Captions[StepLabel] = Caption;
+        return {};
+    });
+}
+
 // The picked edges alone first; refused, their tangent chains (the blend could not end at a G1 joint) when they grow.
+// When only vertices are picked (or Request.VertexCondition is set), performs Blender-style Vertex Bevel (n-gon corner).
 SketcherCommandOutcome BlendSketcherSelection(SketcherDocument& Document, const SketcherBlendRequest& Request)
 {
+    if (Request.VertexCondition || (Document.Selection.Edges.empty() && !Document.Selection.Vertices.empty()))
+        return BlendSketcherVertices(Document, Request);
     bool Grown = false;
     const SketcherCommandOutcome Alone = BlendSketcherEdges(Document, Request, false, Grown);
     if (Alone.AcceptedCondition || Request.EndSize.has_value() || !Request.VertexSizes.empty()) return Alone;
@@ -1018,6 +1057,133 @@ std::vector<std::string> ResolveSketcherVertexBlendEdges(const SketcherDocument&
         if (const auto Named = Owner->Naming.Edges.find(Edge.Slot); Named != Owner->Naming.Edges.end()) Edges.push_back(Named->second);
     }
     return Edges;
+}
+
+[[nodiscard]] std::vector<VertexToken> ResolvePickedVertices(const SketcherDocument& Document, const std::vector<std::string>& Vertices,
+                                                             const RegeneratedBody*& Owner)
+{
+    Owner = nullptr;
+    std::string Key;
+    if (!Document.Partition || Vertices.empty() || !CommonBody(Document, SketcherSelectionCategory::Vertex, Vertices, Key).empty()) return {};
+    Owner = FindRegeneratedBody(Document, Key);
+    if (!Owner) return {};
+    std::vector<VertexToken> Tokens;
+    std::set<uint32_t> Seen;
+    for (const std::string& Name : Vertices)
+    {
+        const auto Entry = std::find_if(Owner->Naming.Vertices.begin(), Owner->Naming.Vertices.end(), [&](const auto& Pair) { return Pair.second == Name; });
+        if (Entry == Owner->Naming.Vertices.end()) return {};
+        if (Seen.insert(Entry->first).second) Tokens.push_back(Document.Partition->Vertices.TokenAt(Entry->first));
+    }
+    return Tokens;
+}
+
+std::vector<SketcherBlendHandle> MeasureSketcherVertexBlendHandles(const SketcherDocument& Document, const std::vector<std::string>& Vertices)
+{
+    const RegeneratedBody*         Owner  = nullptr;
+    const std::vector<VertexToken> Tokens = ResolvePickedVertices(Document, Vertices, Owner);
+    if (Tokens.empty()) return {};
+    const ModelPartition& Partition = *Document.Partition;
+    const BodyInventory   Inventory = Partition.CollectInventory(Owner->Body);
+
+    std::vector<SketcherBlendHandle> Handles;
+    const auto MeasureVertexHandle = [&](VertexToken Vertex, const std::string& PersistentName)
+    {
+        const Vector3 Position = Partition.Vertices.Resolve(Vertex).Position;
+        Vector3 SumInward{};
+        std::vector<Vector3> UnitInwards;
+        Vector3 SumFaceNormals{};
+        std::set<uint32_t> SeenFaces;
+
+        for (EdgeToken Edge : Inventory.Edges)
+        {
+            const EdgeProfile& Profile = Partition.Edges.Resolve(Edge);
+            if (Profile.Start != Vertex && Profile.End != Vertex) continue;
+            if (Profile.Start == Profile.End) continue;
+            const bool FromStart = (Profile.Start == Vertex);
+            const CurveSample Sample = EvaluateCurve(Partition.Curves.Resolve(Profile.Curve),
+                                                     FromStart ? Profile.IntervalLow : Profile.IntervalHigh);
+            if (Length(Sample.Derivative) > 1.0e-12)
+            {
+                const Vector3 Inward = Normalize(FromStart ? Sample.Derivative : -Sample.Derivative);
+                SumInward = SumInward + Inward;
+                UnitInwards.push_back(Inward);
+            }
+            const FinToken Radial = Profile.RadialFin;
+            for (FinToken F : { Radial, Partition.RadialMate(Radial) })
+            {
+                if (!F.PresentCondition()) continue;
+                const FaceToken Face = Partition.Loops.Resolve(Partition.Fins.Resolve(F).Loop).Face;
+                if (SeenFaces.insert(Face.Slot).second) SumFaceNormals = SumFaceNormals + EvaluateOutwardNormal(Partition, Face, Position);
+            }
+        }
+        if (UnitInwards.size() < 3) return;
+        Vector3 Outward = Length(SumInward) > 1.0e-9 ? Normalize(-SumInward)
+                        : (Length(SumFaceNormals) > 1.0e-9 ? Normalize(SumFaceNormals) : Vector3{ 0.0, 0.0, 1.0 });
+        if (Length(SumFaceNormals) > 1.0e-9 && Dot(Outward, SumFaceNormals) < 0.0) Outward = -Outward;
+
+        double SpreadSum = 0.0;
+        for (const Vector3& U : UnitInwards) SpreadSum += std::max(0.05, Dot(U, -Outward));
+        const double Spread = SpreadSum / static_cast<double>(UnitInwards.size());
+        Handles.push_back({ PersistentName, Position, Outward, static_cast<int>(UnitInwards.size()), Spread, true });
+    };
+
+    // Uniform handle [0] sits at the first vertex (Vertex empty so DriveBevelHandles treats it as uniform size).
+    MeasureVertexHandle(Tokens.front(), {});
+    return Handles;
+}
+
+SketcherBlendFit MeasureSketcherVertexBlendFit(const SketcherDocument& Document, const std::vector<std::string>& Vertices)
+{
+    SketcherBlendFit               Fit;
+    const RegeneratedBody*         Owner  = nullptr;
+    const std::vector<VertexToken> Tokens = ResolvePickedVertices(Document, Vertices, Owner);
+    if (Tokens.empty()) { Fit.Refusal = "no picked vertices on one body"; return Fit; }
+
+    const ModelPartition& Partition = *Document.Partition;
+    const BodyInventory   Inventory = Partition.CollectInventory(Owner->Body);
+    std::set<uint32_t>    PickedSlots;
+    for (VertexToken V : Tokens) PickedSlots.insert(V.Slot);
+
+    double Span = std::numeric_limits<double>::infinity();
+    for (VertexToken V : Tokens)
+    {
+        int IncidentCount = 0;
+        for (EdgeToken Edge : Inventory.Edges)
+        {
+            const EdgeProfile& Profile = Partition.Edges.Resolve(Edge);
+            if (Profile.Start != V && Profile.End != V) continue;
+            if (Profile.Start == Profile.End)
+            {
+                Fit.Refusal = "Vertex bevel cannot split a closed self-loop edge";
+                return Fit;
+            }
+            ++IncidentCount;
+            const double Len = MeasureEdgeLength(Partition, Edge);
+            const bool BothPicked = PickedSlots.contains(Profile.Start.Slot) && PickedSlots.contains(Profile.End.Slot);
+            Span = std::min(Span, BothPicked ? 0.5 * Len : Len);
+        }
+        if (IncidentCount < 3)
+        {
+            Fit.Refusal = "Vertex bevel requires at least 3 edges at a vertex (1 or 2 edges cannot form an n-gon)";
+            return Fit;
+        }
+    }
+    if (!std::isfinite(Span) || !(Span > 0.0))
+    {
+        Fit.Refusal = "the incident edges have no length";
+        return Fit;
+    }
+
+    Fit.Span         = Span;
+    Fit.ChamferReach = 0.98 * Span;
+    Fit.FilletReach  = 0.98 * Span;
+    const double Wanted  = 0.15 * Span;
+    const double Decade  = std::pow(10.0, std::floor(std::log10(Wanted)));
+    const double Steps[] = { 5.0, 2.0, 1.0 };
+    Fit.Fitted = Decade;
+    for (double Step : Steps) if (Step * Decade <= Wanted * (1.0 + 1.0e-9)) { Fit.Fitted = Step * Decade; break; }
+    return Fit;
 }
 
 // The two faces of a manifold edge (the second equals the first on a lamina edge).
@@ -1277,10 +1443,14 @@ SketcherBlendStepControls MeasureSketcherBlendStepControls(const SketcherDocumen
 
     const FeatureStep& Step = Document.Tree.Steps[StepIndex];
     std::vector<std::string> EdgeNames;
-    EdgeNames.reserve(Step.References.size());
+    std::vector<std::string> VertexNames;
     for (const ConnectivityReference& Ref : Step.References)
+    {
         if (Ref.Kind == ReferenceCategory::Edge && !Ref.Name.empty()) EdgeNames.push_back(Ref.Name);
-    if (EdgeNames.empty()) return Result;
+        else if (Ref.Kind == ReferenceCategory::Vertex && !Ref.Name.empty()) VertexNames.push_back(Ref.Name);
+    }
+    const bool VertexBevelCondition = EdgeNames.empty() && !VertexNames.empty();
+    if (!VertexBevelCondition && EdgeNames.empty()) return Result;
 
     // Replay a lightweight copy of the tree up to StepIndex (right before this Blend step) so the pre-blend sharp edge
     // geometry, outward bisectors, and corner vertex names match the step's persistent references identically.
@@ -1291,9 +1461,14 @@ SketcherBlendStepControls MeasureSketcherBlendStepControls(const SketcherDocumen
     Before.Partition       = std::make_unique<ModelPartition>();
     Before.Regeneration    = RegenerateFeatureTree(*Before.Partition, Before.Tree, false);
 
-    Result.Handles = MeasureSketcherBlendHandles(Before, EdgeNames);
+    Result.VertexCondition = VertexBevelCondition;
+    Result.Handles = VertexBevelCondition
+                   ? MeasureSketcherVertexBlendHandles(Before, VertexNames)
+                   : MeasureSketcherBlendHandles(Before, EdgeNames);
     if (Result.Handles.empty()) return Result;
-    Result.Fit                 = MeasureSketcherBlendFit(Before, EdgeNames);
+    Result.Fit = VertexBevelCondition
+               ? MeasureSketcherVertexBlendFit(Before, VertexNames)
+               : MeasureSketcherBlendFit(Before, EdgeNames);
     Result.StepLabel           = Step.Label;
     Result.BodyKey             = Step.Target;
     Result.Shape               = Step.Shape;

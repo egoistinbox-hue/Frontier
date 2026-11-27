@@ -11,6 +11,7 @@
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherOutliner.h"
 
 #include "Engine/Components/RetainedCanvasCache.h"
+#include "Engine/GeometrySpace/Parametric/Geometry/SurfaceGeometry.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherInterface.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherStyleSheet.h"
 
@@ -21,6 +22,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <optional>
+#include <variant>
 
 namespace Frontier::Workspaces::Sketcher
 {
@@ -137,6 +140,163 @@ IconSymbol SketchIcon(const SketchModel& Sketch, const std::string& Caption = {}
     return Lines > 1 ? IconSymbol::SketcherPolyline : IconSymbol::SketcherEdge;
 }
 
+bool CaptionStartsWithCI(const std::string& Caption, const char* Prefix)
+{
+    size_t I = 0;
+    for (; Prefix[I] != '\0' && I < Caption.size(); ++I)
+    {
+        if (std::tolower(static_cast<unsigned char>(Caption[I])) != std::tolower(static_cast<unsigned char>(Prefix[I]))) return false;
+    }
+    return Prefix[I] == '\0';
+}
+
+std::optional<IconSymbol> BodyIconFromCaption(const std::string& Caption)
+{
+    if (CaptionStartsWithCI(Caption, "Cylinder")) return IconSymbol::SketcherCylinder;
+    if (CaptionStartsWithCI(Caption, "Sphere"))   return IconSymbol::SketcherSphere;
+    if (CaptionStartsWithCI(Caption, "Cone"))     return IconSymbol::SketcherCone;
+    if (CaptionStartsWithCI(Caption, "Torus"))    return IconSymbol::SketcherRing;
+    if (CaptionStartsWithCI(Caption, "Ring"))     return IconSymbol::SketcherRing;
+    if (CaptionStartsWithCI(Caption, "Wedge"))    return IconSymbol::SketcherWedge;
+    if (CaptionStartsWithCI(Caption, "Prism"))    return IconSymbol::SketcherPrism;
+    if (CaptionStartsWithCI(Caption, "Tube"))     return IconSymbol::SketcherTube;
+    if (CaptionStartsWithCI(Caption, "Pipe"))     return IconSymbol::SketcherTube;
+    if (CaptionStartsWithCI(Caption, "Block") || CaptionStartsWithCI(Caption, "Box") || CaptionStartsWithCI(Caption, "Cube"))
+        return IconSymbol::SketcherBody;
+    return std::nullopt;
+}
+
+std::optional<IconSymbol> BodyIconFromSurfaces(const SketcherDocument& Document, const SketcherBodyFigures& Body)
+{
+    if (!Document.Partition) return std::nullopt;
+    const RegeneratedBody* Regen = nullptr;
+    for (const RegeneratedBody& Candidate : Document.Regeneration.Bodies)
+    {
+        if (Candidate.Key == Body.Key) { Regen = &Candidate; break; }
+    }
+    if (!Regen || !Regen->Body.PresentCondition()) return std::nullopt;
+
+    const BodyInventory Inventory = Document.Partition->CollectInventory(Regen->Body);
+    if (Inventory.Faces.empty()) return std::nullopt;
+
+    size_t Planes = 0, Cylinders = 0, Cones = 0, Spheres = 0, Tori = 0, Others = 0;
+    for (const FaceToken Face : Inventory.Faces)
+    {
+        const SurfaceGeometry& Surface = Document.Partition->Surfaces.Resolve(Document.Partition->Faces.Resolve(Face).Surface);
+        if (std::holds_alternative<PlaneSurface>(Surface))         ++Planes;
+        else if (std::holds_alternative<CylinderSurface>(Surface)) ++Cylinders;
+        else if (std::holds_alternative<ConeSurface>(Surface))     ++Cones;
+        else if (std::holds_alternative<SphereSurface>(Surface))   ++Spheres;
+        else if (std::holds_alternative<TorusSurface>(Surface))    ++Tori;
+        else                                                       ++Others;
+    }
+
+    if (Spheres > 0 && Planes == 0 && Cylinders == 0 && Cones == 0 && Tori == 0 && Others == 0)
+        return IconSymbol::SketcherSphere;
+    if (Tori > 0 && Planes == 0 && Cylinders == 0 && Cones == 0 && Spheres == 0 && Others == 0)
+        return IconSymbol::SketcherRing;
+    if (Cones > 0 && Cylinders == 0 && Spheres == 0 && Tori == 0 && Others == 0 && Planes <= 2)
+        return IconSymbol::SketcherCone;
+    if (Cylinders > 0 && Cones == 0 && Spheres == 0 && Tori == 0 && Others == 0 && Planes == 2)
+        return Body.Genus > 0 ? IconSymbol::SketcherTube : IconSymbol::SketcherCylinder;
+    if (Planes == Inventory.Faces.size() && Body.Genus == 0)
+    {
+        if (Body.Faces == 5 && Body.Vertices == 6 && Body.Edges == 9)
+            return IconSymbol::SketcherWedge;
+        if (Body.Faces >= 7 && Body.Edges == 3 * (Body.Faces - 2) && Body.Vertices == 2 * (Body.Faces - 2))
+        {
+            const size_t Sides = Body.Faces - 2;
+            size_t BaseCount = 0, QuadCount = 0;
+            for (const FaceToken Face : Inventory.Faces)
+            {
+                const FaceProfile& Profile = Document.Partition->Faces.Resolve(Face);
+                if (Profile.Loops.size() != 1) { BaseCount = 0; break; }
+                const FinToken First = Document.Partition->Loops.Resolve(Profile.Loops.front()).FirstFin;
+                if (!First.PresentCondition()) { BaseCount = 0; break; }
+                size_t EdgeCount = 0;
+                FinToken Fin = First;
+                for (int Guard = 0; Guard < 1024; ++Guard)
+                {
+                    ++EdgeCount;
+                    Fin = Document.Partition->Fins.Resolve(Fin).Successor;
+                    if (Fin == First) break;
+                }
+                if (EdgeCount == Sides) ++BaseCount;
+                else if (EdgeCount == 4) ++QuadCount;
+                else { BaseCount = 0; break; }
+            }
+            if (BaseCount == 2 && QuadCount == Sides) return IconSymbol::SketcherPrism;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<IconSymbol> BodyIconFromCreatingStep(const SketcherDocument& Document, const std::string& BodyKey)
+{
+    const FeatureStep* Creating = nullptr;
+    for (const FeatureStep& Step : Document.Tree.Steps)
+    {
+        if (Step.Label == BodyKey) { Creating = &Step; break; }
+    }
+    if (!Creating) return std::nullopt;
+
+    const auto FindSketch = [&](const std::string& SketchLabel) -> const SketchModel*
+    {
+        const auto Solved = Document.Regeneration.Sketches.find(SketchLabel);
+        if (Solved != Document.Regeneration.Sketches.end()) return &Solved->second;
+        for (const FeatureStep& Step : Document.Tree.Steps)
+        {
+            if (Step.Label == SketchLabel && Step.Kind == FeatureStepCategory::Sketch) return &Step.Sketch;
+        }
+        return nullptr;
+    };
+
+    if (Creating->Kind == FeatureStepCategory::Extrude)
+    {
+        if (const SketchModel* Sketch = FindSketch(Creating->Profile))
+        {
+            int Circles = 0, Lines = 0, Arcs = 0, Splines = 0;
+            for (const SketchCurve& Curve : Sketch->Curves)
+            {
+                if (Curve.Construction) continue;
+                switch (Curve.Kind)
+                {
+                case SketchCurveCategory::Circle: ++Circles; break;
+                case SketchCurveCategory::Line:   ++Lines; break;
+                case SketchCurveCategory::Arc:    ++Arcs; break;
+                case SketchCurveCategory::Spline: ++Splines; break;
+                }
+            }
+            if (Circles == 1 && Lines == 0 && Arcs == 0 && Splines == 0) return IconSymbol::SketcherCylinder;
+            if (Circles == 2 && Lines == 0 && Arcs == 0 && Splines == 0) return IconSymbol::SketcherTube;
+            if (Circles == 0 && Arcs == 0 && Splines == 0 && Lines >= 5) return IconSymbol::SketcherPrism;
+            if (Circles == 0 && Arcs == 0 && Splines == 0 && Lines == 3) return IconSymbol::SketcherWedge;
+        }
+    }
+    else if (Creating->Kind == FeatureStepCategory::Revolve)
+    {
+        if (const SketchModel* Sketch = FindSketch(Creating->Profile))
+        {
+            int Circles = 0, Lines = 0, Arcs = 0;
+            for (const SketchCurve& Curve : Sketch->Curves)
+            {
+                if (Curve.Construction) continue;
+                switch (Curve.Kind)
+                {
+                case SketchCurveCategory::Circle: ++Circles; break;
+                case SketchCurveCategory::Line:   ++Lines; break;
+                case SketchCurveCategory::Arc:    ++Arcs; break;
+                default: break;
+                }
+            }
+            if (Circles == 1 && Lines == 0 && Arcs == 0) return IconSymbol::SketcherRing;
+            if (Arcs >= 1 && Circles == 0 && Lines <= 2) return IconSymbol::SketcherSphere;
+            if (Lines == 3 && Circles == 0 && Arcs == 0) return IconSymbol::SketcherCone;
+        }
+    }
+    return std::nullopt;
+}
+
 IconSymbol SpaceCurveIcon(const SketcherDocument& Document, const FeatureStep& Step, const std::string& Caption)
 {
     auto StartsWithCI = [&](const char* Prefix) -> bool
@@ -206,6 +366,15 @@ void LockGlyph(SketcherSheet& Sheet, float CentreX, float CentreY, bool LockedCo
 //                                                    PUBLIC FUNCTIONS
 //------------------------------------------------------------------------------------------------------------------------
 
+IconSymbol SketcherBodyIcon(const SketcherDocument& Document, const SketcherBodyFigures& Body)
+{
+    if (Body.SheetCondition) return IconSymbol::SketcherSurface;
+    if (const std::optional<IconSymbol> BySurface = BodyIconFromSurfaces(Document, Body)) return *BySurface;
+    if (const std::optional<IconSymbol> ByCaption = BodyIconFromCaption(Body.Caption)) return *ByCaption;
+    if (const std::optional<IconSymbol> ByStep = BodyIconFromCreatingStep(Document, Body.Key)) return *ByStep;
+    return IconSymbol::SketcherBody;
+}
+
 std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus& State)
 {
     const SketcherDocument&  Document = State.Document;
@@ -218,7 +387,7 @@ std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus
         Figure.Name            = Body.Caption;
         Figure.Category        = Body.SheetCondition ? SketcherFigureCategory::Surface : SketcherFigureCategory::Body;
         Figure.Source          = SketcherFigureSource::Body;
-        Figure.Icon            = Body.SheetCondition ? IconSymbol::SketcherSurface : IconSymbol::SketcherBody;
+        Figure.Icon            = SketcherBodyIcon(Document, Body);
         Figure.HiddenCondition     = Document.Appearance.HiddenBodies.contains(Body.Key);
         Figure.LockedCondition     = SketcherLockedCondition(Document, Body.Key);
         Figure.LiveCutterCondition = Document.Appearance.LiveCutters.contains(Body.Key);

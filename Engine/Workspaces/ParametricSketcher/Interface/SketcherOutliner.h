@@ -21,6 +21,8 @@
 namespace Frontier::Workspaces::Sketcher
 {
 
+struct SketcherBodyFigures;
+struct SketcherDocument;
 struct SketcherWorkspaceStatus;
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -101,6 +103,9 @@ struct SketcherOutlinerIntent
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    PUBLIC FUNCTIONS
 //------------------------------------------------------------------------------------------------------------------------
+
+// Shape icon for a solid or sheet body (inspects B-rep surfaces, creating feature step, and caption).
+[[nodiscard]] IconSymbol SketcherBodyIcon(const SketcherDocument& Document, const SketcherBodyFigures& Body);
 
 // Bodies (creation order), then sketches and space curves (tree order), then image planes, with selection, visibility and lock.
 [[nodiscard]] std::vector<SketcherFigure> CollectSketcherFigures(const SketcherWorkspaceStatus& State);

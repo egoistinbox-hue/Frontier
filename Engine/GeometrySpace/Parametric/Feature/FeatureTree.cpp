@@ -1213,6 +1213,26 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             }
             if (Step.Kind == FeatureStepCategory::Blend)
             {
+                const bool VertexBevelCondition = !Kinds.empty() && std::all_of(Kinds.begin(), Kinds.end(), [](ReferenceCategory K)
+                {
+                    return K == ReferenceCategory::Vertex;
+                });
+                if (VertexBevelCondition)
+                {
+                    std::vector<VertexToken> Vertices;
+                    Vertices.reserve(Slots.size());
+                    for (uint32_t Slot : Slots) Vertices.push_back(Partition.Vertices.TokenAt(Slot));
+                    VertexBlendSettings VSettings;
+                    VSettings.Size                = Amount;
+                    VSettings.ClampOverlapEnabled = Step.ClampOverlapEnabled;
+                    const BlendOutcome Blend = BevelVertices(Partition, Current, Vertices, VSettings);
+                    if (!Blend.Refusal.empty()) { Refuse(Blend.Refusal); break; }
+                    Outcome.Audits.emplace_back(Blend.Body, Blend.Audit);
+                    Naming  = NameBlendedBody(Partition, Blend.Body, Blend, Naming, Step.Label);
+                    Current = Blend.Body;
+                    Store();
+                    break;
+                }
                 std::vector<EdgeToken> Edges;
                 for (uint32_t Slot : Slots) Edges.push_back(Partition.Edges.TokenAt(Slot));
                 BlendSettings Settings;

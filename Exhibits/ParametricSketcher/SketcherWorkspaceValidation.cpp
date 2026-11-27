@@ -12,9 +12,13 @@
 #include "Engine/Input/ImGuiInputAdapter.h"
 #include "Engine/Input/InputExchange.h"
 #include "Engine/Input/InputExtension.h"
+#include "Engine/GeometrySpace/Parametric/Blend/EdgeBlend.h"
+#include "Engine/GeometrySpace/Parametric/Construction/BodyArrangement.h"
+#include "Engine/GeometrySpace/Parametric/Geometry/SurfaceGeometry.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherDocument.h"
 #include "Engine/Workspaces/ParametricSketcher/Document/SketcherImagePlane.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherIcons.h"
+#include "Engine/Workspaces/ParametricSketcher/Interface/SketcherOutliner.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherProjectBrowser.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherStyleSheet.h"
 #include "Engine/Workspaces/ParametricSketcher/Interface/SketcherWorkspaceHost.h"
@@ -451,13 +455,14 @@ int main()
         State.PickMode = SketcherPickMode::ControlPoint;
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_B, true); });
         const bool VertexBevel = State.Bevel.ActiveCondition && State.Bevel.VertexCondition
-                              && State.Bevel.VertexNames.size() == 1 && State.Document.Selection.Edges.size() >= 2;
+                              && State.Bevel.VertexNames.size() == 1 && State.Document.Selection.Edges.empty()
+                              && State.Bevel.Handles.size() == 1 && State.Bevel.Handles.front().Edges == 3;
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_B, false); Io.AddKeyEvent(ImGuiKey_Escape, true); });
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Escape, false); });
         const bool VertexSelectionRestored = !State.Bevel.ActiveCondition && State.Document.Selection.Edges.empty()
                                           && State.Document.Selection.Vertices.size() == 1;
         if (!VerifyCheck(CtrlBFillet && CChamfer, "Ctrl+B starts Fillet and C on edge starts Chamfer") ||
-            !VerifyCheck(VertexBevel && VertexSelectionRestored, "B bevels selected body vertices and cancel restores their selection"))
+            !VerifyCheck(VertexBevel && VertexSelectionRestored, "B starts Blender-style Vertex Bevel without expanding edges and cancel restores selection"))
         {
             Host.Finalize();
             Dock.Finalize();
@@ -1058,6 +1063,259 @@ int main()
             Dock.Finalize();
             ImGui::DestroyContext(Gui);
             return 1;
+        }
+        ++Passed;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // Outliner 3D Shape Icons (Block, Cylinder, Sphere, Cone, Torus, Wedge, Prism, Tube + renamed Tube)
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    {
+        SketcherDocument IconDoc = CreateDefaultSketcherDocument();
+        const struct { SketcherConstructCategory Kind; IconSymbol Expected; const char* Label; } Cases[] = {
+            { SketcherConstructCategory::Block,    IconSymbol::SketcherBody,     "Block" },
+            { SketcherConstructCategory::Cylinder, IconSymbol::SketcherCylinder, "Cylinder" },
+            { SketcherConstructCategory::Sphere,   IconSymbol::SketcherSphere,   "Sphere" },
+            { SketcherConstructCategory::Cone,     IconSymbol::SketcherCone,     "Cone" },
+            { SketcherConstructCategory::Torus,    IconSymbol::SketcherRing,     "Torus" },
+            { SketcherConstructCategory::Wedge,    IconSymbol::SketcherWedge,    "Wedge" },
+            { SketcherConstructCategory::Prism,    IconSymbol::SketcherPrism,    "Prism" },
+            { SketcherConstructCategory::Tube,     IconSymbol::SketcherTube,     "Tube" },
+        };
+        for (size_t Idx = 0; Idx < std::size(Cases); ++Idx)
+        {
+            SketcherConstructRequest Req;
+            Req.Kind        = Cases[Idx].Kind;
+            Req.Combination = GeometrySpace::Parametric::FeatureCombination::Separate;
+            Req.Spot        = { static_cast<double>(Idx) * 3.0, 0.0, 0.0 };
+            Req.Sides       = 5;
+            const SketcherCommandOutcome Built = ConstructSketcherPrimitive(IconDoc, Req);
+            if (!VerifyCheck(Built.AcceptedCondition, Cases[Idx].Label))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+            const SketcherBodyFigures& Fig = IconDoc.Summary.Bodies.back();
+            const IconSymbol Actual = SketcherBodyIcon(IconDoc, Fig);
+            if (!VerifyCheck(Actual == Cases[Idx].Expected, "Outliner body shape icon matches primitive geometry"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+        }
+        // Rename the Tube body and confirm surface-based shape detection keeps SketcherTube
+        SketcherBodyFigures RenamedTube = IconDoc.Summary.Bodies.back();
+        RenamedTube.Caption = "CustomRenamedPart";
+        if (!VerifyCheck(SketcherBodyIcon(IconDoc, RenamedTube) == IconSymbol::SketcherTube,
+                         "Renamed Tube body retains SketcherTube icon via B-rep surface inspection"))
+        {
+            Host.Finalize();
+            Dock.Finalize();
+            ImGui::DestroyContext(Gui);
+            return 1;
+        }
+        ++Passed;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // Blender-Style Vertex Bevel (Affect: Vertices): 3-gon, 4-gon, 5-gon corner faces + 1/2-edge denial
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    {
+        using namespace GeometrySpace::Parametric;
+
+        const auto MakePlane = [](Vector3 Origin, Vector3 Normal) -> PlaneSurface
+        {
+            const Vector3 N = Normalize(Normal);
+            const Vector3 Seed = std::abs(N.X) < 0.9 ? Vector3{ 1.0, 0.0, 0.0 } : Vector3{ 0.0, 1.0, 0.0 };
+            const Vector3 X = Normalize(Seed - N * Dot(Seed, N));
+            const Vector3 Y = Cross(N, X);
+            return PlaneSurface{ { Origin, X, Y, N } };
+        };
+        const auto AddPlaneFace = [&](BodyBlueprint& Bp, const std::vector<int>& Ring, const std::vector<int>& Edges, const std::vector<Orientation>& Senses)
+        {
+            Vector3 Newell{}, Sum{};
+            for (int V : Ring) Sum = Sum + Bp.Vertices[V].Position;
+            const Vector3 Centre = Sum * (1.0 / static_cast<double>(Ring.size()));
+            for (size_t I = 0; I < Ring.size(); ++I)
+                Newell = Newell + Cross(Bp.Vertices[Ring[I]].Position, Bp.Vertices[Ring[(I + 1) % Ring.size()]].Position);
+            const PlaneSurface Surf = MakePlane(Centre, Newell);
+            BlueprintFace Face{ Surf, Orientation::Forward, {} };
+            std::vector<BlueprintUse> Loop;
+            for (size_t I = 0; I < Edges.size(); ++I)
+            {
+                const BlueprintEdge& E = Bp.Edges[Edges[I]];
+                const Vector3 Mid = EvaluateCurve(E.Curve, 0.5 * (E.Low + E.High)).Position;
+                const Vector2 Anchor = ProjectOntoSurface(Face.Surface, Mid, {});
+                Loop.push_back({ Edges[I], Senses[I], FitSurfaceCurve(Face.Surface, E.Curve, E.Low, E.High, { Anchor - Vector2{ 1.0, 1.0 }, Anchor + Vector2{ 1.0, 1.0 } }, Anchor) });
+            }
+            Face.Loops.push_back(std::move(Loop));
+            Bp.Faces.push_back(std::move(Face));
+        };
+        const auto BuildPyramid = [&](int Sides, ModelPartition& Part, BodyToken& OutBody, VertexToken& OutApex) -> bool
+        {
+            BodyBlueprint Bp;
+            Bp.Category = BodyCategory::Solid;
+            for (int I = 0; I < Sides; ++I)
+            {
+                const double A = 2.0 * 3.14159265358979323846 * I / Sides;
+                Bp.Vertices.push_back({ { std::cos(A), std::sin(A), 0.0 } });
+            }
+            Bp.Vertices.push_back({ { 0.0, 0.0, 1.5 } });
+            for (int I = 0; I < Sides; ++I)
+            {
+                const int J = (I + 1) % Sides;
+                const Vector3 D = Bp.Vertices[J].Position - Bp.Vertices[I].Position;
+                const double L = Length(D);
+                Bp.Edges.push_back({ StraightLine{ Bp.Vertices[I].Position, D * (1.0 / L) }, 0.0, L, I, J });
+            }
+            for (int I = 0; I < Sides; ++I)
+            {
+                const Vector3 D = Bp.Vertices[Sides].Position - Bp.Vertices[I].Position;
+                const double L = Length(D);
+                Bp.Edges.push_back({ StraightLine{ Bp.Vertices[I].Position, D * (1.0 / L) }, 0.0, L, I, Sides });
+            }
+            // Base face (CW from +Z so outward normal is -Z)
+            {
+                std::vector<int> Ring, Edges;
+                std::vector<Orientation> Senses;
+                for (int I = Sides - 1; I >= 0; --I)
+                {
+                    const int Prev = (I + Sides - 1) % Sides;
+                    Ring.push_back(I);
+                    Edges.push_back(Prev);
+                    Senses.push_back(Orientation::Reversed);
+                }
+                AddPlaneFace(Bp, Ring, Edges, Senses);
+            }
+            // Side triangles
+            for (int I = 0; I < Sides; ++I)
+            {
+                const int J = (I + 1) % Sides;
+                AddPlaneFace(Bp, { I, J, Sides }, { I, Sides + J, Sides + I },
+                             { Orientation::Forward, Orientation::Forward, Orientation::Reversed });
+            }
+            const ArrangementOutcome Asm = AssembleBody(Part, Bp, "Pyramid");
+            if (!Asm.Refusal.empty()) return false;
+            OutBody = Asm.Body;
+            OutApex = Part.CollectInventory(OutBody).Vertices.back();
+            return true;
+        };
+        const auto CountFaceEdges = [](const ModelPartition& Part, FaceToken Face) -> int
+        {
+            int Count = 0;
+            for (LoopToken Loop : Part.Faces.Resolve(Face).Loops)
+                Part.EnumerateLoopFins(Loop, [&](FinToken) { ++Count; });
+            return Count;
+        };
+
+        // 1) 3-edge cube corner -> triangle (3-gon) corner face via SketcherDocument
+        SketcherDocument CubeDoc = CreateDefaultSketcherDocument();
+        {
+            SketcherConstructRequest Req;
+            Req.Kind = SketcherConstructCategory::Block;
+            ConstructSketcherPrimitive(CubeDoc, Req);
+            const auto& Body = CubeDoc.Regeneration.Bodies.front();
+            const std::string FirstVert = Body.Naming.Vertices.begin()->second;
+            CubeDoc.Selection.Vertices = { FirstVert };
+            SketcherBlendRequest BReq;
+            BReq.VertexCondition = true;
+            BReq.Size = 0.2;
+            const SketcherCommandOutcome Out = BlendSketcherSelection(CubeDoc, BReq);
+            const auto& NewFig = CubeDoc.Summary.Bodies.front();
+            bool HasTriangle = false;
+            for (FaceToken F : CubeDoc.Partition->CollectInventory(CubeDoc.Regeneration.Bodies.front().Body).Faces)
+                if (CountFaceEdges(*CubeDoc.Partition, F) == 3) HasTriangle = true;
+            if (!VerifyCheck(Out.AcceptedCondition && NewFig.SoundCondition && NewFig.Faces == 7 && NewFig.Edges == 15 && NewFig.Vertices == 10 && HasTriangle,
+                             "Cube vertex bevel (3 edges) generates a 3-gon triangle corner face"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+        }
+
+        // 2) 4-edge apex -> quad (4-gon) corner face
+        {
+            ModelPartition Part;
+            BodyToken Pyr4{};
+            VertexToken Apex4{};
+            const bool Built4 = BuildPyramid(4, Part, Pyr4, Apex4);
+            const BlendOutcome Out4 = Built4 ? BevelVertices(Part, Pyr4, { Apex4 }, { 0.25, true }) : BlendOutcome{};
+            int CornerEdges4 = 0;
+            for (const BlendFaceHistory& H : Out4.FaceHistories)
+                if (H.Origin == BlendFaceOrigin::Vertex) CornerEdges4 = CountFaceEdges(Part, H.Result);
+            if (!VerifyCheck(Built4 && Out4.Refusal.empty() && Out4.Audit.SoundCondition() && CornerEdges4 == 4,
+                             "4-edge vertex bevel generates a 4-gon quad corner face"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+        }
+
+        // 3) 5-edge apex -> pentagon (5-gon) corner face
+        {
+            ModelPartition Part;
+            BodyToken Pyr5{};
+            VertexToken Apex5{};
+            const bool Built5 = BuildPyramid(5, Part, Pyr5, Apex5);
+            const BlendOutcome Out5 = Built5 ? BevelVertices(Part, Pyr5, { Apex5 }, { 0.25, true }) : BlendOutcome{};
+            int CornerEdges5 = 0;
+            for (const BlendFaceHistory& H : Out5.FaceHistories)
+                if (H.Origin == BlendFaceOrigin::Vertex) CornerEdges5 = CountFaceEdges(Part, H.Result);
+            if (!VerifyCheck(Built5 && Out5.Refusal.empty() && Out5.Audit.SoundCondition() && CornerEdges5 == 5,
+                             "5-edge vertex bevel generates a 5-gon pentagon corner face"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+        }
+
+        // 4) Degree-2 vertex (midpoint splitting a cube edge into two collinear edges) -> DENIED
+        {
+            ModelPartition Part;
+            BodyBlueprint Bp;
+            Bp.Category = BodyCategory::Solid;
+            // Unit cube [0,1]^3 with vertex 8 at (0.5, 0, 0) splitting bottom-front edge 0->1
+            Bp.Vertices = {
+                { { 0, 0, 0 } }, { { 1, 0, 0 } }, { { 1, 1, 0 } }, { { 0, 1, 0 } },
+                { { 0, 0, 1 } }, { { 1, 0, 1 } }, { { 1, 1, 1 } }, { { 0, 1, 1 } },
+                { { 0.5, 0, 0 } }
+            };
+            const auto AddSeg = [&](int A, int B)
+            {
+                const Vector3 D = Bp.Vertices[B].Position - Bp.Vertices[A].Position;
+                const double L = Length(D);
+                Bp.Edges.push_back({ StraightLine{ Bp.Vertices[A].Position, D * (1.0 / L) }, 0.0, L, A, B });
+            };
+            AddSeg(0, 8); AddSeg(8, 1); AddSeg(1, 2); AddSeg(2, 3); AddSeg(3, 0); // 0..4 (bottom)
+            AddSeg(4, 5); AddSeg(5, 6); AddSeg(6, 7); AddSeg(7, 4);               // 5..8 (top)
+            AddSeg(0, 4); AddSeg(1, 5); AddSeg(2, 6); AddSeg(3, 7);               // 9..12 (verticals)
+            AddPlaneFace(Bp, { 0, 3, 2, 1, 8 }, { 4, 3, 2, 1, 0 }, { Orientation::Reversed, Orientation::Reversed, Orientation::Reversed, Orientation::Reversed, Orientation::Reversed });
+            AddPlaneFace(Bp, { 4, 5, 6, 7 }, { 5, 6, 7, 8 }, { Orientation::Forward, Orientation::Forward, Orientation::Forward, Orientation::Forward });
+            AddPlaneFace(Bp, { 0, 8, 1, 5, 4 }, { 0, 1, 10, 5, 9 }, { Orientation::Forward, Orientation::Forward, Orientation::Forward, Orientation::Reversed, Orientation::Reversed });
+            AddPlaneFace(Bp, { 1, 2, 6, 5 }, { 2, 11, 6, 10 }, { Orientation::Forward, Orientation::Forward, Orientation::Reversed, Orientation::Reversed });
+            AddPlaneFace(Bp, { 2, 3, 7, 6 }, { 3, 12, 7, 11 }, { Orientation::Forward, Orientation::Forward, Orientation::Reversed, Orientation::Reversed });
+            AddPlaneFace(Bp, { 3, 0, 4, 7 }, { 4, 9, 8, 12 }, { Orientation::Forward, Orientation::Forward, Orientation::Reversed, Orientation::Reversed });
+            const ArrangementOutcome Asm = AssembleBody(Part, Bp, "SplitCube");
+            const VertexToken Deg2Vert = Asm.Refusal.empty() ? Part.CollectInventory(Asm.Body).Vertices[8] : VertexToken{};
+            const BlendOutcome Denied2 = Asm.Refusal.empty() ? BevelVertices(Part, Asm.Body, { Deg2Vert }, { 0.1, true }) : BlendOutcome{};
+            if (!VerifyCheck(Asm.Refusal.empty() && !Denied2.Refusal.empty(),
+                             "Degree-2 vertex bevel is denied (requires >= 3 edges)"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
         }
         ++Passed;
     }

@@ -726,6 +726,8 @@ void WriteBevelText(SketcherBevelSession& Bevel)
     Request.Shape               = Bevel.Shape;
     Request.Size                = Bevel.Size;
     Request.ClampOverlapEnabled = Bevel.ClampOverlapEnabled;
+    Request.VertexCondition     = Bevel.VertexCondition;
+    if (Bevel.VertexCondition) return Request;
     if (Bevel.VariableEnabled)
     {
         Request.EndSize           = Bevel.EndSize;
@@ -834,6 +836,17 @@ void RefreshBevelHandles(SketcherWorkspaceStatus& State, bool ForceCondition)
         Bevel.CornerSizes.clear();
         return;
     }
+    if (Bevel.VertexCondition)
+    {
+        if (!ForceCondition && Bevel.HandleEdges == Bevel.VertexNames) return;
+        Bevel.HandleEdges = Bevel.VertexNames;
+        Bevel.Handles     = MeasureSketcherVertexBlendHandles(State.Document, Bevel.VertexNames);
+        Bevel.CornerSizes.assign(Bevel.Handles.size(), 0.0);
+        Bevel.HoverHandle   = -1;
+        Bevel.DragHandle    = -1;
+        Bevel.GoodCondition = false;
+        return;
+    }
     if (!ForceCondition && Bevel.HandleEdges == State.Document.Selection.Edges) return;
     std::map<std::string, double> Kept;
     for (size_t Index = 1; Index < Bevel.Handles.size() && Index < Bevel.CornerSizes.size(); ++Index)
@@ -866,7 +879,9 @@ constexpr float BevelHandleReach = 11.0f;                                       
 //    size). A short stick (the lead) stands out from there to the grip.
 [[nodiscard]] double BevelHandleDepthRate(const SketcherBevelSession& Bevel, int Index)
 {
-    const double Spread = Bevel.Handles[size_t(Index)].Spread;                               // [-]   - cos ½φ
+    const SketcherBlendHandle& Handle = Bevel.Handles[size_t(Index)];
+    if (Handle.VertexCondition) return std::max(Handle.Spread, 0.05);
+    const double Spread = Handle.Spread;                                                     // [-]   - cos ½φ
     if (!(Spread > 0.05) || !(Spread < 0.999)) return 1.0;                                   // Folded or flat: stands for the size itself
     const double Rate = Bevel.Shape == BlendProfile::Chamfer ? std::sqrt(1.0 - Spread * Spread) : 1.0 / Spread - 1.0;
     return std::max(Rate, 0.05);                                                             // [-]   - Depth per unit size
@@ -916,17 +931,36 @@ void FlipBevelAnchor(SketcherWorkspaceStatus& State)
 
 void OpenBevelSession(SketcherWorkspaceStatus& State, BlendProfile Shape, bool PinOnOpen = false)
 {
-    // In body-point selection mode, B/C performs a CAD corner blend: every edge incident to the picked persistent
-    // vertex is fed to the same exact edge-blend kernel. This produces the proper setback/fillet corner patch rather
-    // than treating a body vertex as a 2D sketch point.
+    // Blender-style Vertex Bevel (Affect: Vertices): in vertex selection mode (with no edges picked), truncate each
+    // selected vertex at distance Size along all k incident edges to generate a k-gon corner face (3 = triangle,
+    // 4 = quad, 5 = pentagon, ...). Vertices with 1 or 2 incident edges are denied.
     const std::vector<std::string> VertexNames = State.Document.Selection.Edges.empty() ? State.Document.Selection.Vertices : std::vector<std::string>{};
-    const std::vector<std::string> VertexEdges = ResolveSketcherVertexBlendEdges(State.Document, VertexNames);
-    if (!VertexNames.empty() && VertexEdges.empty())
+    if (!VertexNames.empty())
     {
-        Announce(State, "Vertex bevel needs body vertices from one solid");
+        const SketcherBlendFit VFit = MeasureSketcherVertexBlendFit(State.Document, VertexNames);
+        if (!VFit.Refusal.empty())
+        {
+            Announce(State, VFit.Refusal);
+            return;
+        }
+        const double Previous = (State.Bevel.Verb == SketcherSessionVerb::Blend && State.Bevel.VertexCondition) ? State.Bevel.Size : 0.0;
+        ResetBevelSession(State);
+        State.Bevel.ActiveCondition = true;
+        State.Bevel.Verb            = SketcherSessionVerb::Blend;
+        State.Bevel.Shape           = BlendProfile::Chamfer;
+        State.Bevel.VertexCondition = true;
+        State.Bevel.VertexNames     = VertexNames;
+        State.Bevel.Size            = Previous > 0.0 ? Previous : 0.25;
+        State.Bevel.Fit             = VFit;
+        const bool Refitted = State.Bevel.Fit.Span > 0.0 && State.Bevel.Size > 0.35 * State.Bevel.Fit.Span;
+        if (Refitted) State.Bevel.Size = State.Bevel.Fit.Fitted;
+        State.Bevel.PinnedCondition = PinOnOpen;
+        RefreshBevelHandles(State, true);
+        WriteBevelText(State.Bevel);
+        Announce(State, std::string("Vertex Bevel (B): drag anywhere or the ring handle to size · type in the card · LMB / Enter applies · RMB / Esc cancels")
+                        + (Refitted ? " · starts at " + FormatLength(State.Bevel.Size) + " m to fit the vertex" : std::string{}));
         return;
     }
-    if (!VertexEdges.empty()) State.Document.Selection.Edges = VertexEdges;
     if (State.Document.Selection.Edges.empty())
     {
         // 2D: sketch corners (picked points in mode 1, or whole sketches).
@@ -1506,8 +1540,11 @@ void ApplyBevelSession(SketcherWorkspaceStatus& State)
     const SketcherBlendRequest Request = ComposeBlendRequest(State.Bevel);
     // Keep the edited location before regeneration replaces the selected sharp-edge names. A successful blend selects
     // its owning body and asks the ordinary transform gizmo to stand where the bevel was made, not at the body centre.
-    const std::string BlendBody = State.Document.Selection.Edges.empty() ? std::string{}
-                                : SketcherBodyOfName(State.Document, SketcherSelectionCategory::Edge, State.Document.Selection.Edges.front());
+    const std::string BlendBody = !State.Document.Selection.Edges.empty()
+                                ? SketcherBodyOfName(State.Document, SketcherSelectionCategory::Edge, State.Document.Selection.Edges.front())
+                                : (!State.Bevel.VertexNames.empty()
+                                   ? SketcherBodyOfName(State.Document, SketcherSelectionCategory::Vertex, State.Bevel.VertexNames.front())
+                                   : std::string{});
     const Vector3 BlendOrigin = !State.Bevel.Handles.empty() ? BevelHandleBase(State.Bevel, 0) : Vector3{};
     // 💡 The preview on screen is the result: when it was staged from this document with every parameter as it stands,
     //    it is adopted (one undo entry, its display arrays reused) instead of running the command a second time.
@@ -9540,7 +9577,9 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
 
 [[nodiscard]] double PersistentBevelHandleDepthRate(const SketcherCommittedBevelControls& Controls, int Index)
 {
-    const double Spread = Controls.Handles[size_t(Index)].Spread;
+    const SketcherBlendHandle& Handle = Controls.Handles[size_t(Index)];
+    if (Handle.VertexCondition) return std::max(Handle.Spread, 0.05);
+    const double Spread = Handle.Spread;
     if (!(Spread > 0.05) || !(Spread < 0.999)) return 1.0;
     const double Rate = Controls.Shape == BlendProfile::Chamfer ? std::sqrt(1.0 - Spread * Spread) : 1.0 / Spread - 1.0;
     return std::max(Rate, 0.05);
@@ -18597,8 +18636,10 @@ void DrawBevelCard(SketcherWorkspaceStatus& State)
     BeginCard(Inset ? "Inset" : Profile ? "Extrude sketch" : Extrude ? "Extrude" : Corner ? "Sketch corners" : Bevel.VertexCondition ? "Vertex bevel" : "Edge bevel");
     if (Bevel.VertexCondition)
     {
+        const int Sides = !Bevel.Handles.empty() ? Bevel.Handles.front().Edges : 0;
+        const char* NgonLabel = Sides == 3 ? "triangle (3-gon)" : Sides == 4 ? "quad (4-gon)" : Sides == 5 ? "pentagon (5-gon)" : "n-gon";
         ImGui::PushStyleColor(ImGuiCol_Text, Tint(MutedColour));
-        ImGui::TextWrapped("%zu selected bod%s · %zu incident edges · CAD corner patch", Bevel.VertexNames.size(), Bevel.VertexNames.size() == 1 ? "y vertex" : "y vertices", State.Document.Selection.Edges.size());
+        ImGui::TextWrapped("%zu selected bod%s · %d edges → %s corner face", Bevel.VertexNames.size(), Bevel.VertexNames.size() == 1 ? "y vertex" : "y vertices", Sides, NgonLabel);
         ImGui::PopStyleColor();
     }
     if (Inset)
@@ -18651,14 +18692,14 @@ void DrawBevelCard(SketcherWorkspaceStatus& State)
             ImGui::EndCombo();
         }
     }
-    if (!Extrude)
+    if (!Extrude && !Bevel.VertexCondition)
     {
         if (ToggleButton(State, "Fillet  (D)###BevelFillet", Bevel.Shape == BlendProfile::Fillet, RowSpan())) Bevel.Shape = BlendProfile::Fillet;
         ImGui::SameLine();
         if (ToggleButton(State, "Chamfer  (C)###BevelChamfer", Bevel.Shape == BlendProfile::Chamfer, RowSpan())) Bevel.Shape = BlendProfile::Chamfer;
     }
     ImGui::SetNextItemWidth(110);
-    if (ImGui::InputText(Extrude ? "Distance###BevelSize" : Bevel.Shape == BlendProfile::Fillet ? "Radius###BevelSize" : "Setback###BevelSize", Bevel.SizeText.data(),
+    if (ImGui::InputText(Extrude ? "Distance###BevelSize" : Bevel.VertexCondition ? "Offset###BevelSize" : Bevel.Shape == BlendProfile::Fillet ? "Radius###BevelSize" : "Setback###BevelSize", Bevel.SizeText.data(),
                          Bevel.SizeText.size(), ImGuiInputTextFlags_EnterReturnsTrue))
     {
         double Parsed = 0.0;
@@ -18703,7 +18744,7 @@ void DrawBevelCard(SketcherWorkspaceStatus& State)
         ImGui::TextWrapped("Border ring %s m wide · inner face %s m along the normal (0 = flat split, − pocket)", FormatLength(Bevel.Size).c_str(), FormatLength(Bevel.Depth).c_str());
         ImGui::PopStyleColor();
     }
-    if (!Extrude && !Corner)
+    if (!Extrude && !Corner && !Bevel.VertexCondition)
     {
         // Variable size: the end size field and the anchor flip (F).
         if (ToggleButton(State, "Variable size###BevelVariable", Bevel.VariableEnabled, RowSpan())) ToggleBevelVariable(State);
@@ -20878,7 +20919,8 @@ void DrawSelectionSummary(SketcherWorkspaceStatus& State, SketcherSheet& Sheet)
         if (BodyKey.empty()) BodyKey = Bodies.front();
         const SketcherBodyFigures* Figures = FiguresOf(State.Document, BodyKey);
         const bool Sheeted = Figures && Figures->SheetCondition;
-        Glyph = Sheeted ? IconSymbol::SketcherSurface : IconSymbol::SketcherBody;
+        Glyph = Figures ? SketcherBodyIcon(State.Document, *Figures)
+                        : (Sheeted ? IconSymbol::SketcherSurface : IconSymbol::SketcherBody);
         Ink   = Sheeted ? 0x7ba9d9 : 0xe5b369;
         Name  = SketcherBodyCaption(State.Document, BodyKey);
         Kind  = Sheeted ? "OPEN SHEET" : "SOLID BODY";

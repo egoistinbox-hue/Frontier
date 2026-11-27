@@ -635,6 +635,21 @@ int main()
         const bool PersistentBevelActive = State.BevelControls.ActiveCondition
                                         && !State.BevelControls.StepLabel.empty()
                                         && State.BevelControls.Handles.size() >= 3u;
+        bool PersistentBevelDragged = false;
+        if (const ImVec4* Handle0Box = State.Widgets.Find("BevelHandle0"))
+        {
+            const float HX = 0.5f * (Handle0Box->x + Handle0Box->z);
+            const float HY = 0.5f * (Handle0Box->y + Handle0Box->w);
+            const double BeforeDragSize = State.BevelControls.Size;
+            StepHostedFrame([&]() { Io.AddMousePosEvent(HX, HY); });
+            const bool Hovered0 = State.BevelControls.HoverHandle == 0;
+            StepHostedFrame([&]() { Io.AddMouseButtonEvent(ImGuiMouseButton_Left, true); });
+            const bool Grabbed0 = State.BevelControls.DragHandle == 0 && !State.Gizmo.DragCondition;
+            StepHostedFrame([&]() { Io.AddMousePosEvent(HX - 24.0f, HY + 18.0f); });
+            const bool StillDragging0 = State.BevelControls.DragHandle == 0 && !State.Gizmo.DragCondition;
+            StepHostedFrame([&]() { Io.AddMouseButtonEvent(ImGuiMouseButton_Left, false); });
+            PersistentBevelDragged = Hovered0 && Grabbed0 && StillDragging0 && std::abs(State.BevelControls.Size - BeforeDragSize) > 1.0e-4;
+        }
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_V, true); });
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_V, false); });
         const bool VUnassigned = !State.Trim.ActiveCondition && !State.Bevel.ActiveCondition;
@@ -650,6 +665,7 @@ int main()
         // Verify Snap Filter & ContextAwareSnap defaults and Shift+A Line drawing mode
         if (!VerifyCheck(BevelGizmoPlaced, "Completed bevel places the gizmo at the edited feature") ||
             !VerifyCheck(PersistentBevelActive, "Completed bevel keeps persistent blue + white variable-bevel controls active") ||
+            !VerifyCheck(PersistentBevelDragged, "Persistent bevel handle 0 drags cleanly over overlapping transform gizmo") ||
             !VerifyCheck(ProfilerToggledOn && ProfilerToggledOff, "F3 toggles live per-operation profiler HUD with recorded timings") ||
             !VerifyCheck(VUnassigned, "Plain V has no assigned tool hotkey") ||
             !VerifyCheck(State.Picker.Enabled && State.Picker.ContextAwareSnap && State.Picker.Filter.CurveEnabled && State.Picker.Filter.EndpointEnabled,

@@ -781,6 +781,8 @@ bool ActivatePersistentBevelControls(SketcherWorkspaceStatus& State, const std::
     Controls.CornerSizes          = Measured.CornerSizes;
     Controls.Fit                  = Measured.Fit;
     Controls.ClampOverlapEnabled  = Measured.ClampOverlapEnabled;
+    Controls.VariableEnabled      = Measured.VariableEnabled;
+    Controls.EndSize              = Measured.EndSize;
     Controls.HoverHandle          = -1;
     Controls.DragHandle           = -1;
     Controls.DragMutatedCondition = false;
@@ -815,6 +817,8 @@ void SyncPersistentBevelControls(SketcherWorkspaceStatus& State)
     Controls.CornerSizes         = Measured.CornerSizes;
     Controls.Fit                 = Measured.Fit;
     Controls.ClampOverlapEnabled = Measured.ClampOverlapEnabled;
+    Controls.VariableEnabled     = Measured.VariableEnabled;
+    Controls.EndSize             = Measured.EndSize;
     Controls.DocumentRevision    = State.Document.Revision;
     if (KeptDrag >= int(Controls.Handles.size())) Controls.DragHandle = -1;
     Controls.FocusCorner = (KeptFocus > 0 && KeptFocus < int(Controls.Handles.size())) ? KeptFocus : -1;
@@ -910,7 +914,7 @@ void FlipBevelAnchor(SketcherWorkspaceStatus& State)
     Announce(State, Bevel.ReversedCondition ? "Anchor flipped: the start size is at each edge's end corner" : "Anchor: the start size is at each edge's start corner");
 }
 
-void OpenBevelSession(SketcherWorkspaceStatus& State, BlendProfile Shape)
+void OpenBevelSession(SketcherWorkspaceStatus& State, BlendProfile Shape, bool PinOnOpen = false)
 {
     // In body-point selection mode, B/C performs a CAD corner blend: every edge incident to the picked persistent
     // vertex is fed to the same exact edge-blend kernel. This produces the proper setback/fillet corner patch rather
@@ -939,7 +943,7 @@ void OpenBevelSession(SketcherWorkspaceStatus& State, BlendProfile Shape)
         State.Bevel.Shape           = Shape;
         State.Bevel.Size            = Previous > 0.0 ? Previous : 0.1;
         State.Bevel.Corner          = std::move(Corner);
-        State.Bevel.PinnedCondition = false;                                                 // Blender: pointer motion sizes immediately; LMB confirms
+        State.Bevel.PinnedCondition = PinOnOpen;                                             // Blender B: pointer motion sizes immediately; UI launch pins for handle/card edits
         WriteBevelText(State.Bevel);
         Announce(State, std::string(Shape == BlendProfile::Fillet ? "Fillet" : "Chamfer") + " sketch corners (B): drag anywhere to size (it stops at the largest that fits) · type a size · D fillet · C chamfer · LMB / Enter applies · RMB / Esc cancels");
         return;
@@ -958,8 +962,8 @@ void OpenBevelSession(SketcherWorkspaceStatus& State, BlendProfile Shape)
     const bool Refitted = State.Bevel.Fit.Span > 0.0 && State.Bevel.Size > 0.35 * State.Bevel.Fit.Span;
     if (Refitted) State.Bevel.Size = State.Bevel.Fit.Fitted;
     // Blender modal bevel: after B, pointer motion adjusts the amount without requiring
-    // a gizmo grab. A handle or numeric edit can still pin a precise value before confirm.
-    State.Bevel.PinnedCondition = false;
+    // a gizmo grab. A handle, numeric edit, or UI button launch pins until dragged or toggled.
+    State.Bevel.PinnedCondition = PinOnOpen;
     RefreshBevelHandles(State, true);
     WriteBevelText(State.Bevel);
     Announce(State, std::string(State.Bevel.VertexCondition ? "Vertex " : "") + (Shape == BlendProfile::Fillet ? "Fillet" : "Chamfer") + " (B): drag anywhere or the ring handle to size (it stops at the largest that fits) · drag a corner diamond for a variable size · type in the card · D fillet · C chamfer · variable size is in the card · Alt+click an edge loop, Ctrl+Alt+click a ring (Shift adds) · LMB / Enter applies · RMB / Esc cancels"
@@ -9404,6 +9408,16 @@ void DrawKnifeGhost(SketcherWorkspaceStatus& State, ImDrawList* Canvas, const Or
     return true;
 }
 
+[[nodiscard]] float BevelPointToSegmentDistance(ImVec2 Point, ImVec2 Start, ImVec2 End)
+{
+    const float Dx = End.x - Start.x;
+    const float Dy = End.y - Start.y;
+    const float LenSq = Dx * Dx + Dy * Dy;
+    if (LenSq <= 1.0e-4f) return std::hypot(Point.x - Start.x, Point.y - Start.y);
+    const float T = std::clamp(((Point.x - Start.x) * Dx + (Point.y - Start.y) * Dy) / LenSq, 0.0f, 1.0f);
+    return std::hypot(Point.x - (Start.x + T * Dx), Point.y - (Start.y + T * Dy));
+}
+
 bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& Frame, ImVec2 Local, bool PointerCondition)
 {
     SketcherBevelSession& Bevel = State.Bevel;
@@ -9425,8 +9439,7 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
     if (Bevel.DragHandle >= 0 && Bevel.DragHandle < int(Bevel.Handles.size()))
     {
         const SketcherBlendHandle& Handle = Bevel.Handles[size_t(Bevel.DragHandle)];
-        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
-        const bool UseScreen = Bevel.DragScreenCondition || RayAlign > 0.90;
+        const bool UseScreen = Bevel.DragScreenCondition;
         const std::optional<double> Parameter = UseScreen ? std::optional<double>((Io.MousePos.x - Bevel.DragLast) * Frame.WorldPerPixel)
                                                           : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
         if (Parameter)
@@ -9474,25 +9487,34 @@ bool DriveBevelHandles(SketcherWorkspaceStatus& State, const OrbitCameraBasis& F
     Bevel.DragHandle = -1;
     if (!PointerCondition) return false;
     const ImVec2 Pointer(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y);
-    float Nearest = BevelHandleReach;
-    bool Facing = false;                                                                     // [-] - Hovered handle's axis faces the camera
+    constexpr float GripReach = std::max(BevelHandleReach, 14.0f);
+    constexpr float StemReach = 8.0f;
+    float NearestGrip = GripReach;
+    float NearestStem = StemReach;
+    int   StemHit     = -1;
+    bool  StemFacing  = false;
+    bool  Facing      = false;                                                               // [-] - Hovered handle's axis faces the camera
     for (int Index = int(Bevel.Handles.size()) - 1; Index >= 0; --Index)                     // Corners first, the uniform handle wins a tie
     {
         ImVec2 Base, Tip;
         bool   Screen = false;
         if (!ProjectBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
-        const float Distance = std::hypot(Tip.x - Pointer.x, Tip.y - Pointer.y);
-        if (Distance <= Nearest) { Nearest = Distance; Bevel.HoverHandle = Index; Facing = Screen; }
+        const float GripDist = std::hypot(Tip.x - Pointer.x, Tip.y - Pointer.y);
+        if (GripDist <= NearestGrip) { NearestGrip = GripDist; Bevel.HoverHandle = Index; Facing = Screen; }
+        const float StemDist = BevelPointToSegmentDistance(Pointer, Base, Tip);
+        if (StemDist <= NearestStem) { NearestStem = StemDist; StemHit = Index; StemFacing = Screen; }
     }
+    if (Bevel.HoverHandle < 0 && StemHit >= 0) { Bevel.HoverHandle = StemHit; Facing = StemFacing; }
     if (Bevel.HoverHandle >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         const SketcherBlendHandle& Handle = Bevel.Handles[size_t(Bevel.HoverHandle)];
+        const std::optional<double> AxisParam = MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
         const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
-        const bool   UseScreen = Facing || RayAlign > 0.90;
+        const bool   UseScreen = Facing || !AxisParam.has_value() || RayAlign > 0.96;
         Bevel.DragHandle          = Bevel.HoverHandle;
         Bevel.DragScreenCondition = UseScreen;
         Bevel.DragLast            = Io.MousePos.x;
-        Bevel.DragOrigin          = UseScreen ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
+        Bevel.DragOrigin          = UseScreen ? 0.0 : *AxisParam;
         double StartDragSize      = BevelHandleSize(Bevel, Bevel.HoverHandle);
         if (Bevel.DragHandle > 0)
         {
@@ -9578,8 +9600,7 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
     if (Controls.DragHandle >= 0 && Controls.DragHandle < int(Controls.Handles.size()))
     {
         const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.DragHandle)];
-        const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
-        const bool UseScreen = Controls.DragScreenCondition || RayAlign > 0.90;
+        const bool UseScreen = Controls.DragScreenCondition;
         const std::optional<double> Parameter = UseScreen
             ? std::optional<double>((Io.MousePos.x - Controls.DragLast) * Frame.WorldPerPixel)
             : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
@@ -9626,6 +9647,8 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
                 SketcherBlendRequest EditRequest;
                 EditRequest.Shape               = Controls.Shape;
                 EditRequest.Size                = NewUniform;
+                if (Controls.DragHandle == 0 && VertexSizes.empty() && Controls.VariableEnabled && Controls.EndSize > 0.0)
+                    EditRequest.EndSize = Controls.EndSize;
                 EditRequest.VertexSizes         = std::move(VertexSizes);
                 EditRequest.ClampOverlapEnabled = Controls.ClampOverlapEnabled;
                 const SketcherCommandOutcome Outcome = UpdateSketcherBlendStep(
@@ -9647,7 +9670,12 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
                     if (RecordHistory) Controls.DragHistoryRecorded = true;
                     Controls.DragMutatedCondition = true;
                     if (Controls.DragHandle == 0) Controls.Size = NewUniform;
-                    else Controls.CornerSizes[size_t(Controls.DragHandle)] = Size;
+                    else
+                    {
+                        Controls.CornerSizes[size_t(Controls.DragHandle)] = Size;
+                        Controls.VariableEnabled = false;
+                        Controls.EndSize = 0.0;
+                    }
                     Controls.DocumentRevision = State.Document.Revision;
                     RefreshSketcherScene(State, true);
                 }
@@ -9672,30 +9700,52 @@ bool DrivePersistentBevelControls(SketcherWorkspaceStatus& State, const OrbitCam
     Controls.DragHandle = -1;
     if (!PointerCondition) return false;
     const ImVec2 Pointer(State.ViewportRect[0] + Local.x, State.ViewportRect[1] + Local.y);
-    float Nearest = BevelHandleReach;
-    bool  Facing  = false;
+    constexpr float GripReach = std::max(BevelHandleReach, 14.0f);
+    constexpr float StemReach = 8.0f;
+    float NearestGrip = GripReach;
+    float NearestStem = StemReach;
+    int   StemHit     = -1;
+    bool  StemFacing  = false;
+    bool  Facing      = false;
     for (int Index = int(Controls.Handles.size()) - 1; Index >= 0; --Index)
     {
         ImVec2 Base, Tip;
         bool   Screen = false;
         if (!ProjectPersistentBevelHandle(State, Frame, Index, Lead, Base, Tip, Screen)) continue;
-        const float Distance = std::hypot(Tip.x - Pointer.x, Tip.y - Pointer.y);
-        if (Distance <= Nearest)
+        const float GripDist = std::hypot(Tip.x - Pointer.x, Tip.y - Pointer.y);
+        if (GripDist <= NearestGrip)
         {
-            Nearest = Distance;
+            NearestGrip = GripDist;
             Controls.HoverHandle = Index;
             Facing = Screen;
         }
+        // Leave the transform gizmo's centre sphere at Base clickable when active, while claiming the stick & grip.
+        const ImVec2 StemStart = (Index == 0 && State.Gizmo.Target != SketcherGizmoTarget::None)
+            ? ImVec2(Base.x + 0.45f * (Tip.x - Base.x), Base.y + 0.45f * (Tip.y - Base.y))
+            : Base;
+        const float StemDist = BevelPointToSegmentDistance(Pointer, StemStart, Tip);
+        if (StemDist <= NearestStem)
+        {
+            NearestStem = StemDist;
+            StemHit = Index;
+            StemFacing = Screen;
+        }
+    }
+    if (Controls.HoverHandle < 0 && StemHit >= 0)
+    {
+        Controls.HoverHandle = StemHit;
+        Facing = StemFacing;
     }
     if (Controls.HoverHandle >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         const SketcherBlendHandle& Handle = Controls.Handles[size_t(Controls.HoverHandle)];
+        const std::optional<double> AxisParam = MeasureAxisParameter(Ray, Handle.Position, Handle.Direction);
         const double RayAlign = std::abs(Ray.Direction[0] * Handle.Direction.X + Ray.Direction[1] * Handle.Direction.Y + Ray.Direction[2] * Handle.Direction.Z);
-        const bool   UseScreen = Facing || RayAlign > 0.90;
+        const bool   UseScreen = Facing || !AxisParam.has_value() || RayAlign > 0.96;
         Controls.DragHandle           = Controls.HoverHandle;
         Controls.DragScreenCondition  = UseScreen;
         Controls.DragLast             = Io.MousePos.x;
-        Controls.DragOrigin           = UseScreen ? 0.0 : MeasureAxisParameter(Ray, Handle.Position, Handle.Direction).value_or(0.0);
+        Controls.DragOrigin           = UseScreen ? 0.0 : *AxisParam;
         double StartDragSize          = PersistentBevelHandleSize(Controls, Controls.HoverHandle);
         if (Controls.DragHandle > 0)
         {
@@ -17512,7 +17562,7 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
                                && (Io.KeyShift || Io.KeyCtrl || Io.KeyAlt)
                                && !FindCurveNear(State, Frame, Io.MousePos).empty();
     // Persistent post-commit variable-bevel controls (blue uniform + white corner handles) take priority over gizmo/picks.
-    const bool PersistentBevelOwned = !State.Bevel.ActiveCondition
+    const bool PersistentBevelOwned = !State.Bevel.ActiveCondition && !State.Gizmo.DragCondition
                                    && DrivePersistentBevelControls(State, Frame, Local, Hovered && !OverCube && !ModifierCurveHit);
     bool GizmoOwned = false;
     {
@@ -18938,11 +18988,11 @@ void DrawSelectionToolCards(SketcherWorkspaceStatus& State)
             ImGui::SetTooltip("Scale the picked sketches about their centre: drag away / towards it or type a factor; X / Y / Z stretch along an axis (straight curves only)");
         // Plasticity fillet-curve: B rounds every corner of the picked sketches (or the picked mode-1 corner points).
         const bool CornerCondition = !CornerTargets(State).Sketches.empty() && !State.Bevel.ActiveCondition;
-        if (PressButton(State, "Fillet  (B)###CurveFillet", RowSpan(), CornerCondition)) OpenBevelSession(State, BlendProfile::Fillet);
+        if (PressButton(State, "Fillet  (B)###CurveFillet", RowSpan(), CornerCondition)) OpenBevelSession(State, BlendProfile::Fillet, true);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Round the corners where two lines meet (every corner of the picked sketches, or the corner points picked in mode 1)");
         ImGui::SameLine();
-        if (PressButton(State, "Chamfer###CurveChamfer", RowSpan(), CornerCondition)) OpenBevelSession(State, BlendProfile::Chamfer);
+        if (PressButton(State, "Chamfer###CurveChamfer", RowSpan(), CornerCondition)) OpenBevelSession(State, BlendProfile::Chamfer, true);
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Cut the corners straight, the same distance back along both lines");
         if (ToggleButton(State, "Combs###CurveCombs", State.CombsEnabled, ImVec2(70, 0))) State.CombsEnabled = !State.CombsEnabled;
         ImGui::SameLine();
@@ -20712,8 +20762,8 @@ float OperationGridHeight(size_t Count)
 
 void RunOperation(SketcherWorkspaceStatus& State, const std::string& Key)
 {
-    if (Key == "Fillet") OpenBevelSession(State, BlendProfile::Fillet);
-    else if (Key == "Chamfer") OpenBevelSession(State, BlendProfile::Chamfer);
+    if (Key == "Fillet") OpenBevelSession(State, BlendProfile::Fillet, true);
+    else if (Key == "Chamfer") OpenBevelSession(State, BlendProfile::Chamfer, true);
     else if (Key == "ExtrudeFaces") OpenExtrudeSession(State);
     else if (Key == "Inset") OpenInsetSession(State);
     else if (Key == "ExtrudeSketch") OpenSketchExtrudeSession(State);
@@ -20980,7 +21030,7 @@ void DrawBevelHistory(SketcherWorkspaceStatus& State, SketcherSheet& Sheet)
     }
     if (!Blends.empty()) Y += 14.0f;
     const bool Edges = !State.Document.Selection.Edges.empty() && !State.Bevel.ActiveCondition;
-    if (SheetButton(State, Sheet, "BevelLauncher", Left, Y + 17.5f, "Bevel / Chamfer · B", Edges)) OpenBevelSession(State, BlendProfile::Fillet);
+    if (SheetButton(State, Sheet, "BevelLauncher", Left, Y + 17.5f, "Bevel / Chamfer · B", Edges)) OpenBevelSession(State, BlendProfile::Fillet, true);
     CloseSheetCard(Card);
 }
 

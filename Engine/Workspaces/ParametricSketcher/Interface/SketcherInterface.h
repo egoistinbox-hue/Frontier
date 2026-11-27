@@ -217,6 +217,8 @@ struct SketcherCommittedBevelControls
     std::vector<double>                 CornerSizes      = {};                               // [len] - Per-handle corner override (0 = follows Size)
     SketcherBlendFit                    Fit              = {};                               // [len] - Suggested start + blocking-vertex merge distances
     bool                                ClampOverlapEnabled = true;                          // [-]   - Step clamp-merge mode
+    bool                                VariableEnabled  = false;                            // [-]   - End-to-end taper active on step
+    double                              EndSize          = 0.0;                              // [len] - End-to-end taper target size
     int                                 HoverHandle      = -1;                               // [idx] - Handle under cursor
     int                                 DragHandle       = -1;                               // [idx] - Handle currently dragged
     double                              DragOrigin       = 0.0;                              // [len] - Axis parameter at drag press

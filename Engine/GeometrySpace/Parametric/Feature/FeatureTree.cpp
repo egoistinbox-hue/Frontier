@@ -1258,9 +1258,9 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
                 Store();
                 break;
             }
-            // ③″ Extrude manifold (Blender's push-in): a negative face extrusion goes into the body. A face whose
-            //    neighbours can follow it is pushed; an imprinted region (every neighbour coplanar) — or a face the push
-            //    refuses — becomes a prism of its own outline, started a hair outside the face, cut out of the body.
+            // ③″ Extrude inward (Amount < 0): standard / along-normals / individual-faces extrudes always cut a recessed
+            //    pocket/wall along -Normal via Boolean difference. Extrude Manifold (ExtrudeManifoldCondition) tries Push
+            //    first when the selection touches non-coplanar neighbours, falling back to Difference if Push refuses.
             if (Step.Operation == FaceOperationCategory::Extrude && Amount < 0.0)
             {
                 std::vector<FaceToken>        Faces;
@@ -1280,7 +1280,8 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
                     Outlines.push_back(std::move(Outline));
                     Planes.push_back(Plane);
                 }
-                if (!IslandCondition || !Problem.empty())
+                const bool TryPush = !Problem.empty() || (Step.ExtrudeManifoldCondition && !IslandCondition);
+                if (TryPush)
                 {
                     FaceOperationSettings Push;
                     Push.Kind     = FaceOperationCategory::Push;
@@ -1302,7 +1303,7 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
                 {
                     const double     Lead  = 1.0e-3 * Outlines[Index].Scale;                 // [len] - Cutter start outside the face
                     // A side a sliver short of a convex rim of the face opens through it (no strip left over the cut).
-                    (void)OpenSliverBridges(Partition, Current, Planes[Index], -1.0, &Faces[Index], Outlines[Index]);
+                    if (Index == 0) (void)OpenSliverBridges(Partition, Current, Planes[Index], -1.0, &Faces[Index], Outlines[Index]);
                     OrthonormalBasis Plane = Planes[Index];
                     Plane.Origin           = Plane.Origin + Plane.ZAxis * Lead;
                     const SweepOutcome Sweep = ExtrudeProfile(Partition, Outlines[Index], Plane, Amount - Lead, true);
@@ -1386,6 +1387,50 @@ RegenerationOutcome RegenerateFeatureTree(ModelPartition& Partition, FeatureTree
             }
             if (Step.Operation == FaceOperationCategory::Inset) Settings.Depth = EvaluateFeatureValue(Tree, Step.Extent);
             const FaceOperationOutcome Change = ApplyFaceOperation(Partition, Current, Settings);
+            if (!Change.Refusal.empty() && Step.Operation == FaceOperationCategory::Extrude && Amount > 0.0 && Settings.Faces.size() > 1)
+            {
+                // Joint extrusion of multiple adjacent planar faces sharing edges: sweep each face profile (with a small
+                // overlap lead inside the body) and unite them cleanly onto Current.
+                std::vector<SketchProfile>    Outlines;
+                std::vector<OrthonormalBasis> Planes;
+                std::string                   Problem;
+                for (FaceToken Face : Settings.Faces)
+                {
+                    SketchProfile    Outline;
+                    OrthonormalBasis Plane;
+                    bool             Island = false;
+                    Problem = DescribePlanarFaceProfile(Partition, Current, Face, Outline, Plane, Island);
+                    if (!Problem.empty()) break;
+                    Outlines.push_back(std::move(Outline));
+                    Planes.push_back(Plane);
+                }
+                if (Problem.empty() && !Outlines.empty())
+                {
+                    BodyToken   Work        = Current;
+                    BodyNaming  WorkNaming  = Naming;
+                    std::string UnionRefusal;
+                    for (size_t Index = 0; Index < Outlines.size() && UnionRefusal.empty(); ++Index)
+                    {
+                        const double     Lead  = 1.0e-3 * Outlines[Index].Scale;
+                        OrthonormalBasis Plane = Planes[Index];
+                        Plane.Origin           = Plane.Origin - Plane.ZAxis * Lead;
+                        const SweepOutcome Sweep = ExtrudeProfile(Partition, Outlines[Index], Plane, Amount + Lead, true);
+                        if (!Sweep.Refusal.empty()) { UnionRefusal = Sweep.Refusal; break; }
+                        const BodyNaming     ToolNaming = NameSweptBody(Partition, Sweep, Step.Label);
+                        const BooleanOutcome Boolean    = ComputeBoolean(Partition, Work, Sweep.Body, BooleanOperation::Union);
+                        if (!Boolean.Refusal.empty()) { UnionRefusal = Boolean.Refusal; break; }
+                        WorkNaming = NameBooleanBody(Partition, Boolean.Body, Boolean, WorkNaming, ToolNaming);
+                        Work       = Boolean.Body;
+                    }
+                    if (UnionRefusal.empty())
+                    {
+                        Naming  = std::move(WorkNaming);
+                        Current = Work;
+                        Store();
+                        break;
+                    }
+                }
+            }
             if (!Change.Refusal.empty()) { Refuse(Change.Refusal); break; }
             Outcome.Audits.emplace_back(Change.Body, Change.Audit);
             Naming  = NameChangedBody(Partition, Change.Body, Change, Naming, Step.Label);

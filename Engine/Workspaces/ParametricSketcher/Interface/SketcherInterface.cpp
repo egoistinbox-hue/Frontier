@@ -65,7 +65,7 @@ struct SketcherPreviewResult
     uint64_t                 Generation      = 0;
     int                      Parameter       = 0;
     SketcherSessionVerb      Verb            = SketcherSessionVerb::Blend;
-    SketcherExtrudeMode      ExtrudeMode     = SketcherExtrudeMode::AlongNormals;
+    SketcherExtrudeMode      ExtrudeMode     = SketcherExtrudeMode::Standard;
     BlendProfile             Shape           = BlendProfile::Fillet;
     double                   Size            = 0.0;
     bool                     VariableEnabled = false;
@@ -1058,39 +1058,6 @@ const char* SketcherExtrudeModeLabel(SketcherExtrudeMode Mode) noexcept
     case SketcherExtrudeMode::Symmetric:       return "Extrude Symmetric";
     }
     return "Extrude";
-}
-
-SketcherCommandOutcome RunFaceExtrudeWithMode(SketcherDocument& Document, double Size, SketcherExtrudeMode Mode)
-{
-    if (Mode == SketcherExtrudeMode::IndividualFaces && Document.Selection.Faces.size() > 1)
-    {
-        const std::vector<std::string> Faces = Document.Selection.Faces;
-        SketcherCommandOutcome LastOutcome { true, {}, "extruded individual faces" };
-        for (const std::string& FaceName : Faces)
-        {
-            Document.Selection.Faces = { FaceName };
-            LastOutcome = ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Size);
-            if (!LastOutcome.AcceptedCondition)
-            {
-                Document.Selection.Faces = Faces;
-                return LastOutcome;
-            }
-        }
-        Document.Selection.Faces = Faces;
-        return LastOutcome;
-    }
-    if (Mode == SketcherExtrudeMode::Symmetric)
-    {
-        const double Half = 0.5 * Size;
-        const SketcherCommandOutcome First = ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Half);
-        if (!First.AcceptedCondition) return First;
-        if (std::abs(Half) > 1.0e-9)
-        {
-            return ChangeSketcherSelection(Document, FaceOperationCategory::Push, -Half);
-        }
-        return First;
-    }
-    return ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Size);
 }
 
 void OpenSketchExtrudeSession(SketcherWorkspaceStatus& State);
@@ -16588,7 +16555,7 @@ void DrawExtrudeTypeMenu(SketcherWorkspaceStatus& State)
         State.ExtrudeMenuRequest = false;
     }
     if (!BeginSelectList("ExtrudeTypeContextMenu", State.ExtrudeMenuPos)) return;
-    ImGui::TextDisabled("Extrude Type (E repeats last)");
+    ImGui::TextDisabled("Extrude (Ctrl+E / Alt+E)");
     ImGui::Separator();
     static constexpr SketcherExtrudeMode Modes[] = {
         SketcherExtrudeMode::Standard,
@@ -16597,17 +16564,41 @@ void DrawExtrudeTypeMenu(SketcherWorkspaceStatus& State)
         SketcherExtrudeMode::IndividualFaces,
         SketcherExtrudeMode::Symmetric,
     };
+    const auto Entry = [&](const std::string& Label, const char* Shortcut, bool SelectedCondition)
+    {
+        const bool Pressed = ImGui::Selectable(Label.c_str(), SelectedCondition, ImGuiSelectableFlags_None, ImVec2(250.0f, 26.0f));
+        RegisterWidget(State, Label.c_str());
+        if (*Shortcut)
+        {
+            const ImVec2 Box  = ImGui::GetItemRectMax();
+            const ImVec2 Text = ImGui::CalcTextSize(Shortcut);
+            ImGui::GetWindowDrawList()->AddText(ImVec2(Box.x - Text.x - 8.0f, Box.y - 13.0f - 0.5f * Text.y),
+                                                ImGui::GetColorU32(Tint(IM_COL32(0x80, 0x84, 0x8a, 0xff))), Shortcut);
+        }
+        return Pressed;
+    };
     for (SketcherExtrudeMode Mode : Modes)
     {
         const std::string Label = std::string(SketcherExtrudeModeLabel(Mode)) + "###ExtrudeMode" + std::to_string(int(Mode));
-        if (SelectListEntry(State, Label, State.LastExtrudeMode == Mode))
+        const char* Shortcut = Mode == State.LastExtrudeMode ? "E" : "";
+        if (Entry(Label, Shortcut, State.LastExtrudeMode == Mode))
         {
-            OpenExtrudeSessionWithMode(State, Mode);
+            if (State.Bevel.ActiveCondition && State.Bevel.Verb == SketcherSessionVerb::Extrude)
+            {
+                State.LastExtrudeMode   = Mode;
+                State.Bevel.ExtrudeMode = Mode;
+                WriteBevelText(State.Bevel);
+                Announce(State, std::string(SketcherExtrudeModeLabel(Mode)) + " active (drag or type distance · LMB / Enter applies)");
+            }
+            else
+            {
+                OpenExtrudeSessionWithMode(State, Mode);
+            }
             ImGui::CloseCurrentPopup();
         }
     }
     ImGui::Separator();
-    if (SelectListEntry(State, "Inset Faces (I)###ExtrudeMenuInset", false))
+    if (Entry("Inset Faces###ExtrudeMenuInset", "I", false))
     {
         OpenInsetSession(State);
         ImGui::CloseCurrentPopup();
@@ -17954,6 +17945,12 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
     }
     else if (State.Bevel.ActiveCondition)
     {
+        if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        {
+            State.Bevel.AxisAnchorCondition = false;
+        }
+        else
+        {
         SketcherBevelSession& Bevel = State.Bevel;
         RefreshBevelHandles(State, false);
         const bool HandleOwned = DriveBevelHandles(State, Frame, Local, Hovered && !OverCube);
@@ -18002,6 +17999,7 @@ void DrawViewport(SketcherWorkspaceStatus& State, ImTextureRef ViewportTexture, 
         // that handle adjustment, leaving the operation active for a later confirmation.
         if ((LeftClick || ReleasedPointerDrag) && !OverCube && !HandleOwned) ApplyBevelSession(State);
         else if (RightClick && !OverCube) CancelBevelSession(State);                         // RMB cancels and preserves the document
+        }
 
     }
     else if (State.Boolean.ActiveCondition)
@@ -21228,16 +21226,35 @@ void DrawOperationsCard(SketcherWorkspaceStatus& State, SketcherSheet& Sheet)
     }
     if (Selection.Bodies.size() >= 2) Operations.clear();                                   // Several bodies: only the Normals card applies to all
     if (Operations.empty()) return;
+    const bool HasExtrude = !Selection.Faces.empty() || (Selection.Faces.empty() && FocusedSketchCondition(State));
     for (InspectorOperation& Operation : Operations) Operation.Enabled = !State.Bevel.ActiveCondition;
     const float       Width = ImGui::GetContentRegionAvail().x - 2.0f * CardInset;
     const std::string Note  = Compose("%d face%s · %d edge%s selected", int(Selection.Faces.size()), Selection.Faces.size() == 1 ? "" : "s", int(Selection.Edges.size()), Selection.Edges.size() == 1 ? "" : "s");
-    const PlaneExtent Card  = PlaceSheetCard(Sheet, 2.0f * CardInset + CardHeadingHeight + OperationGridHeight(Operations.size()) + 15.0f + ParagraphLine);
+    const float       ModeRowHeight = HasExtrude ? 40.0f : 0.0f;
+    const PlaneExtent Card  = PlaceSheetCard(Sheet, 2.0f * CardInset + CardHeadingHeight + OperationGridHeight(Operations.size()) + ModeRowHeight + 15.0f + ParagraphLine);
     const float Left = Card.MinimumX + CardInset;
     float       Y    = Card.MinimumY + CardInset;
     DrawCardHeading(Sheet, Left, Y, Width, "Operations", "NATIVE SOLVERS");
     Y += CardHeadingHeight;
     const std::string Pressed = DrawOperationGrid(State, Sheet, Left, Y, Width, Operations);
-    Y += OperationGridHeight(Operations.size()) + 15.0f;
+    Y += OperationGridHeight(Operations.size()) + 10.0f;
+    if (HasExtrude)
+    {
+        const PlaneExtent ModeBox   = Spanning(Left, Y, Width, 30.0f);
+        const SketcherPress ModePress = PressSketcherRegion(State.Widgets, "InspectorExtrudeMode", ModeBox);
+        Sheet.Box(ModeBox, SketcherInk(ModePress.HoveredCondition ? 0x262626 : 0x1c1c1c), 9.0f, SketcherWash(0x10));
+        const std::string ModeText = std::string("Type: ") + SketcherExtrudeModeLabel(State.LastExtrudeMode);
+        const float TagW = Sheet.TextRight(ModeBox.MaximumX - 10.0f, ModeBox.MinimumY + 15.0f, 9.5f, SketcherInk(0x888888), "Ctrl+E / Alt+E");
+        Sheet.TextClipped(ModeBox.MinimumX + 10.0f, ModeBox.MinimumY + 15.0f, std::max(24.0f, Width - 26.0f - TagW), 11.0f,
+                          SketcherInk(0xeeeeee), ModeText.c_str());
+        if (ModePress.ClickedCondition)
+        {
+            State.ExtrudeMenuRequest = true;
+            State.ExtrudeMenuPos     = ImVec2(ModeBox.MinimumX, ModeBox.MaximumY + 4.0f);
+        }
+        Y += 40.0f;
+    }
+    Y += 5.0f;
     DrawParagraph(Sheet, Left, Y, Width, Note);
     CloseSheetCard(Card);
     if (!Pressed.empty()) RunOperation(State, Pressed);
@@ -21877,6 +21894,13 @@ void ApplyShortcuts(SketcherWorkspaceStatus& State)
     // body[command] — a running command (fillet-solid, extrude).
     if (State.Bevel.ActiveCondition)
     {
+        if (State.Bevel.Verb == SketcherSessionVerb::Extrude && !Shift &&
+            ((Control && !Alternate && Pressed(ImGuiKey_E)) || (Alternate && !Control && Pressed(ImGuiKey_E))))
+        {
+            State.ExtrudeMenuRequest = true;
+            State.ExtrudeMenuPos     = Io.MousePos;
+            return;
+        }
         if (OperationInput.ConfirmPressed()) ApplyBevelSession(State);
         if (OperationInput.CancelPressed()) CancelBevelSession(State);
         if ((State.Bevel.Verb == SketcherSessionVerb::Blend || State.Bevel.Verb == SketcherSessionVerb::Corner) && !Control && !Alternate)
@@ -22405,7 +22429,15 @@ void ApplyShortcuts(SketcherWorkspaceStatus& State)
             if (Shift) { State.Style.GridEnabled = !State.Style.GridEnabled; Announce(State, State.Style.GridEnabled ? "Overlays on" : "Overlays off"); }
             else ToggleXRay(State);                                                     // viewport:toggle-x-ray
         }
-        if (Pressed(ImGuiKey_E)) OpenSweepSession(State, SketcherSweepVerb::Evolution);     // command:evolution
+        if (Pressed(ImGuiKey_E))
+        {
+            if (Shift) OpenSweepSession(State, SketcherSweepVerb::Evolution);
+            else
+            {
+                State.ExtrudeMenuRequest = true;                                            // Alt+E: Blender-style Extrude type context menu
+                State.ExtrudeMenuPos     = Io.MousePos;
+            }
+        }
         if (Pressed(ImGuiKey_S)) ToggleSection(State);                                      // section (no Plasticity default; Alt+S is free)
         if (Pressed(ImGuiKey_D)) ToggleDrawingSheet(State);                                 // drawing sheet (no Plasticity default; Alt+D is free)
         if (Pressed(ImGuiKey_J)) OpenJointSession(State);                                   // joint (no Plasticity default; Alt+J is free)
@@ -23297,7 +23329,6 @@ void DrawSketcherInterface(SketcherWorkspaceStatus& State, ImTextureID ViewportT
     { SketcherPhaseClock Clock(Profile, "status bar"); DrawStatusBar(State, Frame); }
     DrawDrawingOptions(State);
     DrawCurveGuide(State);
-    DrawWorkspacePopups(State);
     DrawMatcapPicker(State);
     DrawWelcome(State);
     { SketcherPhaseClock Clock(Profile, "trace panel"); DrawTracePanel(State); }
@@ -23308,6 +23339,7 @@ void DrawSketcherInterface(SketcherWorkspaceStatus& State, ImTextureID ViewportT
     const bool        XformPlaneBefore    = State.Transform.PlaneCondition;
     const auto        XformVerbBefore     = State.Transform.Verb;
     { SketcherPhaseClock Clock(Profile, "shortcuts"); ApplyShortcuts(State); }
+    DrawWorkspacePopups(State);
     if (State.BevelControls.ActiveCondition && HasCompetingBevelTool(State)) DismissPersistentBevelControls(State);
     const bool CamShortcutChanged = State.Camera.Distance != CamBeforeShortcuts.Distance
                                  || State.Camera.Azimuth != CamBeforeShortcuts.Azimuth
@@ -23817,6 +23849,51 @@ SketcherCommandOutcome ApplySketcherGizmo(SketcherWorkspaceStatus& State, GizmoH
     }
     Gizmo.Grab = GizmoHandle::None;
     return Outcome;
+}
+
+SketcherCommandOutcome RunFaceExtrudeWithMode(SketcherDocument& Document, double Size, SketcherExtrudeMode Mode)
+{
+    const bool Manifold = Mode == SketcherExtrudeMode::Manifold;
+    if (Mode == SketcherExtrudeMode::IndividualFaces && Document.Selection.Faces.size() > 1)
+    {
+        const std::vector<std::string> Faces = Document.Selection.Faces;
+        SketcherCommandOutcome LastOutcome { true, {}, "extruded individual faces" };
+        for (const std::string& FaceName : Faces)
+        {
+            Document.Selection.Faces = { FaceName };
+            LastOutcome = ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Size, std::nullopt, false);
+            if (!LastOutcome.AcceptedCondition)
+            {
+                Document.Selection.Faces = Faces;
+                return LastOutcome;
+            }
+        }
+        Document.Selection.Faces = Faces;
+        return LastOutcome;
+    }
+    if (Mode == SketcherExtrudeMode::Symmetric)
+    {
+        // Symmetric extrusion thickens open sheets equally in both directions (+Half / -Half). On closed solids,
+        // extrude cleanly by Size in the requested direction.
+        bool HasSheet = false;
+        for (const std::string& FaceName : Document.Selection.Faces)
+        {
+            const std::string BodyKey = SketcherBodyOfName(Document, SketcherSelectionCategory::Face, FaceName);
+            for (const SketcherBodyFigures& Figures : Document.Summary.Bodies)
+                if (Figures.Key == BodyKey && Figures.SheetCondition) HasSheet = true;
+        }
+        if (HasSheet)
+        {
+            const double Half = 0.5 * Size;
+            const SketcherCommandOutcome First = ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Half, std::nullopt, false);
+            if (!First.AcceptedCondition) return First;
+            if (std::abs(Half) > 1.0e-9)
+                return ChangeSketcherSelection(Document, FaceOperationCategory::Push, -Half);
+            return First;
+        }
+        return ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Size, std::nullopt, false);
+    }
+    return ChangeSketcherSelection(Document, FaceOperationCategory::Extrude, Size, std::nullopt, Manifold);
 }
 
 } // namespace Frontier::Workspaces::Sketcher

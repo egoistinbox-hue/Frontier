@@ -187,6 +187,7 @@ constexpr int64_t FormatVersion = 1;                                            
     case FeatureStepCategory::FaceOperation:
         Table.insert("Operation", static_cast<int64_t>(Step.Operation));
         Table.insert("Amount", EncodeValue(Step.Amount));
+        if (Step.Operation == FaceOperationCategory::Extrude && Step.ExtrudeManifoldCondition) Table.insert("ExtrudeManifold", true);
         if (Step.Operation == FaceOperationCategory::Inset) Table.insert("Extent", EncodeValue(Step.Extent));
         if (Step.Operation == FaceOperationCategory::Reshape)
         {
@@ -887,6 +888,7 @@ SketcherDocumentFile DecodeSketcherDocument(const std::string& Text)
             Step.Shape          = static_cast<BlendProfile>(View["Shape"].value_or(int64_t{ 0 }));
             Step.Size           = DecodeValue(View["Size"]);
             Step.Operation      = static_cast<FaceOperationCategory>(View["Operation"].value_or(int64_t{ 1 }));
+            Step.ExtrudeManifoldCondition = View["ExtrudeManifold"].value_or(false);
             Step.Amount         = DecodeValue(View["Amount"]);
             Step.Placement.ColumnX = DecodeVector(View["PlacementX"], Step.Placement.ColumnX);
             Step.Placement.ColumnY = DecodeVector(View["PlacementY"], Step.Placement.ColumnY);

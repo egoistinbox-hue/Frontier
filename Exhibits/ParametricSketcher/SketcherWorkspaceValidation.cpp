@@ -420,8 +420,142 @@ int main()
             ImGui::DestroyContext(Gui);
             return 1;
         }
+        // Alt+E opens ExtrudeTypeContextMenu even while an Extrude session is active
+        StepHostedFrame([&]()
+        {
+            Io.AddKeyEvent(ImGuiMod_Alt, true);
+            Io.AddKeyEvent(ImGuiKey_E, true);
+        });
+        const bool AltEDuringExtrude = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+                                       !State.ExtrudeMenuRequest;
+        StepHostedFrame([&]()
+        {
+            Io.AddKeyEvent(ImGuiKey_E, false);
+            Io.AddKeyEvent(ImGuiMod_Alt, false);
+            Io.AddKeyEvent(ImGuiKey_Escape, true);
+        });
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Escape, false); });
+        if (!VerifyCheck(AltEDuringExtrude, "Alt+E opens ExtrudeTypeContextMenu during active Extrude"))
+        {
+            Host.Finalize();
+            Dock.Finalize();
+            ImGui::DestroyContext(Gui);
+            return 1;
+        }
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Escape, true); });
         StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Escape, false); });
+
+        // Alt+E opens ExtrudeTypeContextMenu when idle too
+        StepHostedFrame([&]()
+        {
+            Io.AddKeyEvent(ImGuiMod_Alt, true);
+            Io.AddKeyEvent(ImGuiKey_E, true);
+        });
+        const bool AltEIdle = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+                              !State.ExtrudeMenuRequest;
+        StepHostedFrame([&]()
+        {
+            Io.AddKeyEvent(ImGuiKey_E, false);
+            Io.AddKeyEvent(ImGuiMod_Alt, false);
+            Io.AddKeyEvent(ImGuiKey_Escape, true);
+        });
+        StepHostedFrame([&]() { Io.AddKeyEvent(ImGuiKey_Escape, false); });
+        if (!VerifyCheck(AltEIdle, "Alt+E opens ExtrudeTypeContextMenu when idle"))
+        {
+            Host.Finalize();
+            Dock.Finalize();
+            ImGui::DestroyContext(Gui);
+            return 1;
+        }
+        State.LastExtrudeMode = SketcherExtrudeMode::Standard;
+
+        // Inset cylinder: inward Extrude (Standard) creates recessed side walls on both inner disk & outer ring,
+        // and joint outward Extrude works when both faces are selected together.
+        {
+            SketcherDocument CylDoc = CreateSketcherDocument("InsetCylinder");
+            SketcherConstructRequest CylReq;
+            CylReq.Kind = SketcherConstructCategory::Cylinder;
+            CylReq.Radius = 0.5;
+            CylReq.Height = 1.0;
+            const auto CylMade = ConstructSketcherPrimitive(CylDoc, CylReq);
+            bool InsetOk = CylMade.AcceptedCondition && CylDoc.Summary.Bodies.size() == 1;
+            const double BaseVolume = CylDoc.Summary.Volume;
+            if (InsetOk)
+            {
+                const SketcherScene CylScene = BuildSketcherScene(CylDoc);
+                std::string TopFace;
+                for (const SketcherSceneFace& F : CylScene.Faces)
+                {
+                    if (F.CornerCount > 0 && CylScene.Corners[F.FirstCorner].Normal[2] > 0.9f)
+                    {
+                        TopFace = F.Name;
+                        break;
+                    }
+                }
+                InsetOk = !TopFace.empty();
+                if (InsetOk)
+                {
+                    CylDoc.Selection.Faces = { TopFace };
+                    const auto InsetOut = InsetSketcherSelection(CylDoc, 0.15, 0.0);
+                    InsetOk = InsetOut.AcceptedCondition;
+                }
+            }
+            if (!VerifyCheck(InsetOk, "Inset on cylinder top succeeds"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+            const SketcherScene InsetScene = BuildSketcherScene(CylDoc);
+            std::vector<std::string> TopFaces;
+            for (const SketcherSceneFace& F : InsetScene.Faces)
+            {
+                if (F.CornerCount > 0 && InsetScene.Corners[F.FirstCorner].Normal[2] > 0.9f)
+                    TopFaces.push_back(F.Name);
+            }
+            if (!VerifyCheck(TopFaces.size() == 2, "Cylinder inset produces 2 top faces (inner disk + outer ring)"))
+            {
+                Host.Finalize();
+                Dock.Finalize();
+                ImGui::DestroyContext(Gui);
+                return 1;
+            }
+            const int FacesAfterInset = CylDoc.Summary.Faces;
+
+            // 1) Inward extrude on each top face individually creates recessed wall (face count increases, volume decreases)
+            for (const std::string& PickedTop : TopFaces)
+            {
+                SketcherDocument TestDoc = CloneSketcherDocument(CylDoc);
+                TestDoc.Selection.Faces = { PickedTop };
+                const auto CutOut = RunFaceExtrudeWithMode(TestDoc, -0.25, SketcherExtrudeMode::Standard);
+                if (!VerifyCheck(CutOut.AcceptedCondition &&
+                                     TestDoc.Summary.Faces > FacesAfterInset &&
+                                     TestDoc.Summary.Volume < BaseVolume - 1.0e-3,
+                                 "Inward Extrude on inset cylinder face creates recessed wall instead of flat push"))
+                {
+                    Host.Finalize();
+                    Dock.Finalize();
+                    ImGui::DestroyContext(Gui);
+                    return 1;
+                }
+            }
+
+            // 2) Joint outward extrude on BOTH top faces selected together succeeds and increases volume
+            {
+                SketcherDocument JointDoc = CloneSketcherDocument(CylDoc);
+                JointDoc.Selection.Faces = TopFaces;
+                const auto JointOut = RunFaceExtrudeWithMode(JointDoc, 0.25, SketcherExtrudeMode::Standard);
+                if (!VerifyCheck(JointOut.AcceptedCondition && JointDoc.Summary.Volume > BaseVolume + 1.0e-3,
+                                 "Outward joint Extrude on adjacent inset faces succeeds"))
+                {
+                    Host.Finalize();
+                    Dock.Finalize();
+                    ImGui::DestroyContext(Gui);
+                    return 1;
+                }
+            }
+        }
 
         // Ctrl+B opens Bevel Fillet; C with edge selected opens Chamfer
         State.Document.Selection = {};

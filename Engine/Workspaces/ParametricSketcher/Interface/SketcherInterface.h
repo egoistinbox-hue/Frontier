@@ -122,8 +122,8 @@ struct SketcherBevelSession
     bool                              ActiveCondition = false;                               // [-]   - Session open
     SketcherSessionVerb               Verb            = SketcherSessionVerb::Blend;          // [-]   - B (blend) / E (extrude)
     SketcherSessionVerb               PreviewVerb      = SketcherSessionVerb::Blend;          // [-]   - Verb the preview was built for
-    SketcherExtrudeMode               ExtrudeMode     = SketcherExtrudeMode::AlongNormals;   // [-]   - Active extrude mode (Ctrl+E / E)
-    SketcherExtrudeMode               StagedExtrudeMode = SketcherExtrudeMode::AlongNormals; // [-]   - ExtrudeMode the preview was built for
+    SketcherExtrudeMode               ExtrudeMode     = SketcherExtrudeMode::Standard;       // [-]   - Active extrude mode (Ctrl+E / Alt+E / E)
+    SketcherExtrudeMode               StagedExtrudeMode = SketcherExtrudeMode::Standard;     // [-]   - ExtrudeMode the preview was built for
     bool                              PinnedCondition = false;                               // [-]   - Numeric entry pins the size
     GeometrySpace::Parametric::BlendProfile            Shape           = GeometrySpace::Parametric::BlendProfile::Fillet;      // [-]   - Cross-section
     bool                              VertexCondition = false;                               // [-]   - CAD corner blend expanded from selected body vertices
@@ -1079,8 +1079,8 @@ struct SketcherWorkspaceStatus
     SketcherPictureShelf                  Pictures       = {};                               // [-]   - Decoded image-plane pictures (frame-owned)
     SketcherMatcapShelf                   Matcaps        = {};                               // [-]   - Matcap library + thumbnails + M picker
     SketcherRepeat                        LastCommand    = {};                               // [-]   - Shift+R
-    SketcherExtrudeMode                   LastExtrudeMode = SketcherExtrudeMode::AlongNormals; // [-] - Last extrude type chosen in Ctrl+E menu
-    bool                                  ExtrudeMenuRequest = false;                        // [-]   - Ctrl+E extrude-type context menu pending
+    SketcherExtrudeMode                   LastExtrudeMode = SketcherExtrudeMode::Standard;     // [-] - Last extrude type chosen in Ctrl+E / Alt+E menu
+    bool                                  ExtrudeMenuRequest = false;                        // [-]   - Ctrl+E / Alt+E extrude-type context menu pending
     ImVec2                                ExtrudeMenuPos = {};                               // [px]  - Cursor/viewport anchor for Ctrl+E context menu
     bool                                  SnapMenuRequest = false;                           // [-]   - Viewport Snap filter popover pending
     std::string                           PopupRequest   = {};                               // [-]   - Header popup a shortcut asked for
@@ -1225,5 +1225,8 @@ void EvaluateSketcherGizmo(SketcherWorkspaceStatus& State, const OrbitCameraBasi
 // Executes a single gizmo command on State.Document for the currently resolved State.Gizmo target and refreshes Scene.
 [[nodiscard]] SketcherCommandOutcome ApplySketcherGizmo(SketcherWorkspaceStatus& State, GizmoHandle Handle,
                                                         GeometrySpace::Parametric::Vector3 Shift, double Angle = 0.0, double Factor = 1.0);
+
+// Executes face extrusion on Document using the chosen Blender-style extrude mode (Normal, AlongNormals, Manifold, IndividualFaces, Symmetric).
+[[nodiscard]] SketcherCommandOutcome RunFaceExtrudeWithMode(SketcherDocument& Document, double Size, SketcherExtrudeMode Mode);
 
 } // namespace Frontier::Workspaces::Sketcher

@@ -1653,7 +1653,8 @@ template <typename Author>
     return Appended;
 }
 
-SketcherCommandOutcome ChangeSketcherSelection(SketcherDocument& Document, FaceOperationCategory Operation, double Amount, std::optional<Vector3> Direction)
+SketcherCommandOutcome ChangeSketcherSelection(SketcherDocument& Document, FaceOperationCategory Operation, double Amount, std::optional<Vector3> Direction,
+                                                 bool ExtrudeManifoldCondition)
 {
     const std::string Stem  = SketcherFaceOperationLabel(Operation);
     const std::string Label = Stem + " " + FormatAmount(Amount) + " on " + std::to_string(Document.Selection.Faces.size()) + " face(s)";
@@ -1679,6 +1680,7 @@ SketcherCommandOutcome ChangeSketcherSelection(SketcherDocument& Document, FaceO
         Step.Kind      = FeatureStepCategory::FaceOperation;
         Step.Label     = StepLabel;
         Step.Operation = Operation;
+        Step.ExtrudeManifoldCondition = ExtrudeManifoldCondition;
         Step.Amount    = ParameterValue(Caption + ".Amount");
         Step.Target    = Owner;
         if (Direction && (Operation == FaceOperationCategory::Tweak || Operation == FaceOperationCategory::Rotate))

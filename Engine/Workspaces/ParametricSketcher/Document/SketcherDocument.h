@@ -450,7 +450,8 @@ struct VehicleCurveFile;
                                                              const SketcherBlendRequest& Request, bool RecordUndo = true);
 // Direction (gizmo): Tweak moves along it by Amount, Rotate turns about it (through each face centre) by Amount [rad].
 [[nodiscard]] SketcherCommandOutcome ChangeSketcherSelection(SketcherDocument& Document, GeometrySpace::Parametric::FaceOperationCategory Operation, double Amount,
-                                                             std::optional<GeometrySpace::Parametric::Vector3> Direction = std::nullopt);
+                                                             std::optional<GeometrySpace::Parametric::Vector3> Direction = std::nullopt,
+                                                             bool ExtrudeManifoldCondition = false);
 // Inset (Plasticity O on faces · I): border ring Distance wide; the inner face moves Depth along the outward normal (− pocket).
 // 💡 Direct edit of the picked vertices / edges (mode 1 / 2 gizmo): a FaceOperation Reshape step carrying them by Map; the
 //    faces at them are re-fitted (planes when still flat, or bilinear NURBS patches for four-sided faces across single or

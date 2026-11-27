@@ -145,6 +145,7 @@ struct FeatureStep
     std::vector<FeatureScalar>      AnchorSizes    = {};                                      // [len] - Blend (per vertex): size at SizeAnchors[i] (empty: Size / EndSize)
     bool                           ClampOverlapEnabled = false;                               // [-]   - Blend: clamp & merge at blocking vertices / opposing rails while other side continues beveling
     FaceOperationCategory              Operation      = FaceOperationCategory::Push;                 // [-]   - Face-operation verb
+    bool                           ExtrudeManifoldCondition = false;                         // [-]   - Extrude Manifold: negative distance pushes/dissolves adjacent walls when non-island
     FeatureScalar                   Amount         = {};                                      // [len|rad|-] - Distance / angle / factor (by verb)
     std::vector<ConnectivityReference> References     = {};                                      // [-]   - Blend: edges · face operation: faces
     std::vector<Vector3>           Points         = {};                                      // [len] - SpaceCurve: imported points in order · FaceOperation

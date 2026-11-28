@@ -7,6 +7,17 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { WorldMask2D, ComputeRegionMaskSdf2D } from './Engine/WorldMask2D.js';
 import {
+    WEATHER_SIM_CATALOG,
+    WEATHER_SIM_TIERS,
+    WEATHER_BOX_SCOPES,
+    CreateWeatherSimNode,
+    CreateDefaultLandscapeWeatherNodes,
+    IsWeatherSimType,
+    ResolveTargetTerrainBoxes,
+    RunLandscapeWeatheringNodes,
+    ClearWeatheringFromRegion
+} from './Engine/ThermalOnionSimEngine.js';
+import {
     EvaluateBoundaryFalloff,
     CreateTerrainLayer,
     ComputeSplineCorridorMetrics,
@@ -56,7 +67,10 @@ import {
     ROCK2_STARTER_STACKS,
     ROCK2_BOOLEAN_MODES,
     ROCK2_SCULPT_BRUSH_MODES,
+    ROCK_WEATHER_TIERS,
+    ROCK_WEATHER_BOX_SCOPES,
     isRock2ModifierType,
+    isRock2SimModifierType,
     isRock2BooleanLayer,
     isRock2BooleanCombineMode,
     setRock2LayerBooleanMode,
@@ -3483,5 +3497,227 @@ Suite('42. Steep Cliffside Pathways (3D Rock Gallery), True-3D Limestone Cave Sp
         'WorldMap2DCanvas.js must render 2D spline core width & Influence Scale halo');
 });
 
-console.log(`\nAll ${Passed}/42 Open-World SDF Terrain, Basic Landform Generators, Pathways/Caves/Mounds & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
+// 43. Focused 2-Node Pure-SDF Weathering Catalog, 512 Lookdev / 1K-4K Production Tiers & 3D Box Scopes
+Suite('43. Focused 2-Node Catalog (thermal_cracks + onion_peel ONLY), 512/1K/2K/4K Tiers & 3D Box Scopes', () =>
+{
+    assert.deepEqual(WEATHER_SIM_CATALOG.map(S => S.type), ['thermal_cracks', 'onion_peel'],
+        'Focused catalog must contain ONLY thermal_cracks and onion_peel');
+    assert.equal(IsWeatherSimType('thermal_cracks'), true);
+    assert.equal(IsWeatherSimType('onion_peel'), true);
+    assert.equal(IsWeatherSimType('rockfall'), false);
+
+    assert.deepEqual(WEATHER_SIM_TIERS.map(T => [T.id, T.res]), [
+        ['lookdev_512', 512],
+        ['prod_1k', 1024],
+        ['prod_2k', 2048],
+        ['prod_4k', 4096]
+    ], 'Resolution tiers must be 512 Lookdev and 1K / 2K / 4K Production');
+
+    assert.deepEqual(WEATHER_BOX_SCOPES.map(S => S.id), ['active_box', 'selected_boxes', 'all_boxes']);
+    assert.deepEqual(ROCK_WEATHER_BOX_SCOPES.map(S => S.id), ['active_box', 'below_stack', 'all_boxes']);
+    assert.ok(ROCK_WEATHER_TIERS.some(T => T.id === 'live_raymarch'), 'RockFormation 2.0 must include Live 60 FPS GPU Raymarch tier');
+
+    const SimMods = ROCK2_MODIFIER_CATALOG.filter(M => M.isSimModifier);
+    assert.deepEqual(SimMods.map(M => M.type), ['thermal_cracks', 'onion_peel'],
+        'RockFormation 2.0 modifier catalog must register ONLY thermal_cracks and onion_peel sim nodes');
+    assert.equal(isRock2SimModifierType('thermal_cracks'), true);
+    assert.equal(isRock2SimModifierType('onion_peel'), true);
+    assert.equal(isRock2SimModifierType('split_fault'), false);
+});
+
+// 44. RockFormation 2.0 Pure-SDF Thermal Cracks & Pitting + Onion-Skin Exfoliation (CPU + QEF + 3D Box Scopes)
+Suite('44. RockFormation 2.0 Pure-SDF Thermal Cracks & Pitting + Onion-Skin Exfoliation & 3D Box Scope Isolation', () =>
+{
+    const BaseDoc = {
+        name: 'WeatherTestRock',
+        layers: [
+            createRock2Layer('big_boulder', { width: 3.4, height: 3.1, length: 3.2, posX: -1.8, posZ: 0.0 }),
+            createRock2Layer('big_boulder', { width: 3.2, height: 2.9, length: 3.0, posX: 2.4, posZ: 0.0, combineMode: 'union' })
+        ]
+    };
+    const BaseComp = compileRock2Stack(BaseDoc);
+
+    // A. Thermal Cracks & Pitting carves crisp V-tip fissures + Hallet-Walder pits on rock skin while keeping Pure-SDF invariant
+    const CrackDoc = {
+        name: 'CrackedRock',
+        layers: [
+            ...BaseDoc.layers,
+            createRock2Layer('thermal_cracks', {
+                params: { strength: 0.94, crazing90: 0.90, voronoiJoints: 0.65, pittingStrength: 0.78, boxScope: 'all_boxes' }
+            })
+        ]
+    };
+    const CrackComp = compileRock2Stack(CrackDoc);
+    assert.ok(CrackComp.compiledWeathering.hasThermal && !CrackComp.compiledWeathering.hasOnion,
+        'Compiled stack must expose active thermal_cracks weathering descriptor');
+    assert.equal(CrackComp.simBoxes.length, 2, 'Two boulder layers must compile 2 3D Rock Simulation Boxes');
+
+    let CarveHits = 0, MaxCarve = 0, FreshColorDiff = 0;
+    const OutBase = { r: 0, g: 0, b: 0 };
+    const OutCrack = { r: 0, g: 0, b: 0 };
+    for (let i = 0; i < 600; ++i)
+    {
+        const a = i * 2.3999632;
+        const y = 0.4 + ((i % 25) / 24) * 2.3;
+        const r = 1.48;
+        const x = -1.8 + Math.cos(a) * r;
+        const z = Math.sin(a) * r;
+        const d0 = evalRock2StackSdf(BaseComp, x, y, z, OutBase);
+        const d1 = evalRock2StackSdf(CrackComp, x, y, z, OutCrack);
+        assert.ok(Number.isFinite(d1), 'Weathered rock SDF must never produce NaN/Infinity');
+        if (Math.abs(d0) < 0.25 && d1 - d0 > 0.004)
+        {
+            CarveHits++;
+            if (d1 - d0 > MaxCarve) MaxCarve = d1 - d0;
+        }
+        const dc = Math.abs(OutCrack.r - OutBase.r) + Math.abs(OutCrack.g - OutBase.g) + Math.abs(OutCrack.b - OutBase.b);
+        if (dc > 0.015) FreshColorDiff++;
+    }
+    assert.ok(CarveHits >= 20 && MaxCarve > 0.025,
+        `Thermal Cracks & Pitting must carve measurable V-tip cracks/pits across rock surface (hits=${CarveHits}, maxCarve=${MaxCarve.toFixed(4)}m)`);
+    assert.ok(FreshColorDiff >= 20, `Thermal Cracks must shade bright/crevice walls distinctly (diffSamples=${FreshColorDiff})`);
+
+    // B. Onion-Skin Exfoliation peels concentric shells + parting slots + fresh corestone
+    const OnionDoc = {
+        name: 'OnionRock',
+        layers: [
+            ...BaseDoc.layers,
+            createRock2Layer('onion_peel', {
+                params: { strength: 0.95, shellCount: 4, shellThickness: 1.0, undercutDepth: 1.15, boxScope: 'all_boxes' }
+            })
+        ]
+    };
+    const OnionComp = compileRock2Stack(OnionDoc);
+    assert.ok(OnionComp.compiledWeathering.hasOnion && OnionComp.compiledWeathering.onion.shellCount === 4);
+
+    let OnionDiffs = 0;
+    for (let i = 0; i < 400; ++i)
+    {
+        const a = i * 2.3999632;
+        const y = 0.5 + ((i % 20) / 19) * 2.2;
+        const x = -1.8 + Math.cos(a) * 1.50;
+        const z = Math.sin(a) * 1.50;
+        const d0 = evalRock2StackSdf(BaseComp, x, y, z);
+        const d1 = evalRock2StackSdf(OnionComp, x, y, z);
+        assert.ok(Number.isFinite(d1));
+        if (Math.abs(d1 - d0) > 0.015) OnionDiffs++;
+    }
+    assert.ok(OnionDiffs >= 60, `Onion-Skin Exfoliation must displace & step concentric exfoliation shells (diffs=${OnionDiffs})`);
+
+    // C. 3D Rock Box Scope ('active_box') isolates weathering strictly to Target Box #1 and leaves Box #2 untouched!
+    const IsoDoc = {
+        name: 'IsolatedBoxRock',
+        layers: [
+            ...BaseDoc.layers,
+            createRock2Layer('onion_peel', {
+                params: { strength: 0.95, shellCount: 4, boxScope: 'active_box', targetLayerId: BaseDoc.layers[0].id }
+            })
+        ]
+    };
+    const IsoComp = compileRock2Stack(IsoDoc);
+    assert.ok(IsoComp.compiledWeathering.clipBox !== null, 'active_box scope must compile a strict 3D clipBox');
+    let Box2Changed = 0;
+    for (let i = 0; i < 120; ++i)
+    {
+        const a = i * 2.3999632;
+        const y = 0.6 + ((i % 12) / 11) * 1.8;
+        const x = 2.4 + Math.cos(a) * 1.35; // far inside Box #2
+        const z = Math.sin(a) * 1.35;
+        const d0 = evalRock2StackSdf(BaseComp, x, y, z);
+        const d1 = evalRock2StackSdf(IsoComp, x, y, z);
+        if (Math.abs(d1 - d0) > 1e-5) Box2Changed++;
+    }
+    assert.equal(Box2Changed, 0, 'active_box scope targeting Rock #1 must leave Rock #2 completely untouched');
+
+    // D. Combined Onion-Skin + Thermal Cracks QEF Dual-Contour bake succeeds with 0 Mesh->SDF!
+    const BothDoc = {
+        name: 'BothWeatherRock',
+        layers: [
+            createRock2Layer('big_boulder', { width: 3.2, height: 3.0, length: 3.1 }),
+            createRock2Layer('onion_peel', { params: { strength: 0.90, shellCount: 4 } }),
+            createRock2Layer('thermal_cracks', { params: { strength: 0.88, pittingStrength: 0.72 } })
+        ]
+    };
+    const BothComp = compileRock2Stack(BothDoc);
+    const Baked = bakeRock2StackQefMesh(BothComp, { resolution: 52 });
+    assert.equal(Baked.sdfStats.meshToSdfCount, 0, 'Weathering QEF bake must remain 100% Pure-SDF (0 Mesh->SDF)');
+    assert.ok(Baked.sdfStats.triangles > 800, `Weathered rock QEF mesh must produce rich watertight geometry (tris=${Baked.sdfStats.triangles})`);
+});
+
+// 45. 3D Landscape 512 Lookdev + 1K Production Multi-Box Thermal Cracks & Onion-Skin Exfoliation + Clear Round-Trip
+Suite('45. 3D Landscape 512 Lookdev & 1K Production Multi-Box Weathering + Clear Round-Trip', () =>
+{
+    const W = new WorldMask2D();
+    SeedThreeDemoTerrains(W);
+    for (const R of W.regions) EvaluateTerrainRegion(W, R);
+    assert.ok(W.regions.length >= 2, 'Demo world must contain multiple landscape 3D boxes');
+
+    const BaseH0 = new Float32Array(W.regions[0].runtime.heights);
+    const BaseH1 = new Float32Array(W.regions[1].runtime.heights);
+
+    // A. active_box at Lookdev 512 modifies ONLY Box #0 and generates 512-px detail/tone RGBA8 textures!
+    const Nodes = CreateDefaultLandscapeWeatherNodes();
+    const Run512 = RunLandscapeWeatheringNodes(W, {
+        scope: 'active_box',
+        tierId: 'lookdev_512',
+        nodes: Nodes,
+        activeRegionId: W.regions[0].id
+    });
+    assert.equal(Run512.targetCount, 1, 'active_box scope must target exactly 1 Landscape Box');
+    assert.equal(Run512.resolution, 512);
+    const Tex0 = W.regions[0].runtime.weatherTextures;
+    assert.ok(Tex0 && Math.max(Tex0.width, Tex0.height) === 512,
+        `Lookdev 512 must produce 512px RGBA8 textures (got ${Tex0?.width}x${Tex0?.height})`);
+    assert.equal(Tex0.detail.length, Tex0.width * Tex0.height * 4);
+    assert.equal(Tex0.tone.length, Tex0.width * Tex0.height * 4);
+    assert.ok(Run512.results[0].stats.crackedCells > 500, 'Landscape thermal_cracks must carve hundreds of crisp V-tip crack pixels');
+    assert.ok(Run512.results[0].stats.onionCells > 500, 'Landscape onion_peel must peel hundreds of concentric exfoliation dome/slope pixels');
+    assert.equal(W.regions[1].runtime.weatherTextures || null, null, 'active_box must NOT touch Landscape Box #1');
+    for (let i = 0; i < BaseH1.length; ++i)
+    {
+        assert.equal(W.regions[1].runtime.heights[i], BaseH1[i], 'Untargeted Box #1 heights must stay identical');
+    }
+
+    // B. ClearWeatheringFromRegion restores Box #0 cleanly!
+    ClearWeatheringFromRegion(W, W.regions[0]);
+    assert.equal(W.regions[0].runtime.weatherTextures || null, null);
+    let MaxRestoreErr = 0;
+    for (let i = 0; i < BaseH0.length; ++i)
+    {
+        const e = Math.abs(W.regions[0].runtime.heights[i] - BaseH0[i]);
+        if (e > MaxRestoreErr) MaxRestoreErr = e;
+    }
+    assert.ok(MaxRestoreErr < 1e-4, `ClearWeatheringFromRegion must restore exact base heights (err=${MaxRestoreErr})`);
+
+    // C. Production 1K (1024 px) on active_box produces full 1024-px RGBA8 textures!
+    const Run1K = RunLandscapeWeatheringNodes(W, {
+        scope: 'active_box',
+        tierId: 'prod_1k',
+        nodes: [CreateWeatherSimNode('thermal_cracks'), CreateWeatherSimNode('onion_peel')],
+        activeRegionId: W.regions[0].id
+    });
+    assert.equal(Run1K.resolution, 1024);
+    assert.equal(Math.max(W.regions[0].runtime.weatherTextures.width, W.regions[0].runtime.weatherTextures.height), 1024,
+        'Production 1K must produce 1024px RGBA8 micro-detail textures');
+});
+
+// 46. GPU GLSL Shader & Studio UI Integrity Checks for Thermal Cracks & Onion-Skin Exfoliation
+Suite('46. GPU GLSL Analytical Weathering Shaders & Studio UI Wiring Checks', () =>
+{
+    const Rock2Vp = readFileSync(new URL('./Engine/RockCliff/RockFormation2Viewport.js', import.meta.url), 'utf8');
+    const LandVp  = readFileSync(new URL('./Engine/TerrainOceanViewport.js', import.meta.url), 'utf8');
+    const Editor  = readFileSync(new URL('./TerrainWorldEditor.js', import.meta.url), 'utf8');
+    const Html    = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+
+    assert.ok(Rock2Vp.includes('evalWeatheringDetailed') && Rock2Vp.includes('uWeatherFlags') && Rock2Vp.includes('uOnion0') && Rock2Vp.includes('uThermal0'),
+        'RockFormation2Viewport.js must evaluate analytical GPU weathering in ROCK2_RAYMARCH_FS');
+    assert.ok(!Rock2Vp.includes('dws[idx]'), 'ROCK2_RAYMARCH_FS must avoid dynamic local array writes for strict WebGL2 driver compatibility');
+    assert.ok(LandVp.includes('uWeatherDetailTex') && LandVp.includes('uWeatherToneTex') && LandVp.includes('evalCliffThermal2D'),
+        'TerrainOceanViewport.js must sample 512..4K detail/tone textures + cliff triplanar anti-stretch GLSL');
+    assert.ok(Editor.includes('+ Thermal Cracks & Pitting') && Editor.includes('+ Onion-Skin Exfoliation') && Editor.includes('Lookdev Preview (512)'),
+        'TerrainWorldEditor.js must wire focused Thermal Cracks & Pitting + Onion-Skin Exfoliation controls for Rock 2.0 & Landscapes');
+    assert.ok(Html.includes('TerrainWorldEditor.js?v=20261127k'), 'index.html must carry updated cache-buster');
+});
+
+console.log(`\nAll ${Passed}/46 Open-World SDF Terrain, Basic Landform Generators, Pathways/Caves/Mounds, Thermal Cracks & Onion-Skin Exfoliation & Pure-SDF Rock Formation 1.0 + 2.0 Studio validation suites passed!`);
 

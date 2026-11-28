@@ -814,8 +814,170 @@ uniform vec3 uSunDir;
 uniform float uExposure;
 uniform int uLens;
 
+// Live Analytical Pure-SDF Weathering Uniforms (Thermal Cracks & Pitting + Onion-Skin Exfoliation)
+uniform ivec4 uWeatherFlags;      // x: hasOnion, y: hasThermal, z: onionFirst, w: hasClipBox
+uniform vec3  uWeatherRefCenter;
+uniform vec3  uWeatherRefRadius;
+uniform float uWeatherRefScale;
+uniform vec3  uWeatherClipMin;
+uniform vec3  uWeatherClipMax;
+uniform vec4  uOnion0;            // x: strength, y: shellCount, z: shellThickness, w: undercutDepth
+uniform vec4  uOnion1;            // x: plateJoints, y: corestoneRounding, z: spallAsymmetry, w: seed
+uniform vec4  uThermal0;          // x: strength, y: thermalDeltaT, z: directionalBias, w: skinDepth
+uniform vec4  uThermal1;          // x: crazing90, y: crazingSpacing, z: voronoiJoints, w: pittingStrength
+uniform vec4  uThermal2;          // x: pitScale, y: seed, z: 0, w: 0
+
 vec3 acesk(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+uint hash3u(int ix, int iy, int iz, int salt) {
+    uint h = uint(ix) * 374761393u + uint(iy) * 668265263u + uint(iz) * 2147483647u + uint(salt) * 1274126177u;
+    h ^= (h >> 13u);
+    h *= 1274126177u;
+    h ^= (h >> 16u);
+    return h;
+}
+
+float hash31(int ix, int iy, int iz, int salt) {
+    return float(hash3u(ix, iy, iz, salt)) / 4294967295.0;
+}
+
+float scalarField3D(vec3 p, int salt) {
+    vec3 f = floor(p);
+    vec3 u = p - f;
+    u = u * u * (3.0 - 2.0 * u);
+    int ix = int(f.x), iy = int(f.y), iz = int(f.z);
+    float n000 = hash31(ix,     iy,     iz,     salt) * 2.0 - 1.0;
+    float n100 = hash31(ix + 1, iy,     iz,     salt) * 2.0 - 1.0;
+    float n010 = hash31(ix,     iy + 1, iz,     salt) * 2.0 - 1.0;
+    float n110 = hash31(ix + 1, iy + 1, iz,     salt) * 2.0 - 1.0;
+    float n001 = hash31(ix,     iy,     iz + 1, salt) * 2.0 - 1.0;
+    float n101 = hash31(ix + 1, iy,     iz + 1, salt) * 2.0 - 1.0;
+    float n011 = hash31(ix,     iy + 1, iz + 1, salt) * 2.0 - 1.0;
+    float n111 = hash31(ix + 1, iy + 1, iz + 1, salt) * 2.0 - 1.0;
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+    return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z);
+}
+
+void vorCorner(ivec3 base, int ox, int oy, int oz, vec3 p, float jitter, int salt,
+               inout float min1, inout float min2, inout vec3 c1, inout vec3 c2, inout uint id1) {
+    ivec3 cell = base + ivec3(ox, oy, oz);
+    uint h1 = hash3u(cell.x, cell.y, cell.z, salt + 17);
+    uint h2 = hash3u(cell.x, cell.y, cell.z, salt + 59);
+    uint h3 = hash3u(cell.x, cell.y, cell.z, salt + 101);
+    vec3 j = vec3(float(h1), float(h2), float(h3)) / 4294967295.0;
+    vec3 site = vec3(cell) + 0.5 + (j - 0.5) * jitter;
+    vec3 d = site - p;
+    float d2 = dot(d, d);
+    if (d2 < min1) {
+        min2 = min1; c2 = c1;
+        min1 = d2;   c1 = site; id1 = h1;
+    } else if (d2 < min2) {
+        min2 = d2;   c2 = site;
+    }
+}
+
+vec3 evalFastCleavage3D(vec3 p, float jitter, int salt) {
+    ivec3 base = ivec3(floor(p - 0.5));
+    float min1 = 1e9, min2 = 1e9;
+    vec3 c1 = vec3(0.0), c2 = vec3(0.0);
+    uint id1 = 0u;
+    vorCorner(base, 0, 0, 0, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 1, 0, 0, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 0, 1, 0, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 1, 1, 0, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 0, 0, 1, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 1, 0, 1, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 0, 1, 1, p, jitter, salt, min1, min2, c1, c2, id1);
+    vorCorner(base, 1, 1, 1, p, jitter, salt, min1, min2, c1, c2, id1);
+    float bLen = length(c2 - c1);
+    float wallDist = bLen > 1e-5 ? (min2 - min1) / (2.0 * bLen) : 1.0;
+    float cellRand = float((id1 >> 8u) & 0xffffu) / 32767.5 - 1.0;
+    return vec3(wallDist, cellRand, sqrt(max(0.0, min1)));
+}
+
+vec4 evalOrganic90Crazing3D(float u, float v, float w, float spacing, int salt) {
+    float L1 = max(0.08, spacing);
+    float L2 = L1 * 0.94;
+    float ur0 = u * 0.92718385 - v * 0.37460659;
+    float vr0 = u * 0.37460659 + v * 0.92718385;
+
+    float invMacro = 1.0 / (L1 * 2.15);
+    float invMeso  = 1.0 / (L1 * 0.68);
+    float invJag   = 1.0 / (L1 * 0.24);
+
+    float macroU = L1 * 0.38 * scalarField3D(vec3(ur0 * 0.35, vr0, w * 0.8) * invMacro, salt + 3);
+    float macroV = L2 * 0.36 * scalarField3D(vec3(ur0 * invMacro + 7.3, vr0 * invMacro * 0.35 - 3.1, w * invMacro * 0.8), salt + 19);
+    float mesoU  = L1 * 0.14 * scalarField3D(vec3(ur0 * 0.26, vr0, w * 0.8) * invMeso, salt + 29);
+    float mesoV  = L2 * 0.13 * scalarField3D(vec3(ur0 * invMeso - 4.7, vr0 * invMeso * 0.26 + 5.9, w * invMeso * 0.8), salt + 37);
+    float jagU   = L1 * 0.048 * (abs(scalarField3D(vec3(ur0 * 0.20, vr0, w * 0.7) * invJag, salt + 43)) * 2.0 - 1.0);
+    float jagV   = L2 * 0.046 * (abs(scalarField3D(vec3(ur0 * invJag + 2.1, vr0 * invJag * 0.20, w * invJag * 0.7), salt + 59)) * 2.0 - 1.0);
+
+    float uCoord = (ur0 + macroU + mesoU + jagU) / L1;
+    float k1f = floor(uCoord);
+    int k1 = int(k1f);
+    float fu = uCoord - k1f;
+    float tier1Dist = min(fu, 1.0 - fu) * L1;
+
+    float slabPhase = hash31(k1, 17, 53, salt + 41);
+    float slabScale = 0.68 + 0.64 * hash31(k1, 89, 13, salt + 67);
+    float effL2 = L2 * slabScale;
+
+    float vCoord = (vr0 + macroV + mesoV + jagV) / effL2 + slabPhase;
+    float k2f = floor(vCoord);
+    int k2 = int(k2f);
+    float fv = vCoord - k2f;
+    float tier2Dist = min(fv, 1.0 - fv) * effL2;
+
+    float tileRand = hash31(k1, k2, 7, salt + 97);
+    if (tileRand > 0.56) {
+        float splitPos = 0.28 + 0.44 * hash31(k1, k2, 31, salt + 131);
+        float splitTilt = (hash31(k1, k2, 59, salt + 137) - 0.5) * 0.22;
+        float tier3Dist = abs(fu - (splitPos + splitTilt * (fv - 0.5))) * L1 * 1.45;
+        tier2Dist = min(tier2Dist, tier3Dist);
+    }
+
+    float vit1 = scalarField3D(vec3(ur0 * (0.48 / L1), vr0 * (0.62 / L1), w * (0.52 / L1)), salt + 151);
+    float vit2 = scalarField3D(vec3(ur0 * (0.68 / L1) + 11.3, vr0 * (0.48 / L1) - 3.8, w * (0.58 / L1)), salt + 173);
+    float lipChip = 0.80 + 0.42 * abs(scalarField3D(vec3(ur0, vr0, w) * (invJag * 1.1), salt + 199));
+
+    float open1 = smoothstep(-0.18, 0.42, vit1);
+    float open2 = smoothstep(-0.10, 0.48, vit2);
+    float mod1 = open1 * open1 * 1.38 * lipChip;
+    float mod2 = open2 * sqrt(max(0.0, open2)) * 0.66 * lipChip;
+
+    if (mod1 > 0.06 && mod2 > 0.04) {
+        float spall = 0.35 * smoothstep(L1 * 0.14, 0.0, max(tier1Dist, tier2Dist));
+        mod1 += spall * open1;
+        mod2 += spall * open2;
+    }
+    return vec4(tier1Dist, tier2Dist, mod1, mod2);
+}
+
+float sminPoly(float a, float b, float k) {
+    if (k <= 1e-6) return min(a, b);
+    float h = max(k - abs(a - b), 0.0) / k;
+    return min(a, b) - h * h * k * 0.25;
+}
+
+float smaxPoly(float a, float b, float k) {
+    if (k <= 1e-6) return max(a, b);
+    float h = max(k - abs(a - b), 0.0) / k;
+    return max(a, b) + h * h * k * 0.25;
+}
+
+float chamferMax(float a, float b, float r) {
+    float m = max(a, b);
+    if (r <= 1e-6) return m;
+    return max(m, (a + b + r) * 0.70710678);
+}
+
+float chamferSub(float base, float cut, float r) {
+    return chamferMax(base, -cut, r);
 }
 
 vec2 intersectAabb(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
@@ -837,8 +999,276 @@ vec4 sampleVol(vec3 p) {
     return vec4(v.x + length(over), v.yzw);
 }
 
+vec3 calcMacroNormal(vec3 p) {
+    float e = max(0.014, length(uVolMax - uVolMin) / 140.0);
+    vec2 k = vec2(1.0, -1.0) * e;
+    return normalize(
+        k.xyy * sampleVol(p + k.xyy).x +
+        k.yyx * sampleVol(p + k.yyx).x +
+        k.yxy * sampleVol(p + k.yxy).x +
+        k.xxx * sampleVol(p + k.xxx).x
+    );
+}
+
+// Evaluates analytical Onion-Skin Exfoliation + Thermal Cracks & Pitting directly on top of uSdfVol.
+// Returns vec4(dFinal, freshBoost, cavityAO, shellEdge)
+vec4 evalWeatheringDetailed(vec3 p, float dMacro) {
+    if (uWeatherFlags.x == 0 && uWeatherFlags.y == 0) {
+        return vec4(dMacro, 0.0, 1.0, 0.0);
+    }
+    if (uWeatherFlags.w == 1) {
+        vec3 pad = vec3(0.08);
+        if (any(lessThan(p, uWeatherClipMin - pad)) || any(greaterThan(p, uWeatherClipMax + pad))) {
+            return vec4(dMacro, 0.0, 1.0, 0.0);
+        }
+    }
+
+    float S = max(1.2, uWeatherRefScale);
+    float maxDepth = max(S * 0.24, max(uThermal0.w * 1.45, 0.25));
+    if (dMacro > S * 0.075 || dMacro < -maxDepth) {
+        return vec4(dMacro, 0.0, 1.0, 0.0);
+    }
+
+    vec3 nMacro = calcMacroNormal(p);
+    vec3 lp = p - uWeatherRefCenter;
+    float d = dMacro;
+    float curMacro = dMacro;
+    float freshBoost = 0.0;
+    float shellAgeFactor = 1.0;
+    float cavityAO = 1.0;
+    float shellEdge = 0.0;
+
+    for (int passIdx = 0; passIdx < 2; passIdx++) {
+        bool doOnion = (uWeatherFlags.z == 1) ? (passIdx == 0) : (passIdx == 1);
+        if (doOnion && uWeatherFlags.x == 1 && uOnion0.x > 0.01) {
+            float exfAct = smoothstep(0.05, 0.92, clamp(uOnion0.x, 0.0, 1.0));
+            int shellN = int(clamp(floor(uOnion0.y + 0.5), 2.0, 6.0));
+            float thickMul = clamp(uOnion0.z, 0.35, 2.4);
+            float undercutMul = clamp(uOnion0.w, 0.0, 1.8);
+            float plateK = clamp(uOnion1.x, 0.0, 1.0);
+            float coreRound = clamp(uOnion1.y, 0.0, 1.0);
+            float asym = clamp(uOnion1.z, 0.0, 1.0);
+            int salt = int(uOnion1.w);
+
+            float hShell = S * (0.0135 + 0.0072 * exfAct) * thickMul;
+            float dExt0 = curMacro;
+            if (dExt0 > -((float(shellN) + 0.95) * hShell) && dExt0 < S * 0.045) {
+                vec3 rad = max(vec3(0.6), uWeatherRefRadius);
+                vec3 q = vec3(lp.x / rad.x, (p.y - (uWeatherRefCenter.y - rad.y)) / max(0.6, rad.y * 2.0), lp.z / rad.z);
+
+                float r1 = length(vec3((q.x - 0.24 * asym) * 0.90, (q.y - 0.86) * 1.05, (q.z - 0.22 * asym) * 0.92));
+                float r2 = length(vec3((q.x + 0.38 * asym) * 0.94, (q.y - 0.62) * 1.08, (q.z + 0.34 * asym) * 0.94)) + 0.16;
+                float rBase = sminPoly(r1, r2, 0.15);
+
+                float wf1 = 1.0 / (S * 0.32);
+                float wf2 = 1.0 / (S * 0.11);
+                float wShared = 0.15 * scalarField3D(lp * wf1, salt + 491)
+                              + 0.055 * (abs(scalarField3D(lp * wf2, salt + 499)) * 2.0 - 1.0);
+                float basalHold = max(0.0, 0.16 - q.y) * 1.75;
+                float rSpall = (rBase + wShared + basalHold) * S * 0.55;
+
+                float fanF = 1.0 / (S * 0.44);
+                float kf   = 1.0 / (S * 0.15);
+                float fanBase = S * 0.095 * asym * scalarField3D(lp * fanF, salt + 503);
+                float maxR = S * 0.52 * exfAct;
+
+                float pScale = (0.95 / S) * 3.8;
+                float plateWallWorld = 1e6;
+                float plateOpen = 0.0;
+                if (plateK > 0.01) {
+                    float pwx = 0.36 * scalarField3D(lp * (pScale * 0.5), salt + 563);
+                    float pwz = 0.36 * scalarField3D(lp * (pScale * 0.5) + vec3(4.8, 0.0, -3.1), salt + 569);
+                    vec3 plateClv = evalFastCleavage3D(vec3(lp.x * pScale + pwx, lp.y * pScale * 0.9, lp.z * pScale + pwz), 0.62, salt + 577);
+                    plateWallWorld = plateClv.x / pScale;
+                    plateOpen = smoothstep(-0.20, 0.36, scalarField3D(lp * (pScale * 0.45), salt + 587)) * plateK;
+                }
+
+                float coreSmoothBias = coreRound * hShell * 0.42 * smoothstep(0.35, 0.95, rBase);
+                float dOnionExt = dExt0 + float(shellN) * hShell - coreSmoothBias * 0.25;
+                float onionFresh = 0.96 * exfAct;
+                float onionAge = 0.05;
+                float localSlotAO = 1.0;
+                float wSlot = hShell * 2.35 * undercutMul;
+
+                float cumFan = 0.0;
+                float prevDw = 1e9;
+                for (int rev = 0; rev < 6; rev++) {
+                    if (rev >= shellN) break;
+                    int idx = shellN - 1 - rev;
+                    float fIdx = float(idx);
+                    float fNoise = 0.5 + 0.5 * scalarField3D(
+                        lp * fanF + vec3(fIdx * 3.1 - 4.2, -fIdx * 2.3, fIdx * 1.9 + 2.7),
+                        salt + 509 + idx * 17
+                    );
+                    if (rev > 0) {
+                        cumFan += S * (0.032 + 0.095 * mix(0.45, fNoise, asym)) * exfAct;
+                    }
+                    float kink = S * 0.026 * (abs(scalarField3D(lp * kf + vec3(fIdx * 3.7, 0.0, -fIdx * 2.1), salt + 511 + idx * 13)) * 2.0 - 1.0);
+                    float dw = (maxR + fanBase - cumFan) - (rSpall + kink);
+                    if (rev > 0) dw = min(prevDw - S * 0.020, dw);
+                    prevDw = dw;
+
+                    float surfOff = float(rev) * hShell;
+                    float dSurf = dExt0 + surfOff;
+                    float dSlab = chamferMax(dSurf, dw, hShell * 0.14);
+
+                    if (plateOpen > 0.01) {
+                        float rimStress = smoothstep(-S * 0.44, 0.0, dw) * plateOpen * (0.55 + 0.14 * fIdx);
+                        float plateAp = hShell * 0.26 * rimStress;
+                        if (plateAp > 0.0010) {
+                            float cutPlate = max(plateWallWorld - plateAp, (-dSurf) - hShell * 0.94);
+                            dSlab = chamferSub(dSlab, cutPlate, plateAp * 0.40);
+                        }
+                    }
+
+                    if (wSlot > 0.002) {
+                        float tSlot = clamp(1.0 + dw / wSlot, 0.0, 1.0);
+                        if (tSlot > 0.001) {
+                            float aSlot = hShell * 0.27 * tSlot * clamp(undercutMul, 0.4, 1.5);
+                            float dSeamPlane = abs(dSurf + hShell * 0.88);
+                            float cutSlot = max(max(dSeamPlane - aSlot, (-dw) - wSlot), dw - 0.025);
+                            dSlab = max(dSlab, -cutSlot);
+                            if (dSeamPlane < aSlot * 2.4 && dw < 0.025 && dw > -wSlot) {
+                                localSlotAO = min(localSlotAO, 1.0 - 0.72 * tSlot);
+                            }
+                        }
+                    }
+
+                    if (abs(dw) < hShell * 0.85 && abs(dSurf) < hShell * 0.75) {
+                        shellEdge = max(shellEdge, smoothstep(hShell * 0.85, 0.0, abs(dw)));
+                    }
+
+                    float blend = smoothstep(0.018, -0.018, dSlab - dOnionExt);
+                    dOnionExt = min(dOnionExt, dSlab);
+                    float tierFrac = fIdx / max(1.0, float(shellN - 1));
+                    float freshTier = (1.0 - tierFrac) * 0.72;
+                    float ageTier = 0.14 + 0.86 * tierFrac * tierFrac;
+                    onionFresh = mix(onionFresh, freshTier * exfAct, blend);
+                    onionAge = mix(onionAge, ageTier, blend);
+                }
+
+                d = dOnionExt;
+                curMacro = dOnionExt;
+                freshBoost = max(freshBoost, onionFresh);
+                shellAgeFactor = mix(1.0, onionAge, exfAct);
+                cavityAO = min(cavityAO, localSlotAO);
+            }
+        }
+        else if (!doOnion && uWeatherFlags.y == 1 && uThermal0.x > 0.01) {
+            float str = clamp(uThermal0.x, 0.0, 1.0);
+            float thermalNorm = clamp(uThermal0.y / 60.0, 0.15, 1.65) * str;
+            float dirBias = clamp(uThermal0.z, 0.0, 1.0);
+            float skinDepth = max(0.06, uThermal0.w);
+            float crazing90 = clamp(uThermal1.x, 0.0, 1.0);
+            float spacing = max(0.18, uThermal1.y);
+            float vorStr = clamp(uThermal1.z, 0.0, 1.0);
+            float pitStr = clamp(uThermal1.w, 0.0, 1.0);
+            float pitScale = clamp(uThermal2.x, 0.30, 2.50);
+            int salt = int(uThermal2.y);
+
+            float ndots = max(0.0, dot(nMacro, uSunDir));
+            float sunGate = clamp(pow(ndots, 1.20) + 0.14, 0.0, 1.0);
+            float insol = mix(1.0, sunGate, dirBias) * thermalNorm;
+
+            float tipDepth = skinDepth * clamp(0.32 + 0.72 * insol, 0.18, 1.45) * (0.35 + 0.65 * shellAgeFactor);
+            float depthIn = max(0.0, -curMacro);
+            if (depthIn <= tipDepth * 1.15) {
+                float linTaper = max(0.0, 1.0 - depthIn / max(0.04, tipDepth));
+                float expSkin = exp(-depthIn / max(0.04, tipDepth * 0.68));
+                float vTaper = linTaper * (0.45 + 0.55 * expSkin) * shellAgeFactor;
+                float crackProx = 0.0;
+
+                if (crazing90 > 0.01 && insol > 0.02) {
+                    vec3 an = abs(nMacro);
+                    vec3 uvwT = (an.y >= an.x && an.y >= an.z) ? vec3(p.x, p.z, p.y)
+                              : (an.x >= an.z)                ? vec3(p.z, p.y, p.x)
+                                                              : vec3(p.x, p.y, p.z);
+                    vec4 c90 = evalOrganic90Crazing3D(uvwT.x, uvwT.y, uvwT.z, spacing, salt + 211);
+                    float surfHalfAp90 = spacing * 0.072 * crazing90 * insol;
+                    if (surfHalfAp90 > 0.0012) {
+                        float ap1 = surfHalfAp90 * c90.z * vTaper;
+                        float ap2 = surfHalfAp90 * c90.w * vTaper;
+                        float cutOrg90 = min(c90.x - ap1, c90.y * 1.12 - ap2);
+                        float effAp = max(ap1, ap2);
+                        float cut90 = max(cutOrg90, depthIn - tipDepth);
+                        float dPrev = d;
+                        d = chamferSub(d, cut90, effAp * 0.34);
+                        if (d > dPrev + 1e-5) {
+                            float cDepth = clamp((d - dPrev) / max(0.006, effAp * 1.8), 0.0, 1.0);
+                            cavityAO = min(cavityAO, 1.0 - 0.76 * cDepth);
+                            freshBoost = max(freshBoost, 0.55 * cDepth);
+                        }
+                        crackProx = max(crackProx, smoothstep(spacing * 0.24, 0.0, min(c90.x, c90.y)));
+                    }
+                }
+
+                if (vorStr > 0.01) {
+                    float vorScale = (1.35 / S) * 4.2;
+                    vec3 vp = vec3(lp.x * vorScale, lp.y * vorScale * 0.86, lp.z * vorScale);
+                    vec3 w0 = vec3(
+                        0.38 * scalarField3D(vp * 0.55, salt + 311) + 0.12 * (abs(scalarField3D(vp * 2.15, salt + 317)) * 2.0 - 1.0),
+                        0.36 * scalarField3D(vp * 0.55 + vec3(5.2, -2.8, 0.0), salt + 331) + 0.12 * (abs(scalarField3D(vp * 2.15 + vec3(-3.4, 0.0, 0.0), salt + 337)) * 2.0 - 1.0),
+                        0.38 * scalarField3D(vp * 0.55 + vec3(-4.1, 6.3, 0.0), salt + 347) + 0.12 * (abs(scalarField3D(vp * 2.15 + vec3(0.0, 4.1, 0.0), salt + 353)) * 2.0 - 1.0)
+                    );
+                    vec3 clv = evalFastCleavage3D(vp + w0, 0.62, salt + 307);
+                    float worldWall = clv.x / vorScale;
+                    float vorVit = scalarField3D(vp * 0.48 + vec3(-7.1, 3.9, 0.0), salt + 367);
+                    float openVor = smoothstep(-0.14, 0.44, vorVit);
+                    float vorBridge = openVor * sqrt(max(0.0, openVor)) * (0.82 + 0.46 * abs(scalarField3D(vp * 2.7, salt + 379)));
+                    float surfHalfApVor = (0.012 + 0.034 * vorStr) * (0.45 + 0.55 * insol) * (S / 6.5) * vorBridge;
+                    if (surfHalfApVor > 0.0012) {
+                        float halfApVor = surfHalfApVor * vTaper;
+                        float cutVor = max(worldWall - halfApVor, depthIn - tipDepth);
+                        float dPrev = d;
+                        d = chamferSub(d, cutVor, halfApVor * 0.36);
+                        if (d > dPrev + 1e-5) {
+                            float cDepth = clamp((d - dPrev) / max(0.006, halfApVor * 1.8), 0.0, 1.0);
+                            cavityAO = min(cavityAO, 1.0 - 0.72 * cDepth);
+                            freshBoost = max(freshBoost, 0.48 * cDepth);
+                        }
+                        crackProx = max(crackProx, smoothstep(0.32, 0.0, clv.x) * openVor);
+                    }
+                }
+
+                if (pitStr > 0.01 && depthIn < tipDepth * 0.75) {
+                    float pFreq1 = (6.8 / S) / pitScale;
+                    float pFreq2 = (16.5 / S) / pitScale;
+                    float frostBias = clamp(0.42 + 0.58 * max(0.0, nMacro.y) + 0.55 * crackProx, 0.20, 1.35);
+                    float pitGate = clamp(pitStr * (0.45 + 0.55 * insol) * frostBias * shellAgeFactor, 0.0, 1.4);
+
+                    vec3 cP1 = evalFastCleavage3D(vec3(p.x * pFreq1, p.y * pFreq1 * 1.15, p.z * pFreq1), 0.68, salt + 613);
+                    float act1 = smoothstep(0.28 - 0.34 * pitStr, 0.62 - 0.25 * pitStr, cP1.y * 0.5 + 0.5 + 0.25 * crackProx);
+                    float rad1 = (0.14 + 0.22 * act1) / pFreq1;
+                    float bowl1 = (cP1.z / pFreq1) - rad1 * clamp(pitGate, 0.0, 1.15);
+
+                    vec3 cP2 = evalFastCleavage3D(vec3(p.x * pFreq2 + 7.1, p.y * pFreq2 * 1.15, p.z * pFreq2 - 4.3), 0.70, salt + 641);
+                    float act2 = smoothstep(0.32 - 0.30 * pitStr, 0.70 - 0.20 * pitStr, cP2.y * 0.5 + 0.5 + 0.20 * crackProx);
+                    float rad2 = (0.13 + 0.20 * act2) / pFreq2;
+                    float bowl2 = (cP2.z / pFreq2) - rad2 * clamp(pitGate, 0.0, 1.15);
+
+                    float pitCap = min(tipDepth * 0.42, S * 0.028 * pitScale * pitGate);
+                    float pitCut = min(max(bowl1, depthIn - pitCap), max(bowl2, depthIn - pitCap * 0.55));
+                    if (pitCut < 0.015) {
+                        float dPrev = d;
+                        d = smaxPoly(d, -pitCut, S * 0.004 * pitScale);
+                        if (d > dPrev + 1e-5) {
+                            float pHit = clamp((d - dPrev) / max(0.004, pitCap * 0.85), 0.0, 1.0);
+                            cavityAO = min(cavityAO, 1.0 - 0.56 * pHit);
+                            freshBoost = max(freshBoost, 0.38 * pHit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return vec4(d, clamp(freshBoost, 0.0, 1.0), clamp(cavityAO, 0.16, 1.0), clamp(shellEdge, 0.0, 1.0));
+}
+
 float evalD(vec3 p) {
-    return sampleVol(p).x;
+    float dMacro = sampleVol(p).x;
+    if (uWeatherFlags.x == 0 && uWeatherFlags.y == 0) return dMacro;
+    return evalWeatheringDetailed(p, dMacro).x;
 }
 
 vec4 sampleBoolVol(vec3 p) {
@@ -922,15 +1352,21 @@ void main() {
     if (box.y > box.x) {
         float t = box.x;
         float voxelDiag = length(uVolMax - uVolMin) / 112.0;
-        for (int i = 0; i < 120; i++) {
+        bool hasW = (uWeatherFlags.x == 1 || uWeatherFlags.y == 1);
+        float hitEps = hasW ? min(voxelDiag * 0.075, 0.0055) : voxelDiag * 0.18;
+        float minStep = hasW ? min(voxelDiag * 0.08, 0.007) : voxelDiag * 0.25;
+        float stepMul = hasW ? 0.58 : 0.80;
+        int maxSteps = hasW ? 168 : 120;
+        for (int i = 0; i < 168; i++) {
+            if (i >= maxSteps) break;
             vec3 p = ro + rd * t;
             float d = evalD(p);
-            if (d < voxelDiag * 0.18) {
+            if (d < hitEps) {
                 hitRock = true;
                 tHit = t;
                 break;
             }
-            t += max(voxelDiag * 0.25, d * 0.80);
+            t += max(minStep, d * stepMul);
             if (t > box.y) break;
         }
     }
@@ -938,14 +1374,18 @@ void main() {
     if (hitRock && (tFloor <= 0.0 || tHit < tFloor)) {
         vec3 p = ro + rd * tHit;
         float voxelSize = length(uVolMax - uVolMin) / 112.0;
-        vec3 n = calcNormal(p, voxelSize * 0.45);
+        bool hasW = (uWeatherFlags.x == 1 || uWeatherFlags.y == 1);
+        float nEps = hasW ? min(voxelSize * 0.18, 0.0065) : voxelSize * 0.45;
+        vec3 n = calcNormal(p, nEps);
         vec4 s = sampleVol(p);
-        float ao = calcVolAo(p, n);
-        float shadow = calcSoftShadow(p + n * voxelSize * 0.65, uSunDir);
+        vec4 wInfo = hasW ? evalWeatheringDetailed(p, s.x) : vec4(s.x, 0.0, 1.0, 0.0);
+        float ao = calcVolAo(p, n) * wInfo.z;
+        float shadow = calcSoftShadow(p + n * (hasW ? max(0.012, voxelSize * 0.30) : voxelSize * 0.65), uSunDir);
 
         // Subtle convexity bevel highlight from central difference Laplacian
-        float dLap = evalD(p + n * voxelSize * 0.8) + evalD(p - n * voxelSize * 0.8) - 2.0 * s.x;
-        float edgeWear = clamp(dLap * 14.0, 0.0, 1.0);
+        float lapEps = hasW ? min(voxelSize * 0.35, 0.018) : voxelSize * 0.8;
+        float dLap = evalD(p + n * lapEps) + evalD(p - n * lapEps) - 2.0 * wInfo.x;
+        float edgeWear = clamp(dLap * (hasW ? 22.0 : 14.0), 0.0, 1.0);
 
         if (uLens == 2) {
             col = vec3(ao);
@@ -953,7 +1393,14 @@ void main() {
             col = n * 0.5 + 0.5;
         } else {
             vec3 baseAlbedo = (uLens == 1) ? vec3(0.60, 0.58, 0.54) : s.yzw;
-            baseAlbedo = mix(baseAlbedo, baseAlbedo * 1.14 + vec3(0.03), edgeWear * 0.45);
+            if (hasW) {
+                // Fresh warm peeled granite corestone & fresh bright crack interiors vs dark aged outer rind!
+                vec3 freshCore = clamp(baseAlbedo * vec3(1.26, 1.21, 1.13) + vec3(0.11, 0.09, 0.06), 0.0, 0.96);
+                vec3 agedRind  = baseAlbedo * vec3(0.84, 0.82, 0.78);
+                baseAlbedo = mix(agedRind, freshCore, clamp(wInfo.y * 0.86, 0.0, 1.0));
+                baseAlbedo += vec3(0.085, 0.075, 0.060) * wInfo.w;
+            }
+            baseAlbedo = mix(baseAlbedo, baseAlbedo * 1.14 + vec3(0.03), edgeWear * 0.48);
 
             float ndl = max(0.0, dot(n, uSunDir));
             vec3 halfV = normalize(uSunDir - rd);
@@ -1679,7 +2126,7 @@ export class RockFormation2Viewport
                 for (let x = 0; x < res; x++)
                 {
                     const wx = this.volMin[0] + ((x + 0.5) / res) * (this.volMax[0] - this.volMin[0]);
-                    buf[ptr]     = evalRock2StackSdf(this.compiledStack, wx, wy, wz, col);
+                    buf[ptr]     = evalRock2StackSdf(this.compiledStack, wx, wy, wz, col, true);
                     buf[ptr + 1] = col.r;
                     buf[ptr + 2] = col.g;
                     buf[ptr + 3] = col.b;
@@ -4305,6 +4752,26 @@ export class RockFormation2Viewport
         }
 
         const layer = this.activeLayer;
+
+        // Draw live 3D Rock Simulation Box brackets (1 Rock Box vs All Rock Boxes) whenever weathering is active or visible
+        const cw = this.compiledStack?.compiledWeathering;
+        const simBoxes = this.compiledStack?.simBoxes || [];
+        const showSimBoxOverlay = (this.showSimBoxes || (layer && (layer.type === 'thermal_cracks' || layer.type === 'onion_peel'))) && simBoxes.length > 0 && cw?.hasAny;
+        if (showSimBoxOverlay)
+        {
+            const scope = cw?.boxScope || this.rockSimBoxScope || 'all_boxes';
+            const tgtId = cw?.targetLayerId || this.rockSimTargetLayerId || simBoxes[0]?.layerId;
+            for (const sb of simBoxes)
+            {
+                const isTargeted = scope === 'all_boxes' || sb.layerId === tgtId;
+                const strokeCol = isTargeted ? 'rgba(240, 140, 74, 0.88)' : 'rgba(148, 163, 184, 0.25)';
+                const tag = isTargeted
+                    ? (scope === 'active_box' ? `SIM 1 BOX · ${sb.name}` : `SIM ALL · ${sb.name}`)
+                    : null;
+                this._drawSelectionBounds(ctx, cam, cssW, cssH, sb, tag, strokeCol);
+            }
+        }
+
         if (!this.showGizmos || !layer || !layer.enabled) return;
 
         if (isRock2ModifierType(layer.type))
@@ -5037,6 +5504,28 @@ export class RockFormation2Viewport
             gl.uniform3fv(gl.getUniformLocation(this.rayProg, 'uSunDir'), sunDir);
             gl.uniform1f(gl.getUniformLocation(this.rayProg, 'uExposure'), this.exposure);
             gl.uniform1i(gl.getUniformLocation(this.rayProg, 'uLens'), this.lens);
+
+            // Upload live Pure-SDF Thermal Cracks & Onion-Skin Exfoliation uniforms (60 FPS analytical raymarching!)
+            const cw = this.compiledStack?.compiledWeathering;
+            const hasOnion = (cw?.onion && (cw.onion.strength ?? 0) > 0.01) ? 1 : 0;
+            const hasThermal = (cw?.thermal && (cw.thermal.strength ?? 0) > 0.01) ? 1 : 0;
+            const onionFirst = cw?.onionFirst ? 1 : 0;
+            const hasClip = cw?.clipBox ? 1 : 0;
+            gl.uniform4i(gl.getUniformLocation(this.rayProg, 'uWeatherFlags'), hasOnion, hasThermal, onionFirst, hasClip);
+            const refB = cw?.refBox || { cx: 0, cy: 2, cz: 0, rx: 3, ry: 2, rz: 3, scale: 5 };
+            gl.uniform3f(gl.getUniformLocation(this.rayProg, 'uWeatherRefCenter'), refB.cx, refB.cy, refB.cz);
+            gl.uniform3f(gl.getUniformLocation(this.rayProg, 'uWeatherRefRadius'), refB.rx, refB.ry, refB.rz);
+            gl.uniform1f(gl.getUniformLocation(this.rayProg, 'uWeatherRefScale'), refB.scale);
+            const clipB = cw?.clipBox || refB;
+            gl.uniform3f(gl.getUniformLocation(this.rayProg, 'uWeatherClipMin'), clipB.minX ?? -10, clipB.minY ?? -10, clipB.minZ ?? -10);
+            gl.uniform3f(gl.getUniformLocation(this.rayProg, 'uWeatherClipMax'), clipB.maxX ?? 10, clipB.maxY ?? 10, clipB.maxZ ?? 10);
+            const op = cw?.onion || {};
+            gl.uniform4f(gl.getUniformLocation(this.rayProg, 'uOnion0'), op.strength ?? 0, op.shellCount ?? 4, op.shellThickness ?? 1.0, op.undercutDepth ?? 1.05);
+            gl.uniform4f(gl.getUniformLocation(this.rayProg, 'uOnion1'), op.plateJoints ?? 0.80, op.corestoneRounding ?? 0.62, op.spallAsymmetry ?? 0.78, op.seed ?? 5217);
+            const tp = cw?.thermal || {};
+            gl.uniform4f(gl.getUniformLocation(this.rayProg, 'uThermal0'), tp.strength ?? 0, tp.thermalDeltaT ?? 58, tp.directionalBias ?? 0.55, tp.skinDepth ?? 0.54);
+            gl.uniform4f(gl.getUniformLocation(this.rayProg, 'uThermal1'), tp.crazing90 ?? 0.84, tp.crazingSpacing ?? 0.56, tp.voronoiJoints ?? 0.56, tp.pittingStrength ?? 0.68);
+            gl.uniform4f(gl.getUniformLocation(this.rayProg, 'uThermal2'), tp.pitScale ?? 1.0, tp.seed ?? 4109, 0, 0);
 
             gl.bindVertexArray(this.emptyVao);
             gl.drawArrays(gl.TRIANGLES, 0, 3);

@@ -80,7 +80,10 @@ import {
     ROCK2_STARTER_STACKS,
     ROCK2_ROCK_POOL_OPTIONS,
     ROCK2_ARCH_SPLINE_PRESETS,
+    ROCK_WEATHER_TIERS,
+    ROCK_WEATHER_BOX_SCOPES,
     isRock2ModifierType,
+    isRock2SimModifierType,
     isRock2BooleanLayer,
     isRock2BooleanCombineMode,
     setRock2LayerBooleanMode,
@@ -105,6 +108,18 @@ import {
     deserializeRock2Document
 } from './Engine/RockCliff/RockFormationStackEngine.js';
 import { RockFormation2Viewport } from './Engine/RockCliff/RockFormation2Viewport.js';
+import {
+    WEATHER_SIM_CATALOG,
+    WEATHER_SIM_TIERS,
+    WEATHER_BOX_SCOPES,
+    GetWeatherSimSpec,
+    GetWeatherSimTier,
+    CreateWeatherSimNode,
+    CreateDefaultLandscapeWeatherNodes,
+    ResolveTargetTerrainBoxes,
+    RunLandscapeWeatheringNodesAsync,
+    ClearWeatheringFromRegion
+} from './Engine/ThermalOnionSimEngine.js';
 
 const MASK_PALETTE = ['#58b982', '#5ac8fa', '#a3d977', '#e8c27a', '#f0935b', '#d6a2e8'];
 
@@ -164,12 +179,16 @@ class TerrainWorldStudioApp
             qefStats: null,
             qefDirty: true,
             meshResolution: InitRock2Stack.meshResolution || 72,
+            simBoxScope: 'all_boxes',
+            simTargetLayerId: InitRock2Stack.layers[0]?.id || '',
+            showSimBoxes: true,
             _qefTimer: null,
             undoStack: [],
             redoStack: []
         };
 
-        // ---- Physically based erosion simulation state (solo OR shared-weather group) ----
+        // ---- Physically based erosion + Thermal Cracks & Onion-Skin Exfoliation state ----
+        const InitWeatherNodes = CreateDefaultLandscapeWeatherNodes();
         this.sim = {
             group: null,              // SimulationGroup (shared weather across 2+ terrains)
             playing: false,
@@ -184,7 +203,14 @@ class TerrainWorldStudioApp
             rampId: 'satelliteDesert',
             stampId: 'crossBeddedSandstone',
             stampStrength: 1.0,
-            shareWeather: false       // false = solo (1-by-1) · true = shared climate group
+            shareWeather: false,      // false = solo (1-by-1) · true = shared climate group
+            weatherNodes: InitWeatherNodes,
+            activeWeatherNodeId: InitWeatherNodes[0]?.id || null,
+            weatherTierId: 'lookdev_512',
+            weatherBoxScope: 'all_boxes',
+            weatherRunning: false,
+            weatherProgress: 0,
+            weatherStatus: 'Ready · Lookdev 512 (Thermal Cracks & Onion Peel)'
         };
 
         this.activeRegionId = this.world.regions[0]?.id || null;
@@ -3845,12 +3871,248 @@ class TerrainWorldStudioApp
     }
 
     /*--------------------------------------------------------------------------------------------------------------------------------------
+                         THERMAL CRACKS & ONION-SKIN EXFOLIATION RUNNER & PARAMETER CONTROLS (LANDSCAPE + ROCK 2.0)
+    --------------------------------------------------------------------------------------------------------------------------------------*/
+    async _runLandscapeWeatheringNow(TierIdOverride = null)
+    {
+        if (this.sim.weatherRunning) return;
+        const TierId = TierIdOverride || this.sim.weatherTierId || 'lookdev_512';
+        const Tier = GetWeatherSimTier(TierId);
+        this.sim.weatherTierId = Tier.id;
+        this.sim.weatherRunning = true;
+        this.sim.weatherProgress = 0;
+        this.sim.weatherStatus = `Simulating ${Tier.label}…`;
+        this.rebuildInspector();
+
+        try
+        {
+            const SunDir = this.view3D?.getSunDirection?.() || [0.55, 0.72, 0.42];
+            const RunRes = await RunLandscapeWeatheringNodesAsync(this.world, {
+                scope: this.sim.weatherBoxScope,
+                tierId: Tier.id,
+                nodes: this.sim.weatherNodes,
+                activeRegionId: this.activeRegionId,
+                selectedRegionIds: this.selectedRegionIds,
+                sunDir: SunDir,
+                freshBase: true,
+                onProgress: (Frac, Reg, Node) =>
+                {
+                    this.sim.weatherProgress = Frac;
+                    const Pct = Math.round(Frac * 100);
+                    const Lbl = document.getElementById('weather-sim-progress-label');
+                    if (Lbl) Lbl.textContent = Node ? `${Pct}% · ${Reg?.name || ''} · ${Node.name}` : `${Pct}% · Finalizing…`;
+                    const Bar = document.getElementById('weather-sim-progress-bar');
+                    if (Bar) Bar.style.width = `${Pct}%`;
+                },
+                onRegionDone: Region =>
+                {
+                    Region.meshDirty = true;
+                    this.map2D.invalidateRegionPreview(Region.id);
+                }
+            });
+
+            const Cracked = RunRes.results.reduce((A, R) => A + (R.stats?.crackedCells || 0), 0);
+            const Pitted  = RunRes.results.reduce((A, R) => A + (R.stats?.pittedCells || 0), 0);
+            const Onion   = RunRes.results.reduce((A, R) => A + (R.stats?.onionCells || 0), 0);
+            this.sim.weatherStatus = `Done · ${Tier.label} · ${RunRes.targetCount} box${RunRes.targetCount === 1 ? '' : 'es'} · ${RunRes.totalElapsedMs} ms · Cracks ${Cracked.toLocaleString()} · Pits ${Pitted.toLocaleString()} · Onion ${Onion.toLocaleString()}`;
+            this.sim.weatherProgress = 1.0;
+            this.refreshChrome();
+            this._scheduleAutosave();
+        }
+        finally
+        {
+            this.sim.weatherRunning = false;
+            this.rebuildInspector();
+        }
+    }
+
+    _clearLandscapeWeatheringNow()
+    {
+        const Targets = ResolveTargetTerrainBoxes(this.world, this.sim.weatherBoxScope, this.activeRegionId, this.selectedRegionIds);
+        for (const R of Targets)
+        {
+            ClearWeatheringFromRegion(this.world, R);
+            this.map2D.invalidateRegionPreview(R.id);
+        }
+        this.sim.weatherProgress = 0;
+        this.sim.weatherStatus = `Cleared weathering on ${Targets.length} box${Targets.length === 1 ? '' : 'es'}`;
+        this.refreshChrome();
+        this.rebuildInspector();
+    }
+
+    _buildWeatherNodeSliders(Body, NodeType, P, IsLandscape, OnLive, OnCommit = null)
+    {
+        const Commit = OnCommit || (() => {});
+        if (NodeType === 'thermal_cracks')
+        {
+            Body.appendChild(MakeSliderPillRow('Strength', 0.0, 1.0, 0.02, P.strength ?? 0.88, 2, '', V => { P.strength = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Solar Thermal ΔT', 10, 95, 1, P.thermalDeltaT ?? 58, 0, '°C', V => { P.thermalDeltaT = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Solar Insolation Bias', 0.0, 1.0, 0.02, P.directionalBias ?? 0.55, 2, '', V => { P.directionalBias = V; OnLive(); }, Commit));
+            if (IsLandscape)
+            {
+                Body.appendChild(MakeSliderPillRow('Skin Depth exp(-d/δ)', 0.4, 12.0, 0.2, P.skinDepth ?? 3.4, 1, 'm', V => { P.skinDepth = V; OnLive(); }, Commit));
+                Body.appendChild(MakeSliderPillRow('90° T-Junction Crazing', 0.0, 1.0, 0.02, P.crazing90 ?? 0.86, 2, '', V => { P.crazing90 = V; OnLive(); }, Commit));
+                Body.appendChild(MakeSliderPillRow('Polygon Tile Spacing', 4.0, 48.0, 0.5, P.crazingSpacing ?? 16.0, 1, 'm', V => { P.crazingSpacing = V; OnLive(); }, Commit));
+            }
+            else
+            {
+                Body.appendChild(MakeSliderPillRow('Skin Depth exp(-d/δ)', 0.10, 1.60, 0.02, P.skinDepth ?? 0.54, 2, 'm', V => { P.skinDepth = V; OnLive(); }, Commit));
+                Body.appendChild(MakeSliderPillRow('90° T-Junction Crazing', 0.0, 1.0, 0.02, P.crazing90 ?? 0.84, 2, '', V => { P.crazing90 = V; OnLive(); }, Commit));
+                Body.appendChild(MakeSliderPillRow('Polygon Tile Spacing', 0.20, 1.50, 0.02, P.crazingSpacing ?? 0.56, 2, 'm', V => { P.crazingSpacing = V; OnLive(); }, Commit));
+            }
+            Body.appendChild(MakeSliderPillRow('3D Voronoi Rock Joints', 0.0, 1.0, 0.02, P.voronoiJoints ?? 0.56, 2, '', V => { P.voronoiJoints = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Hallet–Walder Pitting', 0.0, 1.0, 0.02, P.pittingStrength ?? 0.68, 2, '', V => { P.pittingStrength = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Pitting Spall Size', 0.35, 2.40, 0.05, P.pitScale ?? 1.0, 2, '×', V => { P.pitScale = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Fracture Seed', 1, 9999, 1, P.seed ?? 4109, 0, '', V => { P.seed = Math.round(V); OnLive(); }, Commit));
+        }
+        else if (NodeType === 'onion_peel')
+        {
+            Body.appendChild(MakeSliderPillRow('Exfoliation Strength', 0.0, 1.0, 0.02, P.strength ?? 0.90, 2, '', V => { P.strength = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Concentric Shell Tiers', 2, 6, 1, P.shellCount ?? 4, 0, '', V => { P.shellCount = Math.round(V); OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Shell Sheet Thickness', 0.40, 2.20, 0.04, P.shellThickness ?? 1.0, 2, '×', V => { P.shellThickness = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Undercut Parting Slot', 0.0, 1.60, 0.04, P.undercutDepth ?? 1.05, 2, '×', V => { P.undercutDepth = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Shell Plate Cracks', 0.0, 1.0, 0.02, P.plateJoints ?? 0.80, 2, '', V => { P.plateJoints = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Corestone Rounding', 0.0, 1.0, 0.02, P.corestoneRounding ?? 0.62, 2, '', V => { P.corestoneRounding = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Fanned Spall Asymmetry', 0.0, 1.0, 0.02, P.spallAsymmetry ?? 0.78, 2, '', V => { P.spallAsymmetry = V; OnLive(); }, Commit));
+            Body.appendChild(MakeSliderPillRow('Exfoliation Seed', 1, 9999, 1, P.seed ?? 5217, 0, '', V => { P.seed = Math.round(V); OnLive(); }, Commit));
+        }
+    }
+
+    /*--------------------------------------------------------------------------------------------------------------------------------------
                                         TAB 5: SIMULATION & SEASONAL CLIMATE
     --------------------------------------------------------------------------------------------------------------------------------------*/
     _buildSimulationTab(Content, Region)
     {
+        // ---------- Thermal Cracks & Onion-Skin Exfoliation (Pure-SDF Weathering Nodes) ----------
+        const WeatherTargets = ResolveTargetTerrainBoxes(this.world, this.sim.weatherBoxScope, this.activeRegionId, this.selectedRegionIds);
+        const CurWTier = GetWeatherSimTier(this.sim.weatherTierId);
+        const WGroup = MakePropertyGroup(
+            'Thermal Cracks & Onion-Skin Exfoliation',
+            'Activity',
+            CurWTier.label.toUpperCase(),
+            true,
+            'Pure-SDF Irwin V-tipped skin-depth cracks exp(-d/δ), 90° T-junction crazing, Hallet–Walder pitting & concentric Onion-Skin Exfoliation shells.'
+        );
+
+        WGroup.Body.appendChild(MakeSelectRow(
+            'Resolution Tier',
+            WEATHER_SIM_TIERS.map(T => [T.label, T.id]),
+            this.sim.weatherTierId,
+            Val => { this.sim.weatherTierId = Val; this.rebuildInspector(); }
+        ));
+
+        WGroup.Body.appendChild(MakeSelectRow(
+            '3D Landscape Box Scope',
+            WEATHER_BOX_SCOPES.map(S => [S.label, S.id]),
+            this.sim.weatherBoxScope,
+            Val => { this.sim.weatherBoxScope = Val; this.rebuildInspector(); }
+        ));
+
+        const WTargetInfo = MakeEl('div', 'studio-btn-row');
+        WTargetInfo.appendChild(MakeEl('span', 'dock-readout', `Target Boxes (${WeatherTargets.length}): ${WeatherTargets.map(R => R.name).join(' · ') || '—'}`));
+        WGroup.Body.appendChild(WTargetInfo);
+
+        const WBtnRow = MakeEl('div', 'studio-btn-row');
+        const WLookBtn = MakeEl('button', 'button export-button accent', this.sim.weatherRunning ? 'Simulating…' : '▶ Lookdev Preview (512)');
+        WLookBtn.type = 'button';
+        WLookBtn.disabled = this.sim.weatherRunning;
+        WLookBtn.addEventListener('click', () => this._runLandscapeWeatheringNow('lookdev_512'));
+
+        const WProdId = this.sim.weatherTierId === 'lookdev_512' ? 'prod_1k' : this.sim.weatherTierId;
+        const WProdLbl = GetWeatherSimTier(WProdId).label.replace('Production · ', '');
+        const WProdBtn = MakeEl('button', 'button export-button', `⚡ Bake ${WProdLbl}`);
+        WProdBtn.type = 'button';
+        WProdBtn.disabled = this.sim.weatherRunning;
+        WProdBtn.addEventListener('click', () => this._runLandscapeWeatheringNow(WProdId));
+
+        const WClrBtn = MakeEl('button', 'button', '↺ Clear');
+        WClrBtn.type = 'button';
+        WClrBtn.disabled = this.sim.weatherRunning;
+        WClrBtn.addEventListener('click', () => this._clearLandscapeWeatheringNow());
+        WBtnRow.append(WLookBtn, WProdBtn, WClrBtn);
+        WGroup.Body.appendChild(WBtnRow);
+
+        const WProgWrap = MakeEl('div', 'studio-btn-row');
+        WProgWrap.style.cssText = 'flex-direction:column;gap:4px;';
+        const WTrack = MakeEl('div', '');
+        WTrack.style.cssText = 'width:100%;height:4px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;';
+        const WBar = MakeEl('div', '');
+        WBar.id = 'weather-sim-progress-bar';
+        WBar.style.cssText = `height:100%;width:${Math.round((this.sim.weatherProgress || 0) * 100)}%;background:#f08c4a;transition:width 120ms linear;`;
+        WTrack.appendChild(WBar);
+        const WLbl = MakeEl('span', 'dock-readout', this.sim.weatherStatus || 'Ready · Lookdev 512');
+        WLbl.id = 'weather-sim-progress-label';
+        WProgWrap.append(WTrack, WLbl);
+        WGroup.Body.appendChild(WProgWrap);
+
+        // Ordered Node Stack (Thermal Cracks & Pitting + Onion-Skin Exfoliation ONLY)
+        const WStackBox = MakeEl('div', '');
+        WStackBox.style.cssText = 'display:flex;flex-direction:column;gap:5px;margin:8px 0;';
+        for (let Wi = 0; Wi < this.sim.weatherNodes.length; ++Wi)
+        {
+            const WNode = this.sim.weatherNodes[Wi];
+            const WSpec = GetWeatherSimSpec(WNode.nodeType);
+            const IsSelW = WNode.id === this.sim.activeWeatherNodeId;
+            const WRow = MakeEl('div', '');
+            WRow.style.cssText = `display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;cursor:pointer;border:1px solid ${IsSelW ? WSpec.accent : 'rgba(255,255,255,0.08)'};background:${IsSelW ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.025)'};opacity:${WNode.enabled ? 1 : 0.48};`;
+            WRow.addEventListener('click', () => { this.sim.activeWeatherNodeId = WNode.id; this.rebuildInspector(); });
+
+            const EnChk = document.createElement('input');
+            EnChk.type = 'checkbox';
+            EnChk.checked = !!WNode.enabled;
+            EnChk.addEventListener('click', E => E.stopPropagation());
+            EnChk.addEventListener('change', () => { WNode.enabled = EnChk.checked; this.rebuildInspector(); });
+
+            const Badge = MakeEl('span', '', WSpec.shortBadge);
+            Badge.style.cssText = `font-size:9px;font-weight:700;padding:1px 5px;border-radius:4px;color:#0b0d10;background:${WSpec.accent};`;
+
+            const NameSpan = MakeEl('span', '', WNode.name);
+            NameSpan.style.cssText = 'flex:1;font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+            const SoloBtn = MakeEl('button', 'button', 'S');
+            SoloBtn.type = 'button';
+            SoloBtn.title = 'Solo this node';
+            SoloBtn.style.cssText = `padding:1px 6px;font-size:10px;${WNode.solo ? 'background:#e8c27a;color:#0b0d10;' : ''}`;
+            SoloBtn.addEventListener('click', E => { E.stopPropagation(); WNode.solo = !WNode.solo; this.rebuildInspector(); });
+
+            const UpBtn = MakeEl('button', 'button', '↑');
+            UpBtn.type = 'button';
+            UpBtn.style.cssText = 'padding:1px 5px;font-size:10px;';
+            UpBtn.disabled = Wi === 0;
+            UpBtn.addEventListener('click', E =>
+            {
+                E.stopPropagation();
+                if (Wi > 0) { const T = this.sim.weatherNodes[Wi - 1]; this.sim.weatherNodes[Wi - 1] = WNode; this.sim.weatherNodes[Wi] = T; this.rebuildInspector(); }
+            });
+
+            const DnBtn = MakeEl('button', 'button', '↓');
+            DnBtn.type = 'button';
+            DnBtn.style.cssText = 'padding:1px 5px;font-size:10px;';
+            DnBtn.disabled = Wi === this.sim.weatherNodes.length - 1;
+            DnBtn.addEventListener('click', E =>
+            {
+                E.stopPropagation();
+                if (Wi < this.sim.weatherNodes.length - 1) { const T = this.sim.weatherNodes[Wi + 1]; this.sim.weatherNodes[Wi + 1] = WNode; this.sim.weatherNodes[Wi] = T; this.rebuildInspector(); }
+            });
+
+            WRow.append(EnChk, Badge, NameSpan, SoloBtn, UpBtn, DnBtn);
+            WStackBox.appendChild(WRow);
+        }
+        WGroup.Body.appendChild(WStackBox);
+
+        const ActiveWNode = this.sim.weatherNodes.find(N => N.id === this.sim.activeWeatherNodeId) || this.sim.weatherNodes[0];
+        if (ActiveWNode)
+        {
+            const Spec = GetWeatherSimSpec(ActiveWNode.nodeType);
+            const DescEl = MakeEl('div', 'dock-readout', `${Spec.name} — ${Spec.desc}`);
+            DescEl.style.cssText = 'margin:4px 0 6px;color:#b8c7d4;';
+            WGroup.Body.appendChild(DescEl);
+            this._buildWeatherNodeSliders(WGroup.Body, ActiveWNode.nodeType, ActiveWNode.params, true, () => {});
+        }
+        Content.appendChild(WGroup.Group);
+
         // ---------- Preset Gallery ----------
-        const PresetGroup = MakePropertyGroup('Geological Landscape Presets', 'Planet', `${EROSION_PRESETS.length} PRESETS`, true,
+        const PresetGroup = MakePropertyGroup('Geological Landscape Presets', 'Planet', `${EROSION_PRESETS.length} PRESETS`, false,
             'All c7egoist/Frontier landscapes, re-engineered for the physically based multi-process erosion solver.');
         PresetGroup.Body.appendChild(MakeSelectRow('Erosion Preset', EROSION_PRESETS.map(P => [P.name, P.id]), this.sim.presetId, Val =>
         {
@@ -5346,6 +5608,36 @@ class TerrainWorldStudioApp
 
         if (isRock2ModifierType(NodeType))
         {
+            if (isRock2SimModifierType(NodeType))
+            {
+                const FirstRock = Stack.layers.find(L => !isRock2ModifierType(L.type));
+                const SimLayer = createRock2Layer(NodeType, {
+                    params: {
+                        boxScope: this.rock2.simBoxScope || 'all_boxes',
+                        targetLayerId: this.rock2.simTargetLayerId || FirstRock?.id || ''
+                    }
+                });
+                Stack.layers.push(SimLayer);
+                this.rock2.selectedLayerId = SimLayer.id;
+                this.rock2.selectedInstanceIndex = -1;
+                if (this.rock2View)
+                {
+                    // Keep RockFormation 2.0 in LIVE 60 FPS GPU Pure-SDF Raymarching so cracks, pits & onion shells render razor-sharp sub-millimeter!
+                    this.rock2View.setRenderMode('sdf');
+                    this.rock2View.showSimBoxes = !!this.rock2.showSimBoxes;
+                    this.rock2View.rockSimBoxScope = SimLayer.params.boxScope || 'all_boxes';
+                    this.rock2View.rockSimTargetLayerId = SimLayer.params.targetLayerId || '';
+                    this.rock2View.selectedInstanceIndex = -1;
+                    this.rock2View.setActiveLayer(SimLayer);
+                    this.rock2View.setGizmoToolMode('none');
+                }
+                this._rebuildRock2StackNow(false);
+                this._syncRock2ToolbarButtons();
+                this.refreshChrome();
+                this.rebuildInspector();
+                return;
+            }
+
             if (NodeType === 'sculpt_layer')
             {
                 const SculptLayer = createRock2Layer('sculpt_layer');
@@ -5501,7 +5793,11 @@ class TerrainWorldStudioApp
 
         if (this.rock2View)
         {
-            this.rock2View.setActiveLayer(this._getSelectedRock2Layer());
+            const SelLyr = this._getSelectedRock2Layer();
+            this.rock2View.showSimBoxes = !!this.rock2.showSimBoxes;
+            this.rock2View.rockSimBoxScope = (SelLyr && isRock2SimModifierType(SelLyr.type)) ? (SelLyr.params?.boxScope || this.rock2.simBoxScope || 'all_boxes') : (this.rock2.simBoxScope || 'all_boxes');
+            this.rock2View.rockSimTargetLayerId = (SelLyr && isRock2SimModifierType(SelLyr.type)) ? (SelLyr.params?.targetLayerId || this.rock2.simTargetLayerId || '') : (this.rock2.simTargetLayerId || '');
+            this.rock2View.setActiveLayer(SelLyr);
             this.rock2View.setCompiledStack(Compiled, { reframe: Reframe });
             if (this.rock2View.renderMode === 'qef-mesh')
             {
@@ -5701,6 +5997,14 @@ class TerrainWorldStudioApp
                 const DabPill = MakeEl('span', 'rock2-gen-pill mod-gen-pill', `DABS ×${DabN}`);
                 MetaItems = [ModPill, NodeTag, DabPill];
             }
+            else if (IsMod && isRock2SimModifierType(Lyr.type))
+            {
+                const SimPill = MakeEl('span', 'rock2-op-pill op-modifier', Lyr.type === 'onion_peel' ? 'SIM · ONION' : 'SIM · CRACKS');
+                const NodeTag = MakeEl('span', 'rock2-node-tag', Def.name);
+                const ScopeVal = Lyr.params?.boxScope || 'all_boxes';
+                const ScopePill = MakeEl('span', 'rock2-gen-pill mod-gen-pill', ScopeVal === 'active_box' ? '1 BOX' : (ScopeVal === 'below_stack' ? 'BELOW' : 'ALL BOXES'));
+                MetaItems = [SimPill, NodeTag, ScopePill];
+            }
             else if (IsMod)
             {
                 const ModeMap = {
@@ -5809,6 +6113,20 @@ class TerrainWorldStudioApp
             Card.append(TopRow, BotRow);
             Group.appendChild(Card);
         }
+
+        // Focused 2-Node Weathering Quick-Add Bar (Live 60 FPS GPU Pure-SDF Raymarching!)
+        const SimAddBar = MakeEl('div', 'studio-btn-row');
+        SimAddBar.style.cssText = 'margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);gap:6px;';
+        const BtnAddCracks = MakeEl('button', 'button export-button', '+ Thermal Cracks & Pitting');
+        BtnAddCracks.type = 'button';
+        BtnAddCracks.style.cssText = 'flex:1;justify-content:center;font-size:11px;padding:6px 8px;';
+        BtnAddCracks.addEventListener('click', () => this._addRock2Layer('thermal_cracks'));
+        const BtnAddOnion = MakeEl('button', 'button export-button', '+ Onion-Skin Exfoliation');
+        BtnAddOnion.type = 'button';
+        BtnAddOnion.style.cssText = 'flex:1;justify-content:center;font-size:11px;padding:6px 8px;';
+        BtnAddOnion.addEventListener('click', () => this._addRock2Layer('onion_peel'));
+        SimAddBar.append(BtnAddCracks, BtnAddOnion);
+        Group.appendChild(SimAddBar);
 
         Outliner.appendChild(Group);
 
@@ -6415,6 +6733,146 @@ class TerrainWorldStudioApp
         Content.appendChild(HistGrp.Group);
     }
 
+    _buildRock2WeatheringInspector(Content, Stack, Layer, LayerIdx, Def, SavedOpen, OnLive, OnCommit)
+    {
+        const P = Layer.params;
+        const Compiled = this.rock2.compiled;
+        const IsOnion = Layer.type === 'onion_peel';
+        const IsQef = this.rock2View && this.rock2View.renderMode === 'qef-mesh';
+        const RockLayers = Stack.layers.filter(L => !isRock2ModifierType(L.type));
+
+        const Trio = MakeEl('div', 'kpi-trio', [
+            MakeEl('div', 'kpi-card highlight', [
+                MakeEl('span', 'kpi-label', 'Weathering Node'),
+                MakeEl('strong', 'kpi-val', `#${String(LayerIdx + 1).padStart(2, '0')} ${IsOnion ? 'ONION' : 'CRACKS'}`),
+                MakeEl('span', 'kpi-sub', Def.name)
+            ]),
+            MakeEl('div', 'kpi-card', [
+                MakeEl('span', 'kpi-label', 'Viewport Mode'),
+                MakeEl('strong', 'kpi-val', IsQef ? `QEF ${this.rock2.meshResolution}³` : 'Live SDF'),
+                MakeEl('span', 'kpi-sub', IsQef ? 'Dual-Contour Mesh' : '60 FPS GPU Analytical')
+            ]),
+            MakeEl('div', 'kpi-card', [
+                MakeEl('span', 'kpi-label', '3D Sim Boxes'),
+                MakeEl('strong', 'kpi-val', String(Compiled?.simBoxes?.length || 0)),
+                MakeEl('span', 'kpi-sub', '100% Pure-SDF')
+            ])
+        ]);
+        Content.appendChild(Trio);
+
+        // 1. Live Analytical GPU Raymarch vs High-Res QEF Bake + 3D Rock Box Scope
+        const ScopeTitle = '3D Rock Box Scope & Resolution';
+        const ScopeGrp = MakePropertyGroup(
+            ScopeTitle,
+            'Box',
+            IsQef ? `QEF ${this.rock2.meshResolution}³` : 'LIVE 60 FPS SDF',
+            SavedOpen(ScopeTitle, true),
+            'Live GPU SDF Raymarching evaluates cracks, Hallet–Walder pits & onion-skin shells analytically at sub-millimeter precision. Bake QEF Mesh anytime for OBJ/STL/GLB export.'
+        );
+
+        const CurScope = P.boxScope || 'all_boxes';
+        ScopeGrp.Body.appendChild(MakeSelectRow(
+            '3D Rock Box Scope',
+            ROCK_WEATHER_BOX_SCOPES.map(S => [S.label, S.id]),
+            CurScope,
+            Val =>
+            {
+                this._pushRock2UndoSnapshot();
+                P.boxScope = Val;
+                this.rock2.simBoxScope = Val;
+                if (Val === 'active_box' && !P.targetLayerId && RockLayers[0])
+                {
+                    P.targetLayerId = RockLayers[0].id;
+                    this.rock2.simTargetLayerId = RockLayers[0].id;
+                }
+                OnLive();
+                this.refreshChrome();
+                this.rebuildInspector();
+            }
+        ));
+
+        if (CurScope === 'active_box' && RockLayers.length > 0)
+        {
+            if (!P.targetLayerId) P.targetLayerId = RockLayers[0].id;
+            ScopeGrp.Body.appendChild(MakeSelectRow(
+                'Target Rock Box',
+                RockLayers.map((L, idx) => [`#${String(idx + 1).padStart(2, '0')} ${L.name}`, L.id]),
+                P.targetLayerId,
+                Val =>
+                {
+                    this._pushRock2UndoSnapshot();
+                    P.targetLayerId = Val;
+                    this.rock2.simTargetLayerId = Val;
+                    OnLive();
+                    this.refreshChrome();
+                }
+            ));
+        }
+
+        const ModeRow = MakeEl('div', 'studio-btn-row');
+        const BtnLiveSdf = MakeEl('button', `button export-button ${!IsQef ? 'accent' : ''}`, '▶ Live GPU SDF (Razor-Sharp)');
+        BtnLiveSdf.type = 'button';
+        BtnLiveSdf.addEventListener('click', () =>
+        {
+            if (this.rock2View) this.rock2View.setRenderMode('sdf');
+            this._rebuildRock2StackNow(false);
+            this._syncRock2ToolbarButtons();
+            this.rebuildInspector();
+        });
+        const BtnBake88 = MakeEl('button', `button export-button ${IsQef && this.rock2.meshResolution <= 96 ? 'accent' : ''}`, 'Bake QEF 96³');
+        BtnBake88.type = 'button';
+        BtnBake88.addEventListener('click', () =>
+        {
+            this.rock2.meshResolution = 96;
+            this.rock2.stack.meshResolution = 96;
+            if (this.rock2View) this.rock2View.setRenderMode('qef-mesh');
+            this._bakeRock2QefMeshNow();
+            this._syncRock2ToolbarButtons();
+            this.rebuildInspector();
+        });
+        const BtnBake128 = MakeEl('button', `button export-button ${IsQef && this.rock2.meshResolution > 96 ? 'accent' : ''}`, 'Bake QEF 128³');
+        BtnBake128.type = 'button';
+        BtnBake128.addEventListener('click', () =>
+        {
+            this.rock2.meshResolution = 128;
+            this.rock2.stack.meshResolution = 128;
+            if (this.rock2View) this.rock2View.setRenderMode('qef-mesh');
+            this._bakeRock2QefMeshNow();
+            this._syncRock2ToolbarButtons();
+            this.rebuildInspector();
+        });
+        ModeRow.append(BtnLiveSdf, BtnBake88, BtnBake128);
+        ScopeGrp.Body.appendChild(ModeRow);
+
+        const BoxVisRow = MakeEl('div', 'studio-btn-row');
+        const BtnBoxes = MakeEl('button', `button ${this.rock2.showSimBoxes ? 'accent' : ''}`, this.rock2.showSimBoxes ? '3D Sim Boxes: ON' : '3D Sim Boxes: OFF');
+        BtnBoxes.type = 'button';
+        BtnBoxes.addEventListener('click', () =>
+        {
+            this.rock2.showSimBoxes = !this.rock2.showSimBoxes;
+            if (this.rock2View) this.rock2View.showSimBoxes = this.rock2.showSimBoxes;
+            this.rebuildInspector();
+        });
+        const BtnDel = MakeEl('button', 'button', 'Delete Node');
+        BtnDel.type = 'button';
+        BtnDel.addEventListener('click', () => this._deleteRock2Layer(Layer.id));
+        BoxVisRow.append(BtnBoxes, BtnDel);
+        ScopeGrp.Body.appendChild(BoxVisRow);
+        Content.appendChild(ScopeGrp.Group);
+
+        // 2. Real-Time Physics Parameters
+        const PhysTitle = IsOnion ? 'Onion-Skin Exfoliation Physics' : 'Thermal Cracks & Pitting Physics';
+        const PhysGrp = MakePropertyGroup(
+            PhysTitle,
+            'Activity',
+            IsOnion ? '2–6 SHELLS' : 'IRWIN V-TIP',
+            SavedOpen(PhysTitle, true),
+            Def.description || ''
+        );
+        this._buildWeatherNodeSliders(PhysGrp.Body, Layer.type, P, false, OnLive, OnCommit);
+        Content.appendChild(PhysGrp.Group);
+    }
+
     _buildRock2InspectorTab(Content)
     {
         if (!this.rock2.savedOpenState) this.rock2.savedOpenState = new Map();
@@ -6452,6 +6910,12 @@ class TerrainWorldStudioApp
                 const DabN = Array.isArray(P.dabs) ? P.dabs.length : 0;
                 ObjType.textContent = `3D SDF SCULPT · ${(P.brushOp || 'add').toUpperCase()} · ${DabN} DABS`;
             }
+            else if (IsMod && isRock2SimModifierType(Layer.type))
+            {
+                ObjType.textContent = Layer.type === 'onion_peel'
+                    ? 'WEATHERING SIM · ONION-SKIN EXFOLIATION · LIVE GPU SDF'
+                    : 'WEATHERING SIM · THERMAL CRACKS & PITTING · LIVE GPU SDF';
+            }
             else if (IsMod)
             {
                 const ModeTag = (P.splitMode || 'single_plane').replace('_', ' ').toUpperCase();
@@ -6483,6 +6947,13 @@ class TerrainWorldStudioApp
         if (IsSculpt)
         {
             this._buildRock2SculptLayerInspector(Content, Stack, Layer, LayerIdx, Def, SavedOpen, OnLive, OnCommit);
+            this._appendRock2StageExportGroup(Content, Stack, IsQef, SavedOpen, OnLive, OnCommit);
+            return;
+        }
+
+        if (IsMod && isRock2SimModifierType(Layer.type))
+        {
+            this._buildRock2WeatheringInspector(Content, Stack, Layer, LayerIdx, Def, SavedOpen, OnLive, OnCommit);
             this._appendRock2StageExportGroup(Content, Stack, IsQef, SavedOpen, OnLive, OnCommit);
             return;
         }

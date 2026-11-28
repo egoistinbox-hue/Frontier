@@ -33,6 +33,16 @@ import {
 } from './Core/QefDualContour.js';
 
 import {
+    WEATHER_SIM_CATALOG,
+    ROCK_WEATHER_TIERS,
+    ROCK_WEATHER_BOX_SCOPES,
+    IsWeatherSimType,
+    evalRockWeatheringSdf3D
+} from '../ThermalOnionSimEngine.js';
+
+export { ROCK_WEATHER_TIERS, ROCK_WEATHER_BOX_SCOPES };
+
+import {
     createBoxPoly,
     clipPolyByHalfSpace,
     measurePoly,
@@ -890,8 +900,29 @@ export const ROCK2_MODIFIER_CATALOG = [
         desc: 'Non-destructive Pure-SDF kinematic fracture & fault plane modifier with T⁻¹(p) rigid slip, jigsaw teeth, blind V-taper & 3D Fault Gizmo.',
         defaults: { ...DEFAULT_ROCK2_SPLIT_FAULT_PARAMS },
         controlGroups: []
-    }
+    },
+    ...WEATHER_SIM_CATALOG.map(spec => ({
+        type: spec.type,
+        kind: 'modifier',
+        isSimModifier: true,
+        name: spec.name,
+        shortBadge: spec.shortBadge,
+        glyph: spec.glyph,
+        accent: spec.accent,
+        desc: spec.desc,
+        defaults: {
+            ...spec.defaultParams,
+            boxScope: 'all_boxes',
+            targetLayerId: ''
+        },
+        controlGroups: []
+    }))
 ];
+
+export function isRock2SimModifierType(type)
+{
+    return IsWeatherSimType(type);
+}
 
 export function isRock2BooleanCombineMode(mode)
 {
@@ -6811,6 +6842,7 @@ export function compileRock2Stack(doc)
 
     const compiledLayers = [];
     const compiledModifiers = [];
+    const compiledSimModifiers = [];
     const executionSteps = [];
     const allPrimitives = [];
     let totalPlanes = 0;
@@ -6829,6 +6861,20 @@ export function compileRock2Stack(doc)
 
         if (isRock2ModifierType(lyr.type))
         {
+            if (isRock2SimModifierType(lyr.type))
+            {
+                if (hasSoloMod && !lyr.solo) continue;
+                const spec = getRock2ModifierSpec(lyr.type);
+                compiledSimModifiers.push({
+                    id: lyr.id,
+                    type: lyr.type,
+                    name: lyr.name || spec?.name || lyr.type,
+                    params: { ...(spec?.defaults || {}), ...(lyr.params || {}) },
+                    belowLayerIds: compiledLayers.map(cl => cl.id)
+                });
+                continue;
+            }
+
             if (hasSoloMod && !lyr.solo) continue;
             if (hasSoloRock && !lyr.solo && lyr.params?.targetScope !== 'single_layer') continue;
 
@@ -7065,10 +7111,108 @@ export function compileRock2Stack(doc)
         Math.cos(sunEl) * Math.cos(sunAz)
     ];
 
+    // Build per-layer 3D Rock Simulation Boxes (`1-at-a-time` vs `below_stack` vs `all_boxes`)
+    const simBoxes = compiledLayers.map(cl => {
+        const b = cl.bounds || bounds;
+        const sx = Math.max(0.8, b.maxX - b.minX);
+        const sy = Math.max(0.8, b.maxY - b.minY);
+        const sz = Math.max(0.8, b.maxZ - b.minZ);
+        return {
+            layerId: cl.id,
+            name: cl.name,
+            minX: b.minX, minY: b.minY, minZ: b.minZ,
+            maxX: b.maxX, maxY: b.maxY, maxZ: b.maxZ,
+            cx: 0.5 * (b.minX + b.maxX),
+            cy: 0.5 * (b.minY + b.maxY),
+            cz: 0.5 * (b.minZ + b.maxZ),
+            rx: 0.5 * sx, ry: 0.5 * sy, rz: 0.5 * sz,
+            scale: Math.max(sx, sy, sz)
+        };
+    });
+
+    // Compile active Thermal Cracks & Onion-Skin Exfoliation state for BOTH 60 FPS GPU Raymarching & CPU QEF Bake!
+    let thermalIdx = -1, onionIdx = -1;
+    let thermalParams = null, onionParams = null;
+    let weatherBoxScope = 'all_boxes';
+    let weatherTargetLayerId = '';
+    let weatherBelowIds = null;
+    for (let si = 0; si < compiledSimModifiers.length; si++)
+    {
+        const sm = compiledSimModifiers[si];
+        if (sm.type === 'thermal_cracks') { thermalIdx = si; thermalParams = sm.params; }
+        else if (sm.type === 'onion_peel') { onionIdx = si; onionParams = sm.params; }
+        if (sm.params?.boxScope) weatherBoxScope = sm.params.boxScope;
+        if (sm.params?.targetLayerId) weatherTargetLayerId = sm.params.targetLayerId;
+        if (sm.belowLayerIds?.length) weatherBelowIds = sm.belowLayerIds;
+    }
+
+    const fullScale = Math.max(1.2, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, bounds.maxZ - bounds.minZ);
+    const fullBox = {
+        minX: bounds.minX, minY: bounds.minY, minZ: bounds.minZ,
+        maxX: bounds.maxX, maxY: bounds.maxY, maxZ: bounds.maxZ,
+        cx: 0.5 * (bounds.minX + bounds.maxX),
+        cy: 0.5 * (bounds.minY + bounds.maxY),
+        cz: 0.5 * (bounds.minZ + bounds.maxZ),
+        rx: Math.max(0.6, 0.5 * (bounds.maxX - bounds.minX)),
+        ry: Math.max(0.6, 0.5 * (bounds.maxY - bounds.minY)),
+        rz: Math.max(0.6, 0.5 * (bounds.maxZ - bounds.minZ)),
+        scale: fullScale
+    };
+
+    let activeClipBox = null;
+    if (weatherBoxScope === 'active_box' && simBoxes.length > 0)
+    {
+        activeClipBox = simBoxes.find(sb => sb.layerId === weatherTargetLayerId) || simBoxes[0];
+    }
+    else if (weatherBoxScope === 'below_stack' && weatherBelowIds?.length && simBoxes.length > 0)
+    {
+        const hits = simBoxes.filter(sb => weatherBelowIds.includes(sb.layerId));
+        if (hits.length > 0 && hits.length < simBoxes.length)
+        {
+            let bMinX = Infinity, bMinY = Infinity, bMinZ = Infinity;
+            let bMaxX = -Infinity, bMaxY = -Infinity, bMaxZ = -Infinity;
+            for (const h of hits)
+            {
+                if (h.minX < bMinX) bMinX = h.minX;
+                if (h.minY < bMinY) bMinY = h.minY;
+                if (h.minZ < bMinZ) bMinZ = h.minZ;
+                if (h.maxX > bMaxX) bMaxX = h.maxX;
+                if (h.maxY > bMaxY) bMaxY = h.maxY;
+                if (h.maxZ > bMaxZ) bMaxZ = h.maxZ;
+            }
+            activeClipBox = {
+                minX: bMinX, minY: bMinY, minZ: bMinZ,
+                maxX: bMaxX, maxY: bMaxY, maxZ: bMaxZ,
+                cx: 0.5 * (bMinX + bMaxX), cy: 0.5 * (bMinY + bMaxY), cz: 0.5 * (bMinZ + bMaxZ),
+                rx: Math.max(0.6, 0.5 * (bMaxX - bMinX)),
+                ry: Math.max(0.6, 0.5 * (bMaxY - bMinY)),
+                rz: Math.max(0.6, 0.5 * (bMaxZ - bMinZ)),
+                scale: Math.max(1.2, bMaxX - bMinX, bMaxY - bMinY, bMaxZ - bMinZ)
+            };
+        }
+    }
+
+    const compiledWeathering = {
+        hasAny: !!(thermalParams || onionParams),
+        hasThermal: !!thermalParams,
+        hasOnion: !!onionParams,
+        thermal: thermalParams,
+        onion: onionParams,
+        onionFirst: (onionIdx >= 0 && (thermalIdx < 0 || onionIdx < thermalIdx)),
+        boxScope: weatherBoxScope,
+        targetLayerId: weatherTargetLayerId || (simBoxes[0]?.layerId || ''),
+        refBox: activeClipBox || fullBox,
+        clipBox: activeClipBox, // null when applying to all_boxes!
+        targetBoxCount: activeClipBox ? 1 : simBoxes.length
+    };
+
     return {
         doc,
         compiledLayers,
         compiledModifiers,
+        compiledSimModifiers,
+        compiledWeathering,
+        simBoxes,
         executionSteps,
         maxModifierDisplacement,
         primitives: allPrimitives,
@@ -7349,7 +7493,9 @@ function combineRock2LayerSdf(dAcc, colAcc, dLyr, lr, lg, lbCol, op, br)
     return dAcc;
 }
 
-export function evalRock2StackSdf(compiledStack, wx, wy, wz, outColor = null)
+const _weatherMeta = { freshBoost: 0, cavityAO: 1, pitMask: 0, shellEdge: 0 };
+
+function evalRock2MacroStackSdf(compiledStack, wx, wy, wz, outColor = null)
 {
     const { compiledLayers, compiledModifiers, executionSteps, primitives } = compiledStack;
     if (compiledLayers.length === 0)
@@ -7422,6 +7568,69 @@ export function evalRock2StackSdf(compiledStack, wx, wy, wz, outColor = null)
     };
 
     return evalUpToStep(steps.length - 1, wx, wy, wz, outColor);
+}
+
+export function evalRock2StackSdf(compiledStack, wx, wy, wz, outColor = null, skipWeathering = false)
+{
+    const dMacro = evalRock2MacroStackSdf(compiledStack, wx, wy, wz, outColor);
+    const cw = compiledStack?.compiledWeathering;
+    if (skipWeathering || !cw || !cw.hasAny) return dMacro;
+
+    // Box scope gating (`active_box` / `below_stack` clip vs `all_boxes`)
+    const clip = cw.clipBox;
+    if (clip)
+    {
+        const pad = 0.08;
+        if (wx < clip.minX - pad || wx > clip.maxX + pad ||
+            wy < clip.minY - pad || wy > clip.maxY + pad ||
+            wz < clip.minZ - pad || wz > clip.maxZ + pad)
+        {
+            return dMacro;
+        }
+    }
+
+    const refBox = cw.refBox;
+    const S = Math.max(1.2, refBox.scale || 5.0);
+    if (dMacro > S * 0.075 || dMacro < -Math.max(S * 0.25, 1.8)) return dMacro;
+
+    // 4-tap tetrahedron gradient of macro SDF for exact local surface normal
+    const e = Math.max(0.012, S * 0.005);
+    const d1 = evalRock2MacroStackSdf(compiledStack, wx + e, wy - e, wz - e, null);
+    const d2 = evalRock2MacroStackSdf(compiledStack, wx - e, wy - e, wz + e, null);
+    const d3 = evalRock2MacroStackSdf(compiledStack, wx - e, wy + e, wz - e, null);
+    const d4 = evalRock2MacroStackSdf(compiledStack, wx + e, wy + e, wz + e, null);
+    const gx = d1 - d2 - d3 + d4;
+    const gy = -d1 - d2 + d3 + d4;
+    const gz = -d1 + d2 - d3 + d4;
+    const gLen = Math.hypot(gx, gy, gz) || 1.0;
+
+    const dW = evalRockWeatheringSdf3D(
+        wx, wy, wz,
+        dMacro,
+        gx / gLen, gy / gLen, gz / gLen,
+        refBox,
+        compiledStack.sunDir || [0.55, 0.72, 0.42],
+        cw.thermal,
+        cw.onion,
+        cw.onionFirst,
+        outColor ? _weatherMeta : null
+    );
+
+    if (outColor)
+    {
+        // Fresh peeled inner corestone & fresh inner crack walls contrast cleanly against weathered rind + dark V-tip cavity!
+        const fresh = _weatherMeta.freshBoost;
+        const ao = _weatherMeta.cavityAO;
+        const edge = _weatherMeta.shellEdge;
+        const freshR = Math.min(1.0, outColor.r * 1.24 + 0.10);
+        const freshG = Math.min(1.0, outColor.g * 1.20 + 0.08);
+        const freshB = Math.min(1.0, outColor.b * 1.14 + 0.05);
+        outColor.r = clamp((lerp(outColor.r, freshR, fresh * 0.72) + edge * 0.08) * ao, 0.04, 1.0);
+        outColor.g = clamp((lerp(outColor.g, freshG, fresh * 0.72) + edge * 0.07) * ao, 0.04, 1.0);
+        outColor.b = clamp((lerp(outColor.b, freshB, fresh * 0.72) + edge * 0.05) * ao, 0.04, 1.0);
+    }
+
+    return dW;
 }
 
 /**

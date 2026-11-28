@@ -219,9 +219,86 @@ uniform int uShowContours;
 uniform int uShowWireGrid;
 uniform int uIsSelected;
 uniform vec4 uBrushRing;
+uniform int uHasWeatherTex;
+uniform vec4 uRegionBounds;       // xy = bounds.xz, zw = 1 / bounds.width,depth
+uniform sampler2D uWeatherDetailTex;
+uniform sampler2D uWeatherToneTex;
+uniform vec4 uWeatherThermal;     // x: strength, y: crazing90, z: spacing, w: pittingStrength
+uniform vec4 uWeatherOnion;       // x: strength, y: shellCount, z: undercutDepth, w: shellThickness
 
 vec3 acesFilm(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float wHash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+float wNoise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = wHash21(i);
+    float b = wHash21(i + vec2(1.0, 0.0));
+    float c = wHash21(i + vec2(0.0, 1.0));
+    float d = wHash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Fast razor-sharp 2D triplanar 90-degree T-junction crazing + Hallet-Walder pitting for sheer cliffs & close-up sharpening!
+vec2 evalCliffThermal2D(vec2 uv, float spacing, float crazing, float pitStr) {
+    float L1 = max(2.5, spacing);
+    vec2 ruv = vec2(uv.x * 0.92718 - uv.y * 0.37461, uv.x * 0.37461 + uv.y * 0.92718);
+    float wu = L1 * 0.32 * (wNoise2(vec2(ruv.x * 0.35, ruv.y) / (L1 * 1.9)) - 0.5);
+    float wv = L1 * 0.30 * (wNoise2(vec2(ruv.x, ruv.y * 0.35) / (L1 * 1.9) + vec2(5.1, -2.7)) - 0.5);
+    float uc = (ruv.x + wu) / L1;
+    float k1 = floor(uc);
+    float fu = fract(uc);
+    float d1 = min(fu, 1.0 - fu) * L1;
+
+    float slabPhase = wHash21(vec2(k1, 17.3));
+    float slabScale = 0.72 + 0.56 * wHash21(vec2(k1, 89.1));
+    float L2 = L1 * 0.92 * slabScale;
+    float vc = (ruv.y + wv) / L2 + slabPhase;
+    float fv = fract(vc);
+    float d2 = min(fv, 1.0 - fv) * L2;
+
+    float open1 = smoothstep(0.32, 0.74, wNoise2(ruv / (L1 * 2.1) + vec2(1.7, 3.3)));
+    float open2 = smoothstep(0.36, 0.78, wNoise2(ruv / (L1 * 1.6) + vec2(-4.2, 6.1)));
+    float ap1 = L1 * 0.052 * crazing * (0.35 + 1.15 * open1);
+    float ap2 = L1 * 0.036 * crazing * (0.25 + 0.95 * open2);
+    float c1 = ap1 > 0.01 ? max(0.0, 1.0 - d1 / ap1) : 0.0;
+    float c2 = ap2 > 0.01 ? max(0.0, 1.0 - d2 / ap2) * 0.78 : 0.0;
+    float crack = max(c1 * c1, c2 * c2);
+
+    // Hallet-Walder frost/thermal micro-spall pitting clustered along crack junctions!
+    float pit = 0.0;
+    if (pitStr > 0.02) {
+        vec2 gp = uv / max(1.6, L1 * 0.34);
+        vec2 gi = floor(gp);
+        vec2 gf = fract(gp);
+        float minD = 1.0;
+        float cid = 0.0;
+        for (int oy = -1; oy <= 1; oy++) {
+            for (int ox = -1; ox <= 1; ox++) {
+                vec2 nb = vec2(float(ox), float(oy));
+                vec2 cell = gi + nb;
+                vec2 pt = vec2(wHash21(cell + vec2(1.3, 4.7)), wHash21(cell + vec2(8.1, 2.9)));
+                float dist = length(nb + pt - gf);
+                if (dist < minD) { minD = dist; cid = wHash21(cell + vec2(19.3, 7.1)); }
+            }
+        }
+        float prox = smoothstep(L1 * 0.25, 0.0, min(d1, d2));
+        float act = smoothstep(0.56 - 0.34 * pitStr, 0.85 - 0.22 * pitStr, cid + 0.28 * prox);
+        float rad = (0.14 + 0.22 * act) * pitStr;
+        if (rad > 0.02 && minD < rad) {
+            float t = 1.0 - (minD * minD) / (rad * rad);
+            pit = pow(max(0.0, t), 0.72);
+        }
+    }
+    return vec2(crack, pit);
 }
 
 vec3 turboRamp(float t) {
@@ -244,6 +321,76 @@ void main() {
 
     vec3 baseAlbedo = vColor;
     float relH = vWorldPos.y - uSeaLevel;
+    float weatherAO = 1.0;
+
+    // Full-Resolution (512 Lookdev / 1K / 2K / 4K Production) Thermal Cracks, Hallet-Walder Pitting & Onion-Skin Exfoliation!
+    if (uHasWeatherTex == 1 && uLensMode == 0 && relH > 1.5) {
+        vec2 wUv = clamp((vWorldPos.xz - uRegionBounds.xy) * uRegionBounds.zw, vec2(0.001), vec2(0.999));
+        vec4 det = texture(uWeatherDetailTex, wUv);
+        vec4 ton = texture(uWeatherToneTex, wUv);
+
+        float dnx = det.r * 2.0 - 1.0;
+        float dnz = det.g * 2.0 - 1.0;
+        float dny = sqrt(max(0.04, 1.0 - clamp(dnx * dnx + dnz * dnz, 0.0, 0.96)));
+        vec3 hiN = normalize(vec3(dnx, dny, dnz));
+
+        // Top/slope blend uses baked 512..4K normals cleanly; steep cliffs use zero-stretch world triplanar!
+        float topW = smoothstep(0.18, 0.58, N.y);
+        float activeW = clamp(ton.a, 0.0, 1.0);
+        N = normalize(mix(N, hiN, 0.80 * topW * max(0.35, activeW)));
+
+        float cav = det.b;
+        float pitD = det.a;
+        float fresh = ton.r;
+        float rind = ton.g;
+        float lipHi = ton.b;
+
+        // Zero-stretch world-space triplanar sharpening on sheer cliffs + fine close-up V-tip crispness!
+        float cliffW = 1.0 - topW;
+        float rockMask = smoothstep(2.5, 14.0, relH) * max(activeW, cliffW * 0.85);
+        float triDepth = 0.0;
+        if (rockMask > 0.04) {
+            vec2 triUv = (abs(N.x) >= abs(N.z)) ? vWorldPos.zy : vWorldPos.xy;
+            if (uWeatherThermal.x > 0.01) {
+                vec2 ct = evalCliffThermal2D(triUv, uWeatherThermal.z, uWeatherThermal.y, uWeatherThermal.w);
+                float tWeight = uWeatherThermal.x * rockMask * mix(0.42, 1.0, cliffW);
+                cav = max(cav, ct.x * tWeight);
+                pitD = max(pitD, ct.y * tWeight);
+                fresh = max(fresh, (ct.x * 0.52 + ct.y * 0.40) * tWeight);
+                triDepth += (ct.x * 0.85 + ct.y * 0.55) * tWeight;
+            }
+            if (uWeatherOnion.x > 0.01 && cliffW > 0.15) {
+                float bandH = max(3.0, 26.0 / max(2.0, uWeatherOnion.y)) * uWeatherOnion.w;
+                float warp = 4.2 * (wNoise2(vWorldPos.xz * 0.014) - 0.5);
+                float bCoord = fract((vWorldPos.y + warp) / bandH);
+                float slotBand = exp(-pow((bCoord - 0.10) / 0.075, 2.0)) * clamp(uWeatherOnion.z, 0.0, 1.5);
+                float rimBand  = exp(-pow((bCoord - 0.24) / 0.085, 2.0));
+                float oWeight = uWeatherOnion.x * cliffW * smoothstep(8.0, 28.0, relH);
+                cav = max(cav, slotBand * oWeight * 0.92);
+                lipHi = max(lipHi, rimBand * oWeight * 0.85);
+                triDepth += slotBand * oWeight * 0.75;
+            }
+            if (triDepth > 0.002) {
+                vec3 dPdx = dFdx(vWorldPos);
+                vec3 dPdy = dFdy(vWorldPos);
+                float dHdx = dFdx(triDepth);
+                float dHdy = dFdy(triDepth);
+                vec3 surfGrad = cross(dPdy, N) * dHdx + cross(N, dPdx) * dHdy;
+                float invDet = 1.0 / max(1e-4, abs(dot(dPdx, cross(dPdy, N))));
+                N = normalize(N - clamp(surfGrad * invDet * 0.55, vec3(-0.65), vec3(0.65)));
+            }
+        }
+
+        // Rich geological material contrast: aged weathered dark rind vs bright warm freshly-peeled corestone & crack walls!
+        vec3 agedCol  = baseAlbedo * vec3(0.76, 0.74, 0.70);
+        vec3 freshCol = clamp(baseAlbedo * vec3(1.30, 1.24, 1.15) + vec3(0.11, 0.09, 0.06), 0.0, 0.96);
+        baseAlbedo = mix(baseAlbedo, agedCol, clamp(rind * 0.72, 0.0, 0.72));
+        baseAlbedo = mix(baseAlbedo, freshCol, clamp(fresh * 0.78, 0.0, 0.84));
+        baseAlbedo += vec3(0.085, 0.075, 0.060) * clamp(lipHi, 0.0, 1.0);
+
+        // Deep dark V-tip crevice, onion parting-slot & Hallet-Walder pit ambient occlusion!
+        weatherAO = mix(1.0, 0.24, clamp(max(cav, pitD * 0.78), 0.0, 1.0));
+    }
 
     if (uLensMode == 1) {
         baseAlbedo = turboRamp(vAux.x);
@@ -262,8 +409,8 @@ void main() {
     vec3 skyAmb = mix(vec3(0.065, 0.075, 0.095), vec3(0.18, 0.22, 0.28), N.y * 0.5 + 0.5);
     vec3 sunCol = uAtmosMode == 1 ? vec3(1.42, 1.05, 0.76) : vec3(1.28, 1.18, 1.04);
 
-    // Subtle cavity/slope darkening for rich sculptural depth
-    float slopeAO = mix(0.76, 1.0, clamp(N.y * 0.65 + 0.35, 0.0, 1.0));
+    // Subtle cavity/slope darkening boosted by V-tip cracks, Hallet-Walder pits & onion parting slots!
+    float slopeAO = mix(0.76, 1.0, clamp(N.y * 0.65 + 0.35, 0.0, 1.0)) * weatherAO;
     vec3 lit = baseAlbedo * (skyAmb + sunCol * ndl + vec3(0.35, 0.45, 0.58) * rim) * slopeAO;
 
     vec3 V = normalize(uCamPos - vWorldPos);
@@ -634,6 +781,13 @@ export class TerrainOceanViewport
         this.lineProg = CreateGlProgram(Gl, LINE_VS, LINE_FS);
 
         this.emptyVao = Gl.createVertexArray();
+        this._emptyWeatherTex = Gl.createTexture();
+        Gl.bindTexture(Gl.TEXTURE_2D, this._emptyWeatherTex);
+        Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_MIN_FILTER, Gl.NEAREST);
+        Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_MAG_FILTER, Gl.NEAREST);
+        Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_WRAP_S, Gl.CLAMP_TO_EDGE);
+        Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_WRAP_T, Gl.CLAMP_TO_EDGE);
+        Gl.texImage2D(Gl.TEXTURE_2D, 0, Gl.RGBA8, 1, 1, 0, Gl.RGBA, Gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 0, 0]));
         this.regionGpu = new Map();
         this._initOceanMesh(168);
         this._initDynamicLineBuffer();
@@ -1651,6 +1805,32 @@ export class TerrainOceanViewport
             Region.meshDirty = false;
         }
 
+        // Upload high-res (512 Lookdev / 1K / 2K / 4K Production) thermal crack, pitting & onion-peel RGBA8 textures!
+        const WTex = Region.runtime?.weatherTextures;
+        if (WTex && Region.runtime.weatherTexturesDirty)
+        {
+            const UploadRgba = (Existing, Pixels, W, H) =>
+            {
+                const Tex = Existing || Gl.createTexture();
+                Gl.bindTexture(Gl.TEXTURE_2D, Tex);
+                Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_MIN_FILTER, Gl.LINEAR);
+                Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_MAG_FILTER, Gl.LINEAR);
+                Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_WRAP_S, Gl.CLAMP_TO_EDGE);
+                Gl.texParameteri(Gl.TEXTURE_2D, Gl.TEXTURE_WRAP_T, Gl.CLAMP_TO_EDGE);
+                Gl.pixelStorei(Gl.UNPACK_ALIGNMENT, 1);
+                Gl.texImage2D(Gl.TEXTURE_2D, 0, Gl.RGBA8, W, H, 0, Gl.RGBA, Gl.UNSIGNED_BYTE, Pixels);
+                return Tex;
+            };
+            Entry.weatherDetailTex = UploadRgba(Entry.weatherDetailTex, WTex.detail, WTex.width, WTex.height);
+            Entry.weatherToneTex   = UploadRgba(Entry.weatherToneTex,   WTex.tone,   WTex.width, WTex.height);
+            Entry.hasWeatherTex = true;
+            Region.runtime.weatherTexturesDirty = false;
+        }
+        else if (!WTex)
+        {
+            Entry.hasWeatherTex = false;
+        }
+
         return Entry;
     }
 
@@ -1727,6 +1907,13 @@ export class TerrainOceanViewport
         Gl.uniform4fv(Gl.getUniformLocation(this.terrainProg, 'uBrushRing'), BrushUniform);
 
         const LocSelected = Gl.getUniformLocation(this.terrainProg, 'uIsSelected');
+        const LocHasWeatherTex = Gl.getUniformLocation(this.terrainProg, 'uHasWeatherTex');
+        const LocRegBounds = Gl.getUniformLocation(this.terrainProg, 'uRegionBounds');
+        const LocWThermal = Gl.getUniformLocation(this.terrainProg, 'uWeatherThermal');
+        const LocWOnion = Gl.getUniformLocation(this.terrainProg, 'uWeatherOnion');
+        Gl.uniform1i(Gl.getUniformLocation(this.terrainProg, 'uWeatherDetailTex'), 0);
+        Gl.uniform1i(Gl.getUniformLocation(this.terrainProg, 'uWeatherToneTex'), 1);
+
         for (const Region of VisibleRegions)
         {
             const Gpu = this._syncRegionGpuBuffer(Region, Region.id === this.activeRegionId ? PreviewFalloffLayerId : null);
@@ -1734,6 +1921,31 @@ export class TerrainOceanViewport
 
             const IsSel = this.selectedRegionIds.has(Region.id) || this.viewScope === 'all';
             Gl.uniform1i(LocSelected, IsSel ? 1 : 0);
+            const Rb = Region.bounds;
+            Gl.uniform4f(LocRegBounds, Rb.x, Rb.z, 1.0 / Math.max(1.0, Rb.width), 1.0 / Math.max(1.0, Rb.depth));
+            if (Gpu.hasWeatherTex && Gpu.weatherDetailTex && Gpu.weatherToneTex)
+            {
+                Gl.activeTexture(Gl.TEXTURE0);
+                Gl.bindTexture(Gl.TEXTURE_2D, Gpu.weatherDetailTex);
+                Gl.activeTexture(Gl.TEXTURE1);
+                Gl.bindTexture(Gl.TEXTURE_2D, Gpu.weatherToneTex);
+                Gl.uniform1i(LocHasWeatherTex, 1);
+                const Wp = Region.runtime?.weatherParams || {};
+                const Tp = Wp.thermal;
+                const Op = Wp.onion;
+                Gl.uniform4f(LocWThermal, Tp ? (Tp.strength ?? 0.9) : 0, Tp ? (Tp.crazing90 ?? 0.85) : 0, Tp ? (Tp.crazingSpacing ?? 16.0) : 16.0, Tp ? (Tp.pittingStrength ?? 0.7) : 0);
+                Gl.uniform4f(LocWOnion, Op ? (Op.strength ?? 0.9) : 0, Op ? (Op.shellCount ?? 4) : 4, Op ? (Op.undercutDepth ?? 1.0) : 1.0, Op ? (Op.shellThickness ?? 1.0) : 1.0);
+            }
+            else
+            {
+                Gl.activeTexture(Gl.TEXTURE0);
+                Gl.bindTexture(Gl.TEXTURE_2D, this._emptyWeatherTex);
+                Gl.activeTexture(Gl.TEXTURE1);
+                Gl.bindTexture(Gl.TEXTURE_2D, this._emptyWeatherTex);
+                Gl.uniform1i(LocHasWeatherTex, 0);
+                Gl.uniform4f(LocWThermal, 0, 0, 16, 0);
+                Gl.uniform4f(LocWOnion, 0, 4, 1, 1);
+            }
             Gl.bindVertexArray(Gpu.vao);
             Gl.drawElements(Gl.TRIANGLES, Gpu.indexCount, Gl.UNSIGNED_INT, 0);
 
